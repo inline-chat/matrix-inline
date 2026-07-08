@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -230,8 +231,11 @@ func TestGetChatInfoFetchesFullInlineMembers(t *testing.T) {
 	if info.Members.TotalMemberCount != 2 || len(info.Members.MemberMap) != 2 {
 		t.Fatalf("member count = %d/%d, want 2", info.Members.TotalMemberCount, len(info.Members.MemberMap))
 	}
-	if info.Members.OtherUserID != makeUserID("2") {
-		t.Fatalf("OtherUserID = %q, want 2", info.Members.OtherUserID)
+	if info.Type == nil || *info.Type != database.RoomTypeGroupDM {
+		t.Fatalf("Type = %#v, want group DM", info.Type)
+	}
+	if info.Members.OtherUserID != "" {
+		t.Fatalf("OtherUserID = %q, want empty for group chat", info.Members.OtherUserID)
 	}
 	member := info.Members.MemberMap[makeUserID("2")]
 	if member.Membership != event.MembershipJoin {
@@ -239,6 +243,93 @@ func TestGetChatInfoFetchesFullInlineMembers(t *testing.T) {
 	}
 	if member.UserInfo == nil || member.UserInfo.Name == nil || *member.UserInfo.Name != "Ada Lovelace" {
 		t.Fatalf("member user info = %#v, want Ada Lovelace", member.UserInfo)
+	}
+}
+
+func TestGetChatInfoUsesCachedDMDialogMembers(t *testing.T) {
+	calledParticipants := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calledParticipants = true
+		t.Fatalf("unexpected sidecar call %s", r.URL.Path)
+	}))
+	defer server.Close()
+
+	peerUserID := int64(2)
+	ic := &InlineClient{
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: networkid.UserLoginID("1")}},
+		AccountID: "1",
+		Sidecar:   sidecar.NewClient(server.URL),
+		users:     make(map[int64]sidecar.UserRecord),
+		dialogs: map[int64]sidecar.DialogRecord{
+			7: {
+				ChatID:     7,
+				PeerUserID: &peerUserID,
+				Title:      stringPtr("Ada Lovelace"),
+			},
+		},
+	}
+	ic.cacheUsers([]sidecar.UserRecord{{
+		UserID:      2,
+		DisplayName: stringPtr("Ada Lovelace"),
+	}})
+
+	info, err := ic.GetChatInfo(context.Background(), testPortal("7"))
+	if err != nil {
+		t.Fatalf("GetChatInfo() error = %v", err)
+	}
+	if calledParticipants {
+		t.Fatal("GetChatInfo called participants endpoint for cached DM dialog")
+	}
+	if info.Type == nil || *info.Type != database.RoomTypeDM {
+		t.Fatalf("Type = %#v, want DM", info.Type)
+	}
+	if info.Name != nil {
+		t.Fatalf("Name = %#v, want nil so bridgev2 uses DM ghost metadata", *info.Name)
+	}
+	if info.Members == nil || info.Members.OtherUserID != makeUserID("2") {
+		t.Fatalf("Members = %#v, want DM members with other user 2", info.Members)
+	}
+	if _, ok := info.Members.MemberMap[makeUserID("1")]; !ok {
+		t.Fatalf("member map = %#v, missing self user", info.Members.MemberMap)
+	}
+	if member, ok := info.Members.MemberMap[makeUserID("2")]; !ok || member.Membership != event.MembershipJoin {
+		t.Fatalf("peer member = %#v, want joined user 2", member)
+	}
+}
+
+func TestChatInfoForDialogIncludesSelfForGroupWithoutParticipantFetch(t *testing.T) {
+	title := "Project"
+	ic := &InlineClient{
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: networkid.UserLoginID("1")}},
+		AccountID: "1",
+	}
+
+	info := ic.chatInfoForDialog(context.Background(), sidecar.DialogRecord{
+		ChatID: 7,
+		Title:  &title,
+	}, &title)
+
+	if info.Type == nil || *info.Type != database.RoomTypeGroupDM {
+		t.Fatalf("Type = %#v, want group DM", info.Type)
+	}
+	if info.Name == nil || *info.Name != title {
+		t.Fatalf("Name = %#v, want %q", info.Name, title)
+	}
+	if info.Members == nil {
+		t.Fatal("Members = nil, want partial self member list")
+	}
+	if info.Members.IsFull {
+		t.Fatal("Members.IsFull = true, want partial group list")
+	}
+	if info.Members.OtherUserID != "" {
+		t.Fatalf("OtherUserID = %q, want empty for group chat", info.Members.OtherUserID)
+	}
+	self, ok := info.Members.MemberMap[makeUserID("1")]
+	if !ok {
+		t.Fatalf("MemberMap = %#v, missing self user", info.Members.MemberMap)
+	}
+	if !self.IsFromMe || self.Membership != event.MembershipJoin {
+		t.Fatalf("self member = %#v, want joined self", self)
 	}
 }
 
@@ -493,6 +584,60 @@ func TestDialogNeedsStartupHistoryUsesCheckpoint(t *testing.T) {
 
 	if dialogNeedsStartupHistory(sidecar.DialogRecord{}) {
 		t.Fatal("dialogNeedsStartupHistory = true for dialog without last message")
+	}
+}
+
+func TestRememberDialogDoesNotInvalidateDetailsForMessageCheckpointChange(t *testing.T) {
+	last := int64(10)
+	next := int64(11)
+	title := "Project"
+	ic := &InlineClient{
+		dialogs: map[int64]sidecar.DialogRecord{
+			7: {
+				ChatID:        7,
+				Title:         &title,
+				LastMessageID: &last,
+			},
+		},
+		details: map[int64]struct{}{7: {}},
+	}
+
+	changed := ic.rememberDialog(sidecar.DialogRecord{
+		ChatID:        7,
+		Title:         &title,
+		LastMessageID: &next,
+	})
+	if !changed {
+		t.Fatal("rememberDialog changed = false, want true for checkpoint update")
+	}
+	if ic.needsDialogDetailsSync(7) {
+		t.Fatal("details were invalidated by a message checkpoint change")
+	}
+
+	peerUserID := int64(2)
+	ic.rememberDialog(sidecar.DialogRecord{
+		ChatID:     7,
+		Title:      &title,
+		PeerUserID: &peerUserID,
+	})
+	if !ic.needsDialogDetailsSync(7) {
+		t.Fatal("details were not invalidated when dialog peer identity changed")
+	}
+}
+
+func TestIsRateLimitedErrorDetectsInlineFloodResponses(t *testing.T) {
+	cases := []error{
+		&sidecar.Error{Category: "Network", Message: "websocket error: HTTP error: 420 <unknown status code>"},
+		&sidecar.Error{Category: "FLOOD", Message: "too many requests"},
+		errors.New("Inline sidecar GET /rpc/dialogs returned HTTP 420"),
+	}
+	for _, err := range cases {
+		if !isRateLimitedError(err) {
+			t.Fatalf("isRateLimitedError(%v) = false, want true", err)
+		}
+	}
+	if isRateLimitedError(errors.New("temporary network disconnect")) {
+		t.Fatal("isRateLimitedError(non-rate-limit) = true, want false")
 	}
 }
 

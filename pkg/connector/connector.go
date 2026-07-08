@@ -204,6 +204,8 @@ func newInlineClient(login *bridgev2.UserLogin, meta *UserLoginMetadata, sidecar
 		Sidecar:   sidecar.NewClient(sidecarURL),
 		loggedIn:  !meta.SessionInvalidated,
 		users:     make(map[int64]sidecar.UserRecord),
+		dialogs:   make(map[int64]sidecar.DialogRecord),
+		details:   make(map[int64]struct{}),
 	}
 }
 

@@ -133,6 +133,7 @@ type DialogsRequest struct {
 
 type DialogRecord struct {
 	ChatID                 int64   `json:"chat_id"`
+	PeerUserID             *int64  `json:"peer_user_id,omitempty"`
 	Title                  *string `json:"title,omitempty"`
 	LastMessageID          *int64  `json:"last_message_id,omitempty"`
 	SyncedThroughMessageID *int64  `json:"synced_through_message_id,omitempty"`

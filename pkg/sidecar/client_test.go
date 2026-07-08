@@ -162,8 +162,9 @@ func TestClientDialogsAndHistoryDecodeVersionedResponses(t *testing.T) {
 		switch r.URL.Path {
 		case "/rpc/dialogs":
 			synced := int64(11)
+			peerUserID := int64(42)
 			writeRPCResult(t, w, "dialogs", DialogsPage{
-				Dialogs: []DialogRecord{{ChatID: 7, SyncedThroughMessageID: &synced}},
+				Dialogs: []DialogRecord{{ChatID: 7, PeerUserID: &peerUserID, SyncedThroughMessageID: &synced}},
 				Users: []UserRecord{{
 					UserID:      42,
 					DisplayName: stringPtr("Ada Lovelace"),
@@ -206,6 +207,9 @@ func TestClientDialogsAndHistoryDecodeVersionedResponses(t *testing.T) {
 	}
 	if len(dialogs.Dialogs) != 1 || dialogs.Dialogs[0].ChatID != 7 {
 		t.Fatalf("dialogs = %#v, want chat 7", dialogs.Dialogs)
+	}
+	if dialogs.Dialogs[0].PeerUserID == nil || *dialogs.Dialogs[0].PeerUserID != 42 {
+		t.Fatalf("peer_user_id = %#v, want 42", dialogs.Dialogs[0].PeerUserID)
 	}
 	if dialogs.Dialogs[0].SyncedThroughMessageID == nil || *dialogs.Dialogs[0].SyncedThroughMessageID != 11 {
 		t.Fatalf("synced_through_message_id = %#v, want 11", dialogs.Dialogs[0].SyncedThroughMessageID)

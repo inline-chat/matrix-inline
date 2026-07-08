@@ -30,10 +30,16 @@ import (
 const (
 	startupDialogPageLimit   = 100
 	startupHistoryLimit      = 20
+	dialogSyncRPCBudget      = 45
+	dialogPollInterval       = 30 * time.Second
+	dialogRateLimitCooldown  = 2 * time.Minute
+	startupRPCThrottle       = 1200 * time.Millisecond
 	sidecarEventReconnectLag = 3 * time.Second
 	maxInlineMediaDownload   = 100 << 20
 	maxInlineAvatarDownload  = 8 << 20
 )
+
+var errInlineRateLimited = errors.New("inline rate limited")
 
 var inlineMediaHTTPClient = &http.Client{Timeout: 2 * time.Minute}
 
@@ -45,6 +51,8 @@ type InlineClient struct {
 	mu       sync.RWMutex
 	loggedIn bool
 	users    map[int64]sidecar.UserRecord
+	dialogs  map[int64]sidecar.DialogRecord
+	details  map[int64]struct{}
 
 	runCancel context.CancelFunc
 	wg        sync.WaitGroup
@@ -144,7 +152,13 @@ func (ic *InlineClient) IsThisUser(ctx context.Context, userID networkid.UserID)
 }
 
 func (ic *InlineClient) GetUserID() networkid.UserID {
-	return makeUserID(ic.AccountID)
+	if strings.TrimSpace(ic.AccountID) != "" {
+		return makeUserID(ic.AccountID)
+	}
+	if ic.UserLogin != nil && ic.UserLogin.ID != "" {
+		return networkid.UserID(ic.UserLogin.ID)
+	}
+	return ""
 }
 
 func (ic *InlineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
@@ -152,7 +166,23 @@ func (ic *InlineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal
 	if err != nil {
 		return nil, err
 	}
-	return ic.chatInfoForChat(ctx, chatID, optionalString(string(portal.ID)))
+	name := optionalString(string(portal.ID))
+	if dialog, ok := ic.cachedDialog(chatID); ok {
+		if dialog.Title != nil && strings.TrimSpace(*dialog.Title) != "" {
+			name = optionalString(*dialog.Title)
+		}
+		if isDMDialog(dialog) {
+			return ic.chatInfoForDialog(ctx, dialog, name), nil
+		}
+	}
+	info, err := ic.chatInfoForChat(ctx, chatID, name)
+	if err != nil {
+		if dialog, ok := ic.cachedDialog(chatID); ok {
+			return ic.chatInfoForDialog(ctx, dialog, name), nil
+		}
+		return nil, err
+	}
+	return info, nil
 }
 
 func (ic *InlineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.UserInfo, error) {
@@ -605,15 +635,32 @@ func (ic *InlineClient) startSidecarLoops(ctx context.Context) {
 	ic.wg.Add(2)
 	ic.mu.Unlock()
 
-	go ic.syncStartup(runCtx)
+	go ic.syncDialogLoop(runCtx)
 	go ic.consumeSidecarEvents(runCtx)
 }
 
-func (ic *InlineClient) syncStartup(ctx context.Context) {
+func (ic *InlineClient) syncDialogLoop(ctx context.Context) {
 	defer ic.wg.Done()
 
-	if err := ic.syncDialogs(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		ic.UserLogin.Bridge.Log.Warn().Err(err).Msg("Inline startup sync failed")
+	for {
+		err := ic.syncDialogs(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if isRateLimitedError(err) {
+				ic.UserLogin.Bridge.Log.Warn().Err(err).Msg("Inline dialog sync rate limited; backing off")
+			} else {
+				ic.UserLogin.Bridge.Log.Warn().Err(err).Msg("Inline dialog sync failed")
+			}
+		}
+
+		delay := dialogPollInterval
+		if isRateLimitedError(err) {
+			delay = dialogRateLimitCooldown
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
 	}
 }
 
@@ -621,8 +668,13 @@ func (ic *InlineClient) syncDialogs(ctx context.Context) error {
 	limit := uint32(startupDialogPageLimit)
 	cursor := ""
 	seenCursors := make(map[string]struct{})
+	remainingRPCs := dialogSyncRPCBudget
 
 	for {
+		if remainingRPCs <= 0 {
+			ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
+			return nil
+		}
 		page, err := ic.Sidecar.Dialogs(ctx, sidecar.DialogsRequest{
 			Limit:  &limit,
 			Cursor: cursor,
@@ -630,14 +682,51 @@ func (ic *InlineClient) syncDialogs(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		remainingRPCs--
 		ic.cacheUsers(page.Users)
 
 		for _, dialog := range page.Dialogs {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			ic.queueDialogResync(ctx, dialog)
-			ic.syncRecentHistory(ctx, dialog)
+			changed := ic.rememberDialog(dialog)
+			if changed {
+				ic.queueDialogResync(ctx, dialog)
+			}
+			if !isDMDialog(dialog) && ic.needsDialogDetailsSync(dialog.ChatID) {
+				if remainingRPCs <= 0 {
+					ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
+					return nil
+				}
+				if err := ic.syncDialogDetails(ctx, dialog); err != nil {
+					if isRateLimitedError(err) {
+						return err
+					}
+					ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline chat details")
+				} else {
+					ic.markDialogDetailsSynced(dialog.ChatID)
+				}
+				remainingRPCs--
+				if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
+					return err
+				}
+			}
+			if dialogNeedsStartupHistory(dialog) {
+				if remainingRPCs <= 0 {
+					ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
+					return nil
+				}
+				if err := ic.syncRecentHistory(ctx, dialog); err != nil {
+					if isRateLimitedError(err) {
+						return err
+					}
+					ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline startup history")
+				}
+				remainingRPCs--
+				if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
+					return err
+				}
+			}
 		}
 
 		if page.NextCursor == "" {
@@ -651,9 +740,27 @@ func (ic *InlineClient) syncDialogs(ctx context.Context) error {
 	}
 }
 
-func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.DialogRecord) {
+func (ic *InlineClient) syncDialogDetails(ctx context.Context, dialog sidecar.DialogRecord) error {
+	name := dialogName(dialog)
+	info, err := ic.chatInfoForChat(ctx, dialog.ChatID, name)
+	if err != nil {
+		return err
+	}
+	ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:         bridgev2.RemoteEventChatResync,
+			PortalKey:    ic.portalKeyForChat(dialog.ChatID),
+			Timestamp:    time.Now(),
+			CreatePortal: true,
+		},
+		ChatInfo: info,
+	})
+	return nil
+}
+
+func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.DialogRecord) error {
 	if !dialogNeedsStartupHistory(dialog) {
-		return
+		return nil
 	}
 	limit := uint32(startupHistoryLimit)
 	request := sidecar.HistoryRequest{
@@ -665,10 +772,7 @@ func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.Di
 	}
 	page, err := ic.Sidecar.History(ctx, request)
 	if err != nil {
-		if !errors.Is(err, context.Canceled) {
-			ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline startup history")
-		}
-		return
+		return err
 	}
 	ic.cacheUsers(page.Users)
 
@@ -682,10 +786,11 @@ func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.Di
 
 	for _, msg := range page.Messages {
 		if err := ctx.Err(); err != nil {
-			return
+			return err
 		}
 		ic.queueInlineMessage(msg)
 	}
+	return nil
 }
 
 func dialogNeedsStartupHistory(dialog sidecar.DialogRecord) bool {
@@ -696,6 +801,45 @@ func dialogNeedsStartupHistory(dialog sidecar.DialogRecord) bool {
 		return true
 	}
 	return *dialog.LastMessageID > *dialog.SyncedThroughMessageID
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(delay):
+		return nil
+	}
+}
+
+func isRateLimitedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errInlineRateLimited) {
+		return true
+	}
+	var sidecarErr *sidecar.Error
+	if errors.As(err, &sidecarErr) {
+		category := strings.ToLower(sidecarErr.Category)
+		message := strings.ToLower(sidecarErr.Message)
+		if strings.Contains(category, "flood") ||
+			strings.Contains(category, "rate") ||
+			strings.Contains(message, "420") ||
+			strings.Contains(message, "flood") ||
+			strings.Contains(message, "rate limit") {
+			return true
+		}
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "http error: 420") ||
+		strings.Contains(message, "http 420") ||
+		strings.Contains(message, "returned http 420") ||
+		strings.Contains(message, "flood") ||
+		strings.Contains(message, "rate limit")
 }
 
 func (ic *InlineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
@@ -869,7 +1013,7 @@ func (ic *InlineClient) consumeSidecarEvents(ctx context.Context) {
 				}
 				break
 			}
-			ic.handleSidecarEvent(envelope)
+			ic.handleSidecarEvent(ctx, envelope)
 		}
 	}
 }
@@ -904,7 +1048,7 @@ func (ic *InlineClient) waitBeforeEventReconnect(ctx context.Context, err error)
 	}
 }
 
-func (ic *InlineClient) handleSidecarEvent(envelope *sidecar.EventEnvelope) {
+func (ic *InlineClient) handleSidecarEvent(ctx context.Context, envelope *sidecar.EventEnvelope) {
 	if envelope == nil {
 		return
 	}
@@ -913,6 +1057,9 @@ func (ic *InlineClient) handleSidecarEvent(envelope *sidecar.EventEnvelope) {
 		ic.handleStatusChanged(envelope.Event.StatusChanged)
 	case envelope.Event.MessageStored != nil:
 		ic.queueInlineMessage(envelope.Event.MessageStored.Message)
+	case envelope.Event.ChatUpserted != nil:
+		ic.markDialogDetailsStale(envelope.Event.ChatUpserted.ChatID)
+		ic.queueChatResyncByID(ctx, envelope.Event.ChatUpserted.ChatID)
 	case envelope.Event.MessageDeleted != nil:
 		ic.queueInlineMessageDelete(envelope.Event.MessageDeleted.ChatID, envelope.Event.MessageDeleted.MessageID)
 	case envelope.Event.ReactionChanged != nil:
@@ -946,18 +1093,7 @@ func (ic *InlineClient) handleStatusChanged(evt *sidecar.StatusChangedEvent) {
 }
 
 func (ic *InlineClient) queueDialogResync(ctx context.Context, dialog sidecar.DialogRecord) {
-	chatName := strconv.FormatInt(dialog.ChatID, 10)
-	if dialog.Title != nil && *dialog.Title != "" {
-		chatName = *dialog.Title
-	}
-	chatInfo, err := ic.chatInfoForChat(ctx, dialog.ChatID, &chatName)
-	if err != nil {
-		ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline members for chat resync")
-		chatInfo = &bridgev2.ChatInfo{
-			Name:        &chatName,
-			CanBackfill: true,
-		}
-	}
+	chatInfo := ic.chatInfoForDialog(ctx, dialog, dialogName(dialog))
 	ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
@@ -967,6 +1103,19 @@ func (ic *InlineClient) queueDialogResync(ctx context.Context, dialog sidecar.Di
 		},
 		ChatInfo: chatInfo,
 	})
+}
+
+func dialogName(dialog sidecar.DialogRecord) *string {
+	if dialog.Title != nil && strings.TrimSpace(*dialog.Title) != "" {
+		return optionalString(*dialog.Title)
+	}
+	return optionalString(strconv.FormatInt(dialog.ChatID, 10))
+}
+
+func (ic *InlineClient) queueChatResyncByID(ctx context.Context, chatID int64) {
+	if dialog, ok := ic.cachedDialog(chatID); ok {
+		ic.queueDialogResync(ctx, dialog)
+	}
 }
 
 func (ic *InlineClient) cacheUsers(users []sidecar.UserRecord) {
@@ -986,6 +1135,75 @@ func (ic *InlineClient) cacheUsers(users []sidecar.UserRecord) {
 	}
 }
 
+func (ic *InlineClient) rememberDialog(dialog sidecar.DialogRecord) bool {
+	if dialog.ChatID <= 0 {
+		return false
+	}
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	if ic.dialogs == nil {
+		ic.dialogs = make(map[int64]sidecar.DialogRecord)
+	}
+	previous, ok := ic.dialogs[dialog.ChatID]
+	ic.dialogs[dialog.ChatID] = dialog
+	changed := !ok || !sameDialogRecord(previous, dialog)
+	if !ok || !int64PtrEqual(previous.PeerUserID, dialog.PeerUserID) {
+		delete(ic.details, dialog.ChatID)
+	}
+	return changed
+}
+
+func (ic *InlineClient) cachedDialog(chatID int64) (sidecar.DialogRecord, bool) {
+	ic.mu.RLock()
+	defer ic.mu.RUnlock()
+	dialog, ok := ic.dialogs[chatID]
+	return dialog, ok
+}
+
+func sameDialogRecord(left, right sidecar.DialogRecord) bool {
+	return left.ChatID == right.ChatID &&
+		int64PtrEqual(left.PeerUserID, right.PeerUserID) &&
+		stringPtrEqual(left.Title, right.Title) &&
+		int64PtrEqual(left.LastMessageID, right.LastMessageID) &&
+		int64PtrEqual(left.SyncedThroughMessageID, right.SyncedThroughMessageID) &&
+		uint32PtrEqual(left.UnreadCount, right.UnreadCount)
+}
+
+func isDMDialog(dialog sidecar.DialogRecord) bool {
+	return dialog.PeerUserID != nil && *dialog.PeerUserID > 0
+}
+
+func (ic *InlineClient) needsDialogDetailsSync(chatID int64) bool {
+	if chatID <= 0 {
+		return false
+	}
+	ic.mu.RLock()
+	defer ic.mu.RUnlock()
+	_, ok := ic.details[chatID]
+	return !ok
+}
+
+func (ic *InlineClient) markDialogDetailsSynced(chatID int64) {
+	if chatID <= 0 {
+		return
+	}
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	if ic.details == nil {
+		ic.details = make(map[int64]struct{})
+	}
+	ic.details[chatID] = struct{}{}
+}
+
+func (ic *InlineClient) markDialogDetailsStale(chatID int64) {
+	if chatID <= 0 {
+		return
+	}
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	delete(ic.details, chatID)
+}
+
 func (ic *InlineClient) cachedUser(userID int64) (sidecar.UserRecord, bool) {
 	ic.mu.RLock()
 	defer ic.mu.RUnlock()
@@ -994,16 +1212,39 @@ func (ic *InlineClient) cachedUser(userID int64) (sidecar.UserRecord, bool) {
 }
 
 func (ic *InlineClient) chatInfoForChat(ctx context.Context, chatID int64, name *string) (*bridgev2.ChatInfo, error) {
+	if dialog, ok := ic.cachedDialog(chatID); ok && isDMDialog(dialog) {
+		return ic.chatInfoForDialog(ctx, dialog, name), nil
+	}
 	page, err := ic.Sidecar.ChatParticipants(ctx, sidecar.ChatParticipantsRequest{ChatID: chatID})
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch Inline chat participants: %w", err)
 	}
 	ic.cacheUsers(page.Users)
+	roomType := database.RoomTypeGroupDM
 	return &bridgev2.ChatInfo{
+		Type:        &roomType,
 		Name:        name,
 		Members:     ic.chatMemberListFromParticipants(ctx, page),
 		CanBackfill: true,
 	}, nil
+}
+
+func (ic *InlineClient) chatInfoForDialog(ctx context.Context, dialog sidecar.DialogRecord, name *string) *bridgev2.ChatInfo {
+	info := &bridgev2.ChatInfo{
+		Name:        name,
+		CanBackfill: true,
+	}
+	if dialog.PeerUserID != nil && *dialog.PeerUserID > 0 {
+		roomType := database.RoomTypeDM
+		info.Type = &roomType
+		info.Name = nil
+		info.Members = ic.chatMemberListForDM(ctx, *dialog.PeerUserID)
+	} else {
+		roomType := database.RoomTypeGroupDM
+		info.Type = &roomType
+		info.Members = ic.chatMemberListForKnownSelf(ctx)
+	}
+	return info
 }
 
 func (ic *InlineClient) chatMemberListFromParticipants(ctx context.Context, page *sidecar.ChatParticipantsPage) *bridgev2.ChatMemberList {
@@ -1031,6 +1272,14 @@ func (ic *InlineClient) chatMemberListFromParticipants(ctx context.Context, page
 		}
 		members[userID] = member
 	}
+	if len(members) == 0 {
+		return nil
+	}
+	if selfID := ic.GetUserID(); selfID != "" {
+		if _, ok := members[selfID]; !ok {
+			members[selfID] = ic.chatMemberForUserID(ctx, selfID)
+		}
+	}
 
 	memberList := &bridgev2.ChatMemberList{
 		IsFull:                     true,
@@ -1039,21 +1288,52 @@ func (ic *InlineClient) chatMemberListFromParticipants(ctx context.Context, page
 		TotalMemberCount:           len(members),
 		MemberMap:                  members,
 	}
-	if len(members) == 2 {
-		for userID := range members {
-			if !ic.IsThisUser(ctx, userID) {
-				memberList.OtherUserID = userID
-				break
-			}
-		}
-	}
 	return memberList
+}
+
+func (ic *InlineClient) chatMemberListForDM(ctx context.Context, peerUserID int64) *bridgev2.ChatMemberList {
+	members := make(bridgev2.ChatMemberMap, 2)
+	if selfID := ic.GetUserID(); selfID != "" {
+		members[selfID] = ic.chatMemberForUserID(ctx, selfID)
+	}
+	otherUserID := makeUserID(strconv.FormatInt(peerUserID, 10))
+	members[otherUserID] = ic.chatMemberForUserID(ctx, otherUserID)
+	return &bridgev2.ChatMemberList{
+		IsFull:                     true,
+		CheckAllLogins:             true,
+		ExcludeChangesFromTimeline: true,
+		TotalMemberCount:           len(members),
+		OtherUserID:                otherUserID,
+		MemberMap:                  members,
+	}
+}
+
+func (ic *InlineClient) chatMemberListForKnownSelf(ctx context.Context) *bridgev2.ChatMemberList {
+	selfID := ic.GetUserID()
+	if selfID == "" {
+		return nil
+	}
+	return &bridgev2.ChatMemberList{
+		IsFull:                     false,
+		CheckAllLogins:             true,
+		ExcludeChangesFromTimeline: true,
+		MemberMap: bridgev2.ChatMemberMap{
+			selfID: ic.chatMemberForUserID(ctx, selfID),
+		},
+	}
 }
 
 func (ic *InlineClient) createDMWithUserID(ctx context.Context, userID int64) (*bridgev2.CreateChatResponse, error) {
 	chat, err := ic.Sidecar.CreateDM(ctx, sidecar.CreateDMRequest{UserID: userID})
 	if err != nil {
 		return nil, fmt.Errorf("Inline sidecar create DM failed: %w", err)
+	}
+	if chat != nil {
+		ic.rememberDialog(sidecar.DialogRecord{
+			ChatID:     chat.ChatID,
+			PeerUserID: &userID,
+			Title:      chat.Title,
+		})
 	}
 	participantIDs := []networkid.UserID{makeUserID(strconv.FormatInt(userID, 10))}
 	return ic.createChatResponse(ctx, chat, ic.chatInfoForCreatedChat(ctx, chat, participantIDs)), nil
@@ -1638,6 +1918,27 @@ func optionalString(value string) *string {
 		return nil
 	}
 	return &value
+}
+
+func stringPtrEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
+}
+
+func int64PtrEqual(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
+}
+
+func uint32PtrEqual(left, right *uint32) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
 }
 
 func uint64Ptr(value uint64) *uint64 {
