@@ -106,6 +106,7 @@ func (login *InlineCodeLogin) submitCode(ctx context.Context, input map[string]s
 		return nil, fmt.Errorf("failed to create Inline user login: %w", err)
 	}
 
+	go ul.Client.Connect(context.Background())
 	ul.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,
