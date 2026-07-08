@@ -5,7 +5,7 @@ use matrix_inline_adapter::bind_adapter_http;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:29342";
 const DEFAULT_STORE_PATH: &str = "inline-client.sqlite3";
-const DEFAULT_API_BASE_URL: &str = "https://api.inline.chat";
+const DEFAULT_API_BASE_URL: &str = "https://api.inline.chat/v1";
 const DEFAULT_REALTIME_URL: &str = "wss://api.inline.chat/realtime";
 
 #[tokio::main]
@@ -172,6 +172,8 @@ mod tests {
 
         assert_eq!(options.bind_addr.to_string(), DEFAULT_BIND_ADDR);
         assert_eq!(options.store_path, PathBuf::from(DEFAULT_STORE_PATH));
+        assert_eq!(options.api_base_url, DEFAULT_API_BASE_URL);
+        assert_eq!(options.realtime_url, DEFAULT_REALTIME_URL);
         assert!(options.realtime_handshake);
     }
 

@@ -117,7 +117,7 @@ fixperms
 su-exec "${PUID}:${PGID}" "${SIDECAR_NAME}" \
 	--bind "${INLINE_SIDECAR_BIND}" \
 	--store "${INLINE_CLIENT_STORE}" \
-	--api-base-url "${INLINE_API_BASE_URL:-https://api.inline.chat}" \
+	--api-base-url "${INLINE_API_BASE_URL:-https://api.inline.chat/v1}" \
 	--realtime-url "${INLINE_REALTIME_URL:-wss://api.inline.chat/realtime}" \
 	${INLINE_SIDECAR_EXTRA_ARGS:-} &
 sidecar_pid=$!

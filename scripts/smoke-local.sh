@@ -26,7 +26,7 @@ if [[ "${START_ADAPTER}" == "1" ]]; then
 	cargo run -p matrix-inline-adapter -- \
 		--bind "${BIND}" \
 		--store "${STORE}" \
-		--api-base-url "${INLINE_API_BASE_URL:-https://api.inline.chat}" \
+		--api-base-url "${INLINE_API_BASE_URL:-https://api.inline.chat/v1}" \
 		--realtime-url "${INLINE_REALTIME_URL:-wss://api.inline.chat/realtime}" &
 	ADAPTER_PID=$!
 fi
