@@ -1,0 +1,5 @@
+services:
+  matrix-inline:
+    build:
+      context: ..
+      dockerfile: matrix-inline/Dockerfile

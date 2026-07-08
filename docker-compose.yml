@@ -1,8 +1,6 @@
 services:
   matrix-inline:
-    build:
-      context: ..
-      dockerfile: matrix-inline/Dockerfile
+    image: ${MATRIX_INLINE_IMAGE:-ghcr.io/inline-chat/matrix-inline:latest}
     init: true
     environment:
       RUST_LOG: info
@@ -10,6 +8,10 @@ services:
       INLINE_SIDECAR_URL: http://127.0.0.1:29342
       INLINE_CLIENT_STORE: /data/inline-client/inline-client.sqlite3
       MATRIX_INLINE_DB_URI: file:/data/matrix-inline.db?_txlock=immediate
+      MATRIX_INLINE_HOMESERVER_ADDRESS: ${MATRIX_INLINE_HOMESERVER_ADDRESS:-}
+      MATRIX_INLINE_HOMESERVER_DOMAIN: ${MATRIX_INLINE_HOMESERVER_DOMAIN:-}
+      MATRIX_INLINE_APPSERVICE_ADDRESS: ${MATRIX_INLINE_APPSERVICE_ADDRESS:-}
+      MATRIX_INLINE_APPSERVICE_HOSTNAME: ${MATRIX_INLINE_APPSERVICE_HOSTNAME:-0.0.0.0}
     ports:
       - "29343:29343"
     volumes:

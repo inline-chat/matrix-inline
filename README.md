@@ -36,10 +36,10 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - An existing Inline account
 - A Matrix homeserver or Beeper bridge deployment
 - Docker and Docker Compose, or Go 1.25 plus Rust 1.96 for native builds
-- A local checkout of `inline-chat/inline` next to this repo when building from
-  source, because the bridge builds against the Rust Inline client crates
+- A published container image from `ghcr.io/inline-chat/matrix-inline`
 
-Expected checkout layout:
+Source builds require a local checkout of `inline-chat/inline` next to this repo
+because the bridge builds against the Rust Inline client crates:
 
 ```text
 inline-chat/
@@ -55,6 +55,14 @@ Create a data directory:
 mkdir -p data
 ```
 
+Pull the published image:
+
+```sh
+docker compose pull
+```
+
+Published images are built for `linux/amd64` and `linux/arm64`.
+
 ### Beeper
 
 Generate a bridgev2 config with the bridge type assigned by your Beeper
@@ -67,7 +75,7 @@ bbctl c --type bridgev2 <inline-bridge-type> > data/config.yaml
 Start the bridge:
 
 ```sh
-docker compose up --build -d
+docker compose up -d
 ```
 
 The container uses the Beeper-issued appservice tokens from `data/config.yaml`
@@ -78,7 +86,7 @@ and writes `data/registration.yaml` on first start.
 Start once to generate `data/config.yaml`:
 
 ```sh
-docker compose up --build
+docker compose up
 ```
 
 Edit `data/config.yaml` and set at least:
@@ -91,7 +99,7 @@ Edit `data/config.yaml` and set at least:
 Start again to generate `data/registration.yaml`:
 
 ```sh
-docker compose up --build
+docker compose up
 ```
 
 Register `data/registration.yaml` with your homeserver, restart the homeserver,
@@ -99,6 +107,23 @@ then run the bridge detached:
 
 ```sh
 docker compose up -d
+```
+
+When the homeserver and bridge are on the same Docker network,
+`appservice.address` usually looks like:
+
+```text
+http://matrix-inline:29343
+```
+
+The URL must be reachable by the homeserver container or host.
+
+### Build from source
+
+Use the build override when developing or testing unreleased code:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
 ```
 
 ## Native Build
@@ -153,10 +178,15 @@ The Docker entrypoint stores bridge state in `/data`:
 Useful environment variables:
 
 ```text
+MATRIX_INLINE_IMAGE=ghcr.io/inline-chat/matrix-inline:latest
 INLINE_SIDECAR_BIND=127.0.0.1:29342
 INLINE_SIDECAR_URL=http://127.0.0.1:29342
 INLINE_CLIENT_STORE=/data/inline-client/inline-client.sqlite3
 MATRIX_INLINE_DB_URI=file:/data/matrix-inline.db?_txlock=immediate
+MATRIX_INLINE_HOMESERVER_ADDRESS=http://synapse:8008
+MATRIX_INLINE_HOMESERVER_DOMAIN=example.com
+MATRIX_INLINE_APPSERVICE_ADDRESS=http://matrix-inline:29343
+MATRIX_INLINE_APPSERVICE_HOSTNAME=0.0.0.0
 INLINE_API_BASE_URL=https://api.inline.chat
 INLINE_REALTIME_URL=wss://api.inline.chat/realtime
 RUST_LOG=info

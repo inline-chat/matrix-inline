@@ -1,8 +1,14 @@
 # syntax=docker/dockerfile:1
 
 ARG DOCKER_HUB="docker.io"
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
 
 FROM ${DOCKER_HUB}/golang:1.25-alpine AS go-builder
+ARG VERSION
+ARG COMMIT
+ARG BUILD_TIME
 
 RUN apk add --no-cache build-base git
 
@@ -19,7 +25,9 @@ COPY matrix-inline/cmd ./cmd
 COPY matrix-inline/pkg ./pkg
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go build -tags goolm -o /out/matrix-inline ./cmd/matrix-inline
+    go build -tags goolm \
+    -ldflags "-s -w -X main.Tag=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTime=${BUILD_TIME}" \
+    -o /out/matrix-inline ./cmd/matrix-inline
 
 FROM ${DOCKER_HUB}/rust:1.96-alpine AS rust-builder
 
@@ -42,6 +50,17 @@ RUN --mount=type=cache,target=/cargo/registry \
     cp /target/release/matrix-inline-adapter /out-matrix-inline-adapter
 
 FROM ${DOCKER_HUB}/alpine:3.23
+ARG VERSION
+ARG COMMIT
+ARG BUILD_TIME
+
+LABEL org.opencontainers.image.title="matrix-inline" \
+      org.opencontainers.image.description="Matrix bridge for Inline" \
+      org.opencontainers.image.source="https://github.com/inline-chat/matrix-inline" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_TIME}"
 
 ENV PUID=1337 \
     PGID=1337 \

@@ -10,8 +10,15 @@ INLINE_SIDECAR_BIND=${INLINE_SIDECAR_BIND:-127.0.0.1:29342}
 INLINE_SIDECAR_URL=${INLINE_SIDECAR_URL:-http://${INLINE_SIDECAR_BIND}}
 INLINE_CLIENT_STORE=${INLINE_CLIENT_STORE:-${DATA_DIR}/inline-client/inline-client.sqlite3}
 MATRIX_INLINE_DB_URI=${MATRIX_INLINE_DB_URI:-file:${DATA_DIR}/matrix-inline.db?_txlock=immediate}
+MATRIX_INLINE_APPSERVICE_HOSTNAME=${MATRIX_INLINE_APPSERVICE_HOSTNAME:-0.0.0.0}
+MATRIX_INLINE_APPSERVICE_ADDRESS=${MATRIX_INLINE_APPSERVICE_ADDRESS:-}
+MATRIX_INLINE_HOMESERVER_ADDRESS=${MATRIX_INLINE_HOMESERVER_ADDRESS:-}
+MATRIX_INLINE_HOMESERVER_DOMAIN=${MATRIX_INLINE_HOMESERVER_DOMAIN:-}
 PUID=${PUID:-1337}
 PGID=${PGID:-1337}
+
+export DATA_DIR CONFIG_PATH REGISTRATION_PATH INLINE_SIDECAR_BIND INLINE_SIDECAR_URL INLINE_CLIENT_STORE MATRIX_INLINE_DB_URI
+export MATRIX_INLINE_APPSERVICE_HOSTNAME MATRIX_INLINE_APPSERVICE_ADDRESS MATRIX_INLINE_HOMESERVER_ADDRESS MATRIX_INLINE_HOMESERVER_DOMAIN
 
 mkdir -p "${DATA_DIR}" "$(dirname "${INLINE_CLIENT_STORE}")"
 
@@ -21,12 +28,25 @@ function fixperms {
 
 function patch_generated_config {
 	yq -i '
-		.appservice.hostname = "0.0.0.0" |
+		.appservice.hostname = strenv(MATRIX_INLINE_APPSERVICE_HOSTNAME) |
 		.database.type = "sqlite3-fk-wal" |
 		.database.uri = strenv(MATRIX_INLINE_DB_URI) |
 		.database.max_open_conns = 1 |
 		.network.sidecar_url = strenv(INLINE_SIDECAR_URL)
 	' "${CONFIG_PATH}"
+	patch_config_value MATRIX_INLINE_APPSERVICE_ADDRESS .appservice.address
+	patch_config_value MATRIX_INLINE_HOMESERVER_ADDRESS .homeserver.address
+	patch_config_value MATRIX_INLINE_HOMESERVER_DOMAIN .homeserver.domain
+}
+
+function patch_config_value {
+	local env_name path value
+	env_name=$1
+	path=$2
+	value=${!env_name:-}
+	if [[ -n "${value}" ]]; then
+		CONFIG_VALUE="${value}" yq -i "${path} = strenv(CONFIG_VALUE)" "${CONFIG_PATH}"
+	fi
 }
 
 function generate_registration_from_config {

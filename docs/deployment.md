@@ -21,8 +21,16 @@ http://127.0.0.1:29342
 
 ## Docker Compose
 
-The Compose setup builds both binaries from source. Build commands must run from
-the `matrix-inline` repo root with the sibling `inline` repo available:
+The default Compose setup uses the published image:
+
+```sh
+docker compose pull
+```
+
+Published images are built for `linux/amd64` and `linux/arm64`.
+
+Source builds are available with the build override. Build commands must run
+from the `matrix-inline` repo root with the sibling `inline` repo available:
 
 ```text
 inline-chat/
@@ -47,7 +55,7 @@ bbctl c --type bridgev2 <inline-bridge-type> > data/config.yaml
 Start the bridge:
 
 ```sh
-docker compose up --build -d
+docker compose up -d
 ```
 
 On first start, the container writes `data/registration.yaml` from the
@@ -58,7 +66,7 @@ appservice tokens already present in the Beeper config.
 Start once to generate an example config:
 
 ```sh
-docker compose up --build
+docker compose up
 ```
 
 Edit `data/config.yaml` and set:
@@ -69,10 +77,27 @@ Edit `data/config.yaml` and set:
 - `appservice.hostname`
 - `bridge.permissions`
 
+The appservice address must be reachable by the homeserver. If the bridge and
+homeserver share a Docker network, use the bridge service name:
+
+```yaml
+appservice:
+  address: http://matrix-inline:29343
+```
+
+For first-time config generation, these environment variables can prefill the
+common homeserver and appservice values:
+
+```text
+MATRIX_INLINE_HOMESERVER_ADDRESS=http://synapse:8008
+MATRIX_INLINE_HOMESERVER_DOMAIN=example.com
+MATRIX_INLINE_APPSERVICE_ADDRESS=http://matrix-inline:29343
+```
+
 Start again to generate `data/registration.yaml`:
 
 ```sh
-docker compose up --build
+docker compose up
 ```
 
 Add `data/registration.yaml` to your homeserver appservice registrations and
@@ -83,6 +108,12 @@ Run detached:
 
 ```sh
 docker compose up -d
+```
+
+Build from source:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
 ```
 
 ## Docker Storage
@@ -110,6 +141,7 @@ directory private.
 Common environment variables:
 
 ```text
+MATRIX_INLINE_IMAGE=ghcr.io/inline-chat/matrix-inline:latest
 DATA_DIR=/data
 CONFIG_PATH=/data/config.yaml
 REGISTRATION_PATH=/data/registration.yaml
@@ -117,6 +149,10 @@ INLINE_SIDECAR_BIND=127.0.0.1:29342
 INLINE_SIDECAR_URL=http://127.0.0.1:29342
 INLINE_CLIENT_STORE=/data/inline-client/inline-client.sqlite3
 MATRIX_INLINE_DB_URI=file:/data/matrix-inline.db?_txlock=immediate
+MATRIX_INLINE_HOMESERVER_ADDRESS=http://synapse:8008
+MATRIX_INLINE_HOMESERVER_DOMAIN=example.com
+MATRIX_INLINE_APPSERVICE_ADDRESS=http://matrix-inline:29343
+MATRIX_INLINE_APPSERVICE_HOSTNAME=0.0.0.0
 INLINE_API_BASE_URL=https://api.inline.chat
 INLINE_REALTIME_URL=wss://api.inline.chat/realtime
 RUST_LOG=info

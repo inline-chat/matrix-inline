@@ -7,6 +7,7 @@ This runbook covers routine operation for `matrix-inline`.
 Docker:
 
 ```sh
+docker compose pull
 docker compose up -d
 docker compose logs -f matrix-inline
 docker compose down
@@ -104,11 +105,18 @@ and restrict access to the bridge operator.
 1. Read the release notes for config or migration notes.
 2. Stop the bridge.
 3. Back up config, registration, bridge database, and Inline client store.
-4. Deploy the new image or install the new binaries.
+4. Pull the new image or install the new binaries.
 5. Start the adapter.
 6. Start the bridge.
 7. Run `inline-status`.
 8. Run the checklist in [smoke-test.md](smoke-test.md).
+
+Docker image updates:
+
+```sh
+docker compose pull
+docker compose up -d
+```
 
 ## User Commands
 

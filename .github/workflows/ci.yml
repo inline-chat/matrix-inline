@@ -44,6 +44,3 @@ jobs:
       - name: Run checks
         working-directory: matrix-inline
         run: scripts/check.sh
-
-      - name: Build Docker image
-        run: docker build -f matrix-inline/Dockerfile .
