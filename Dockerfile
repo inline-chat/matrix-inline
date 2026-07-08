@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 FROM ${DOCKER_HUB}/rust:1.96-alpine AS rust-builder
 
-RUN apk add --no-cache build-base protobuf-dev sqlite-dev
+RUN apk add --no-cache build-base protobuf-dev sqlite-dev sqlite-static
 
 WORKDIR /build
 ENV CARGO_HOME=/cargo \
