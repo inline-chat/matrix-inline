@@ -52,7 +52,7 @@ func (login *InlineCodeLogin) submitContact(ctx context.Context, input map[strin
 		return login.contactStep(fmt.Sprintf("Inline login failed: %v", err)), nil
 	}
 	if start.NeedsInviteCode {
-		return login.contactStep("This Inline account requires an invite code. The bridge beta does not support invite-code signup yet."), nil
+		return login.contactStep("This Inline account requires an invite code. Complete signup in Inline, then log in through the bridge."), nil
 	}
 	if !start.ExistingUser {
 		return login.contactStep("No existing Inline account was found for that contact. Create or join Inline first, then try again."), nil

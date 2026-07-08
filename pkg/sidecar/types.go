@@ -7,7 +7,7 @@ const (
 	// this bridge.
 	ProtocolVersion = 1
 
-	// DefaultBaseURL is the beta loopback sidecar endpoint.
+	// DefaultBaseURL is the loopback sidecar endpoint.
 	DefaultBaseURL = "http://127.0.0.1:29342"
 )
 

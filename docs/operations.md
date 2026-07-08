@@ -1,14 +1,14 @@
-# Operations Runbook
+# Operations
 
-This runbook is for the one-team beta operator.
+This runbook covers routine operation for `matrix-inline`.
 
-## Start And Stop
+## Start and Stop
 
 Docker:
 
 ```sh
 docker compose up -d
-docker compose logs -f
+docker compose logs -f matrix-inline
 docker compose down
 ```
 
@@ -20,7 +20,11 @@ sudo systemctl stop matrix-inline.service matrix-inline-adapter.service
 sudo systemctl restart matrix-inline-adapter.service matrix-inline.service
 ```
 
+Start the adapter before the bridge. Stop the bridge before the adapter.
+
 ## Health
+
+Adapter health:
 
 ```sh
 curl -fsS http://127.0.0.1:29342/health | jq .
@@ -28,12 +32,19 @@ curl -fsS http://127.0.0.1:29342/status | jq .
 curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .
 ```
 
-Expected statuses:
+Bridge status from Matrix:
 
-- `AuthRequired`: adapter is healthy, but no Inline login is stored yet.
-- `Connected`: adapter has a valid Inline session.
-- `AuthExpired`: user needs to log in again.
-- `Reconnecting`: adapter hit a transient network/realtime issue.
+```text
+inline-status
+```
+
+Status values:
+
+- `AuthRequired`: no Inline account is logged in yet.
+- `Connected`: Inline session is active.
+- `AuthExpired`: log in again.
+- `Reconnecting`: temporary network or realtime recovery.
+- `Disconnected`: adapter is stopped or logged out.
 
 ## Logs
 
@@ -49,28 +60,34 @@ systemd:
 journalctl -u matrix-inline-adapter.service -u matrix-inline.service -f
 ```
 
-Useful log knobs:
+Logging defaults:
 
 ```text
 RUST_LOG=info
+```
+
+Useful troubleshooting setting:
+
+```text
 RUST_LOG=matrix_inline_adapter=debug,inline_client=debug,info
 ```
 
-Do not enable verbose HTTP/body logging in production. Inline auth material is
-owned by the Rust client store and should not be printed.
+Do not enable request body or token logging in production.
 
-## Backup
+## Backups
 
-Back up these files together while the services are stopped:
+Stop the bridge before making filesystem-level backups.
+
+Docker paths:
 
 ```text
-/data/config.yaml
-/data/registration.yaml
-/data/matrix-inline.db*
-/data/inline-client/inline-client.sqlite3*
+data/config.yaml
+data/registration.yaml
+data/matrix-inline.db*
+data/inline-client/inline-client.sqlite3*
 ```
 
-For systemd installs, the equivalent paths are:
+systemd paths:
 
 ```text
 /etc/matrix-inline/config.yaml
@@ -79,46 +96,80 @@ For systemd installs, the equivalent paths are:
 /var/lib/inline-client/inline-client.sqlite3*
 ```
 
-The adapter SQLite store contains Inline session credentials. Keep backups
-private and encrypted.
+The Inline client store contains session credentials. Store backups encrypted
+and restrict access to the bridge operator.
 
 ## Upgrade
 
-1. Run `scripts/check.sh` before building an image or copying binaries.
-2. Stop the bridge first, then the adapter.
-3. Back up config, registration, Matrix DB, and Inline client store.
-4. Install the new Go bridge and Rust adapter binaries or deploy the new image.
-5. Start the adapter first, then the bridge.
-6. Run `scripts/smoke-local.sh`.
-7. Run the Matrix/Beeper smoke checklist in [smoke-test.md](smoke-test.md).
+1. Read the release notes for config or migration notes.
+2. Stop the bridge.
+3. Back up config, registration, bridge database, and Inline client store.
+4. Deploy the new image or install the new binaries.
+5. Start the adapter.
+6. Start the bridge.
+7. Run `inline-status`.
+8. Run the checklist in [smoke-test.md](smoke-test.md).
 
-## Common Failures
+## User Commands
 
-Adapter unreachable:
+In the bridge management room:
 
+```text
+login
+inline-status
+inline-reconnect
+logout <login ID>
+```
+
+Short aliases:
+
+```text
+istatus
+ireconnect
+```
+
+## Troubleshooting
+
+### Adapter Unreachable
+
+- Confirm the adapter process is running.
 - Confirm it is bound to `127.0.0.1:29342`.
-- Check `INLINE_SIDECAR_URL` and `network.sidecar_url`.
+- Confirm `network.sidecar_url` or `INLINE_SIDECAR_URL` points to the same URL.
 - Check adapter logs before restarting the bridge.
 
-Inline auth expired:
+### Login Fails
 
-- `inline-status` should show `AuthExpired`.
-- Use the bridge login flow again.
-- If logout was intentional, use mautrix `logout <login ID>` and then log in.
+- Confirm the Inline account already exists.
+- Confirm the email or phone number is entered in the same format used by
+  Inline.
+- Request a new verification code and try again.
+- If the account requires an invite code, complete signup in Inline first.
 
-Messages send from Matrix but do not appear in Inline:
+### Auth Expired
 
-- Check adapter logs for send/upload errors.
-- Confirm `/status` is `Connected`.
-- Confirm media size is under the beta upload limit.
+- Run `inline-status`.
+- Use `login` again from the bridge bot.
+- If the old login should be removed, run `logout <login ID>`.
 
-Rooms appear without full members:
+### Messages Do Not Send
 
-- Check adapter logs for `GetChatParticipants` failures.
-- Run `inline-reconnect`, then open the portal again.
+- Confirm adapter status is `Connected`.
+- Check adapter logs for send or upload errors.
+- Check whether the message contains unsupported media.
+- Run `inline-reconnect` and try again.
 
-Restart does not resume:
+### Rooms Have Missing Members
 
-- Confirm the adapter store path is stable and writable.
+- Open the Matrix room again to trigger a membership refresh.
+- Run `inline-reconnect`.
+- Check adapter logs for participant fetch errors.
+
+### Restart Does Not Resume Login
+
+- Confirm the adapter store path is stable.
 - Confirm the service user owns the store directory.
-- Run `curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .`.
+- Run:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .
+```

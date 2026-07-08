@@ -1,7 +1,30 @@
-# Matrix Inline Agent Notes
+# Agent Notes
 
-- This repo is the official Matrix/Beeper bridge for Inline.
-- Keep Inline protocol, sync, cache, retry, and transaction behavior in Rust `inline-client`.
-- Keep this Go bridge focused on mautrix-go bridgev2 glue, Matrix/Beeper provisioning, portals, ghosts, Matrix content conversion, packaging, and docs.
-- Never store long-lived Inline auth tokens in Go bridge metadata unless the Rust client store cannot own the session yet. Prefer passing credentials to the local sidecar during login and storing only account/session glue in bridge metadata.
-- Use Beeper LINE bridge patterns for bridgev2 capabilities, login flows, bridge state, startup sync, media placeholders, message status errors, and deployment docs.
+This repository contains the Matrix bridge for Inline.
+
+## Boundaries
+
+- Keep Matrix/Beeper appservice behavior in the Go bridge.
+- Keep Inline API/session/cache behavior behind the local Rust adapter and
+  `inline-client`.
+- Keep the adapter bound to loopback by default.
+- Do not commit secrets, generated local config, registrations, databases, or
+  `.env` files.
+
+## Checks
+
+Run before committing:
+
+```sh
+scripts/check.sh
+docker build --check -f Dockerfile ..
+```
+
+Use `-tags goolm` for local Go commands unless explicitly testing system
+libolm packaging.
+
+## Docs
+
+Public docs should describe installation, operation, commands, supported
+features, known limitations, and licensing. Keep private project notes out of
+committed docs.

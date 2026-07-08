@@ -1,16 +1,17 @@
-# Team Beta Smoke Test
+# Smoke Test
 
-Run this after a fresh deploy, after changing config, and after upgrading either
-the Go bridge or Rust adapter.
+Run this checklist after a fresh install, config change, or upgrade.
 
-## Local Process Health
+## Local Checks
+
+From the repo root:
 
 ```sh
 scripts/check.sh
 scripts/smoke-local.sh --start-adapter
 ```
 
-For a deployed host:
+For an installed bridge:
 
 ```sh
 curl -fsS http://127.0.0.1:29342/health | jq .
@@ -18,36 +19,66 @@ curl -fsS http://127.0.0.1:29342/status | jq .
 curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .
 ```
 
-Expected result:
+Expected adapter states:
 
-- `/health` returns protocol version `1`.
-- `/status` returns `Connected` after login, or `AuthRequired` before login.
-- `/rpc/resume` does not return a transport/protocol error.
+- `AuthRequired`: adapter is healthy and no Inline account is logged in yet.
+- `Connected`: adapter has a valid Inline session.
+- `AuthExpired`: the Inline account needs to log in again.
+- `Reconnecting`: adapter is recovering from a network or realtime issue.
 
-## Matrix/Beeper Flow
+## Login
 
-1. Start the adapter and bridge.
-2. Log in with an existing Inline account using email or SMS code.
-3. Confirm `inline-status` reports the sidecar status and account ID.
-4. Confirm existing Inline dialogs appear as Matrix rooms.
-5. Open a room and confirm recent history appears without duplicate outgoing echoes.
-6. Confirm the member list includes all Inline members currently exposed by Inline.
-7. Send text from Matrix and confirm it appears in Inline.
-8. Send text from Inline and confirm it appears in Matrix.
-9. Reply to a normal message from Matrix and confirm Inline receives a normal reply.
-10. Reply to a normal message from Inline and confirm Matrix shows a normal reply.
-11. Send an image or file from Matrix and confirm Inline receives it.
-12. Send an image or file from Inline and confirm Matrix receives it or gets a clear unavailable notice.
-13. Edit, delete, and react to a Matrix-originated text message.
-14. Create a DM through Beeper/bridgev2 provisioning using a numeric Inline user ID.
-15. Create a basic Matrix group/thread using bridgev2 group creation and confirm it opens as an Inline thread.
-16. Restart the adapter and bridge.
-17. Confirm login resumes, dialogs remain mapped, and new messages sent during downtime catch up.
+1. Open a chat with the bridge bot.
+2. Send `login`.
+3. Choose email or phone login when prompted.
+4. Enter the verification code sent by Inline.
+5. Run `inline-status`.
+6. Confirm the account ID and sidecar status are shown.
 
-## Beta Limitations To Verify Are Acceptable
+## Messaging
 
-- New account signup and invite-code onboarding are out of scope.
-- DM lookup is numeric Inline user ID only until search/contact lookup is added.
-- Inline reply-thread chats are bridged as standalone Matrix rooms, not Matrix thread UI.
-- Room avatars and rich chat metadata are partial.
-- Very old history/backfill policy is still conservative.
+Verify both directions:
+
+1. Existing Inline chats appear as Matrix rooms.
+2. Recent messages appear when a room is opened.
+3. Sending text from Matrix appears in Inline.
+4. Sending text from Inline appears in Matrix.
+5. Normal replies work in both directions.
+6. Matrix edits update the Inline message.
+7. Matrix redactions delete or unsend the Inline message.
+8. Reactions bridge in both directions.
+9. Typing notifications appear where supported.
+10. Opening a Matrix room marks the Inline chat read.
+
+## Media
+
+1. Send an image from Matrix and confirm it appears in Inline.
+2. Send a file from Matrix and confirm it appears in Inline.
+3. Send an image or video from Inline and confirm it appears in Matrix.
+4. Send a voice or audio file and confirm it appears as playable media or a
+   clear unavailable notice.
+
+## Rooms and Members
+
+1. Confirm the Matrix member list includes current Inline members.
+2. Confirm ghost display names match Inline users where available.
+3. Create a DM using a numeric Inline user ID.
+4. Create a basic Matrix group/thread and confirm an Inline thread is created.
+
+## Restart
+
+1. Restart the bridge and adapter.
+2. Confirm `inline-status` returns `Connected`.
+3. Confirm existing rooms keep their Matrix mappings.
+4. Send a message after restart in both directions.
+5. Confirm messages sent during downtime are synced after reconnect.
+
+## Known Limitations
+
+- Login requires an existing Inline account.
+- Invite-code signup is not handled inside the bridge.
+- DM creation currently requires a numeric Inline user ID.
+- Inline reply-thread chats are represented as Matrix rooms, not Matrix-native
+  thread UI.
+- Room avatars and some rich chat metadata may be missing.
+- Calls are not bridged.
