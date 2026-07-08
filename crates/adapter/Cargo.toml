@@ -1,0 +1,27 @@
+[package]
+name = "matrix-inline-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Rust bridge adapter sidecar for the official Inline Matrix/Beeper bridge."
+publish = false
+
+[dependencies]
+axum.workspace = true
+env_logger.workspace = true
+inline-client.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[[bin]]
+name = "matrix-inline-adapter"
+path = "src/bin/matrix-inline-adapter.rs"

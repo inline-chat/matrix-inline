@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/adapter"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/inline-chat/matrix-inline"
+homepage = "https://inline.chat"
+
+[workspace.dependencies]
+axum = { version = "0.8.9", features = ["multipart", "ws"] }
+env_logger = "0.11.11"
+inline-client = { path = "../inline-public/crates/client" }
+log = "0.4.22"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+thiserror = "1.0.69"
+tokio = { version = "1.43.0", features = ["macros", "net", "rt-multi-thread"] }
+tower = { version = "0.5.3", features = ["util"] }
+

@@ -1,0 +1,9 @@
+.DS_Store
+.wip
+data/
+*.db
+*.db-shm
+*.db-wal
+/matrix-inline
+/target
+coverage.out

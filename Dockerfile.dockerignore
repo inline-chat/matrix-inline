@@ -1,0 +1,29 @@
+# Docker builds use the parent inline-chat directory as context so the image can
+# compile matrix-inline and the sibling inline-public Rust client dependency. Keep
+# the effective context limited to those public-safe build inputs.
+
+**
+
+!matrix-inline/
+!matrix-inline/Dockerfile
+!matrix-inline/docker-run.sh
+!matrix-inline/go.mod
+!matrix-inline/go.sum
+!matrix-inline/Cargo.toml
+!matrix-inline/Cargo.lock
+!matrix-inline/rust-toolchain.toml
+!matrix-inline/cmd/
+!matrix-inline/cmd/**
+!matrix-inline/crates/
+!matrix-inline/crates/**
+!matrix-inline/pkg/
+!matrix-inline/pkg/**
+
+!inline-public/
+!inline-public/Cargo.toml
+!inline-public/Cargo.lock
+!inline-public/rust-toolchain.toml
+!inline-public/cli/
+!inline-public/cli/**
+!inline-public/crates/
+!inline-public/crates/**

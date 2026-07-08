@@ -1,0 +1,17 @@
+services:
+  matrix-inline:
+    build:
+      context: ..
+      dockerfile: matrix-inline/Dockerfile
+    init: true
+    environment:
+      RUST_LOG: info
+      INLINE_SIDECAR_BIND: 127.0.0.1:29342
+      INLINE_SIDECAR_URL: http://127.0.0.1:29342
+      INLINE_CLIENT_STORE: /data/inline-client/inline-client.sqlite3
+      MATRIX_INLINE_DB_URI: file:/data/matrix-inline.db?_txlock=immediate
+    ports:
+      - "29343:29343"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

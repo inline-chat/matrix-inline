@@ -1,0 +1,23 @@
+[Unit]
+Description=Matrix/Beeper bridge for Inline
+Documentation=https://github.com/inline-chat/matrix-inline
+After=network-online.target matrix-inline-adapter.service
+Wants=network-online.target matrix-inline-adapter.service
+
+[Service]
+Type=simple
+User=inline-bridge
+Group=inline-bridge
+WorkingDirectory=/var/lib/matrix-inline
+ExecStart=/opt/inline/bin/matrix-inline \
+  --config /etc/matrix-inline/config.yaml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/matrix-inline /etc/matrix-inline
+
+[Install]
+WantedBy=multi-user.target

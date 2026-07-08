@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout matrix-inline
+        uses: actions/checkout@v4
+        with:
+          path: matrix-inline
+
+      - name: Checkout inline-public
+        uses: actions/checkout@v4
+        with:
+          repository: inline-chat/inline
+          path: inline-public
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libsqlite3-dev
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: matrix-inline/go.mod
+          cache-dependency-path: matrix-inline/go.sum
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            matrix-inline -> target
+            inline-public -> target
+
+      - name: Run checks
+        working-directory: matrix-inline
+        run: scripts/check.sh
+
+      - name: Build Docker image
+        run: docker build -f matrix-inline/Dockerfile .

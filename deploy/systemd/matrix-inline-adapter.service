@@ -1,0 +1,28 @@
+[Unit]
+Description=Rust adapter sidecar for matrix-inline
+Documentation=https://github.com/inline-chat/matrix-inline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=inline-bridge
+Group=inline-bridge
+WorkingDirectory=/var/lib/inline-client
+Environment=RUST_LOG=info
+ExecStart=/opt/inline/bin/matrix-inline-adapter \
+  --bind 127.0.0.1:29342 \
+  --store /var/lib/inline-client/inline-client.sqlite3 \
+  --api-base-url https://api.inline.chat \
+  --realtime-url wss://api.inline.chat/realtime \
+  --realtime-handshake
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/inline-client
+
+[Install]
+WantedBy=multi-user.target

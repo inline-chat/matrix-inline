@@ -1,0 +1,346 @@
+package sidecar
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+type Client struct {
+	BaseURL string
+	HTTP    *http.Client
+}
+
+func NewClient(baseURL string) *Client {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	return &Client{
+		BaseURL: baseURL,
+		HTTP:    &http.Client{Timeout: 2 * time.Minute},
+	}
+}
+
+func (c *Client) Health(ctx context.Context) (*Health, error) {
+	var health Health
+	if err := c.do(ctx, http.MethodGet, "/health", nil, &health); err != nil {
+		return nil, err
+	}
+	if health.Protocol.ProtocolVersion != ProtocolVersion {
+		return nil, fmt.Errorf("unsupported Inline sidecar protocol %d, expected %d", health.Protocol.ProtocolVersion, ProtocolVersion)
+	}
+	return &health, nil
+}
+
+func (c *Client) Status(ctx context.Context) (*Status, error) {
+	var status Status
+	if err := c.doRPC(ctx, http.MethodGet, "/status", nil, "status", &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+func (c *Client) AuthStart(ctx context.Context, request AuthStartRequest) (*AuthStartResult, error) {
+	var result AuthStartResult
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/auth/start", request, "auth_start", &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) AuthVerify(ctx context.Context, request AuthVerifyRequest) (*AuthVerifyResult, error) {
+	var result AuthVerifyResult
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/auth/verify", request, "auth_verify", &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) Resume(ctx context.Context) (*Status, error) {
+	var status Status
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/resume", nil, "status", &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+func (c *Client) Connect(ctx context.Context, token, namespace string) (*Status, error) {
+	request := ConnectRequest{
+		Auth:             AccessToken(token),
+		AccountNamespace: namespace,
+	}
+	var status Status
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/connect", request, "status", &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+func (c *Client) Logout(ctx context.Context) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/logout", nil, "empty", nil)
+}
+
+func (c *Client) Dialogs(ctx context.Context, request DialogsRequest) (*DialogsPage, error) {
+	var page DialogsPage
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/dialogs", request, "dialogs", &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+func (c *Client) History(ctx context.Context, request HistoryRequest) (*HistoryPage, error) {
+	var page HistoryPage
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/history", request, "history", &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+func (c *Client) ChatParticipants(ctx context.Context, request ChatParticipantsRequest) (*ChatParticipantsPage, error) {
+	var page ChatParticipantsPage
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/chat/participants", request, "chat_participants", &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+func (c *Client) CreateDM(ctx context.Context, request CreateDMRequest) (*CreatedChat, error) {
+	var chat CreatedChat
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/chat/create-dm", request, "created_chat", &chat); err != nil {
+		return nil, err
+	}
+	return &chat, nil
+}
+
+func (c *Client) CreateThread(ctx context.Context, request CreateThreadRequest) (*CreatedChat, error) {
+	var chat CreatedChat
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/chat/create-thread", request, "created_chat", &chat); err != nil {
+		return nil, err
+	}
+	return &chat, nil
+}
+
+func (c *Client) CreateReplyThread(ctx context.Context, request CreateReplyThreadRequest) (*CreatedChat, error) {
+	var chat CreatedChat
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/chat/create-reply-thread", request, "created_chat", &chat); err != nil {
+		return nil, err
+	}
+	return &chat, nil
+}
+
+func (c *Client) SendText(ctx context.Context, request SendTextRequest) (*MessageMutation, error) {
+	var mutation MessageMutation
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/send", request, "message", &mutation); err != nil {
+		return nil, err
+	}
+	return &mutation, nil
+}
+
+func (c *Client) Upload(ctx context.Context, request UploadRequest, data []byte) (*MessageMutation, error) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	metadata, err := writer.CreateFormField("metadata")
+	if err != nil {
+		return nil, fmt.Errorf("create upload metadata field: %w", err)
+	}
+	if err := json.NewEncoder(metadata).Encode(request); err != nil {
+		return nil, fmt.Errorf("encode upload metadata: %w", err)
+	}
+	fileName := "upload.bin"
+	if request.FileName != nil && strings.TrimSpace(*request.FileName) != "" {
+		fileName = strings.TrimSpace(*request.FileName)
+	}
+	file, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return nil, fmt.Errorf("create upload file field: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
+		return nil, fmt.Errorf("write upload file field: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("finalize upload multipart body: %w", err)
+	}
+
+	var response Response
+	if err := c.doRaw(ctx, http.MethodPost, "/rpc/upload", writer.FormDataContentType(), &body, &response); err != nil {
+		return nil, err
+	}
+	var mutation MessageMutation
+	if err := decodeRPCResponse(response, "message", &mutation); err != nil {
+		return nil, err
+	}
+	return &mutation, nil
+}
+
+func (c *Client) EditMessage(ctx context.Context, request EditMessageRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/edit", request, "empty", nil)
+}
+
+func (c *Client) DeleteMessage(ctx context.Context, request DeleteMessageRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/delete", request, "empty", nil)
+}
+
+func (c *Client) React(ctx context.Context, request ReactRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/react", request, "empty", nil)
+}
+
+func (c *Client) Read(ctx context.Context, request ReadRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/read", request, "empty", nil)
+}
+
+func (c *Client) Typing(ctx context.Context, request TypingRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/typing", request, "empty", nil)
+}
+
+func (c *Client) Events(ctx context.Context) (*EventStream, error) {
+	url := websocketURL(c.BaseURL, "/ws/events")
+	conn, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &EventStream{conn: conn}, nil
+}
+
+type EventStream struct {
+	conn *websocket.Conn
+}
+
+func (stream *EventStream) Recv(ctx context.Context) (*EventEnvelope, error) {
+	messageType, reader, err := stream.conn.Reader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if messageType != websocket.MessageText {
+		_, _ = io.Copy(io.Discard, reader)
+		return nil, fmt.Errorf("unexpected Inline sidecar event message type %v", messageType)
+	}
+	var envelope EventEnvelope
+	if err := json.NewDecoder(reader).Decode(&envelope); err != nil {
+		return nil, err
+	}
+	if envelope.ProtocolVersion != ProtocolVersion {
+		return nil, fmt.Errorf("unsupported Inline sidecar protocol %d, expected %d", envelope.ProtocolVersion, ProtocolVersion)
+	}
+	return &envelope, nil
+}
+
+func (stream *EventStream) Close(status websocket.StatusCode, reason string) error {
+	return stream.conn.Close(status, reason)
+}
+
+func (c *Client) doRPC(ctx context.Context, method, path string, body any, resultType string, out any) error {
+	var response Response
+	if err := c.do(ctx, method, path, body, &response); err != nil {
+		return err
+	}
+	return decodeRPCResponse(response, resultType, out)
+}
+
+func decodeRPCResponse(response Response, resultType string, out any) error {
+	if response.ProtocolVersion != ProtocolVersion {
+		return fmt.Errorf("unsupported Inline sidecar protocol %d, expected %d", response.ProtocolVersion, ProtocolVersion)
+	}
+	switch response.Outcome.Status {
+	case "ok":
+		var result Result
+		if err := json.Unmarshal(response.Outcome.Data, &result); err != nil {
+			return fmt.Errorf("decode Inline sidecar result: %w", err)
+		}
+		if result.Type != resultType {
+			return fmt.Errorf("unexpected Inline sidecar result %q, expected %q", result.Type, resultType)
+		}
+		if out == nil {
+			return nil
+		}
+		if err := json.Unmarshal(result.Data, out); err != nil {
+			return fmt.Errorf("decode Inline sidecar %s result: %w", result.Type, err)
+		}
+		return nil
+	case "error":
+		var sidecarErr Error
+		if err := json.Unmarshal(response.Outcome.Data, &sidecarErr); err != nil {
+			return fmt.Errorf("decode Inline sidecar error: %w", err)
+		}
+		return &sidecarErr
+	default:
+		return fmt.Errorf("unknown Inline sidecar outcome %q", response.Outcome.Status)
+	}
+}
+
+func websocketURL(baseURL, path string) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	switch {
+	case strings.HasPrefix(baseURL, "https://"):
+		return "wss://" + strings.TrimPrefix(baseURL, "https://") + path
+	case strings.HasPrefix(baseURL, "http://"):
+		return "ws://" + strings.TrimPrefix(baseURL, "http://") + path
+	default:
+		return baseURL + path
+	}
+}
+
+func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
+	var reqBody *bytes.Reader
+	if body == nil {
+		reqBody = bytes.NewReader(nil)
+	} else {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("encode Inline sidecar request: %w", err)
+		}
+		reqBody = bytes.NewReader(raw)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, reqBody)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	return c.doRequest(req, out)
+}
+
+func (c *Client) doRaw(ctx context.Context, method, path, contentType string, body io.Reader, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, body)
+	if err != nil {
+		return err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return c.doRequest(req, out)
+}
+
+func (c *Client) doRequest(req *http.Request, out any) error {
+	httpClient := c.HTTP
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Inline sidecar %s %s returned HTTP %d", req.Method, req.URL.Path, resp.StatusCode)
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("decode Inline sidecar response: %w", err)
+	}
+	return nil
+}
