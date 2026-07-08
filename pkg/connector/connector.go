@@ -10,6 +10,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
 )
@@ -17,6 +18,13 @@ import (
 const (
 	loginFlowEmail = "chat.inline.matrix.email"
 	loginFlowPhone = "chat.inline.matrix.phone"
+
+	defaultDisplayName      = "Inline"
+	defaultNetworkURL       = "https://inline.chat"
+	defaultNetworkID        = "inline"
+	defaultBeeperBridgeType = "github.com/inline-chat/matrix-inline"
+	defaultPort             = 29343
+	defaultCommandPrefix    = "!inline"
 )
 
 type InlineConnector struct {
@@ -25,7 +33,10 @@ type InlineConnector struct {
 }
 
 type Config struct {
-	SidecarURL string `yaml:"sidecar_url" json:"sidecar_url"`
+	DisplayName string `yaml:"displayname" json:"displayname"`
+	NetworkURL  string `yaml:"network_url" json:"network_url"`
+	NetworkIcon string `yaml:"network_icon" json:"network_icon"`
+	SidecarURL  string `yaml:"sidecar_url" json:"sidecar_url"`
 }
 
 type UserLoginMetadata struct {
@@ -47,11 +58,14 @@ func (ic *InlineConnector) Start(ctx context.Context) error {
 	if _, ok := ic.br.Matrix.(bridgev2.MatrixConnectorWithServer); !ok {
 		return fmt.Errorf("matrix connector does not implement MatrixConnectorWithServer")
 	}
+	if err := ic.validateConfig(); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (ic *InlineConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 1, 1
+	return 2, 1
 }
 
 func (ic *InlineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
@@ -89,17 +103,24 @@ func (ic *InlineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilitie
 
 func (ic *InlineConnector) GetName() bridgev2.BridgeName {
 	return bridgev2.BridgeName{
-		DisplayName:      "Inline",
-		NetworkURL:       "https://inline.chat",
-		NetworkIcon:      "",
-		NetworkID:        "inline",
-		BeeperBridgeType: "github.com/inline-chat/matrix-inline",
-		DefaultPort:      29343,
+		DisplayName:          configString(ic.Config.DisplayName, defaultDisplayName),
+		NetworkURL:           configString(ic.Config.NetworkURL, defaultNetworkURL),
+		NetworkIcon:          id.ContentURIString(strings.TrimSpace(ic.Config.NetworkIcon)),
+		NetworkID:            defaultNetworkID,
+		BeeperBridgeType:     defaultBeeperBridgeType,
+		DefaultPort:          defaultPort,
+		DefaultCommandPrefix: defaultCommandPrefix,
 	}
 }
 
 func (ic *InlineConnector) GetConfig() (example string, data any, upgrader configupgrade.Upgrader) {
-	return "sidecar_url: http://127.0.0.1:29342\n", &ic.Config, nil
+	return `displayname: Inline
+network_url: https://inline.chat
+# Matrix Content URI (mxc://...) for the Inline bridge/network icon.
+# Set appservice.bot.avatar to the same URI for a matching bridge bot avatar.
+network_icon: ""
+sidecar_url: http://127.0.0.1:29342
+`, &ic.Config, nil
 }
 
 func (ic *InlineConnector) GetDBMetaTypes() database.MetaTypes {
@@ -156,6 +177,24 @@ func (ic *InlineConnector) sidecarURL(override string) string {
 		return ic.Config.SidecarURL
 	}
 	return sidecar.DefaultBaseURL
+}
+
+func (ic *InlineConnector) validateConfig() error {
+	icon := strings.TrimSpace(ic.Config.NetworkIcon)
+	if icon == "" {
+		return nil
+	}
+	if _, err := id.ParseContentURI(icon); err != nil {
+		return fmt.Errorf("invalid network_icon %q: %w", icon, err)
+	}
+	return nil
+}
+
+func configString(value, fallback string) string {
+	if trimmed := strings.TrimSpace(value); trimmed != "" {
+		return trimmed
+	}
+	return fallback
 }
 
 func newInlineClient(login *bridgev2.UserLogin, meta *UserLoginMetadata, sidecarURL string) *InlineClient {

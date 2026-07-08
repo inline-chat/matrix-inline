@@ -153,10 +153,40 @@ MATRIX_INLINE_HOMESERVER_ADDRESS=http://synapse:8008
 MATRIX_INLINE_HOMESERVER_DOMAIN=example.com
 MATRIX_INLINE_APPSERVICE_ADDRESS=http://matrix-inline:29343
 MATRIX_INLINE_APPSERVICE_HOSTNAME=0.0.0.0
+MATRIX_INLINE_NETWORK_DISPLAYNAME=Inline
+MATRIX_INLINE_NETWORK_URL=https://inline.chat
+MATRIX_INLINE_NETWORK_ICON=mxc://example.com/media-id
+MATRIX_INLINE_BOT_DISPLAYNAME=Inline bridge bot
+MATRIX_INLINE_BOT_AVATAR=mxc://example.com/media-id
 INLINE_API_BASE_URL=https://api.inline.chat/v1
 INLINE_REALTIME_URL=wss://api.inline.chat/realtime
 RUST_LOG=info
 ```
+
+## Bridge Profile
+
+Set a bridge icon before adding users in Beeper or Matrix so management rooms,
+bridge info, spaces, and the bridge bot profile have Inline branding.
+
+Matrix profile avatars use Matrix Content URIs (`mxc://...`). Upload
+`assets/inline-logo.svg` with a Matrix client, Beeper tooling, or homeserver
+admin tooling, then use the returned URI. In the Docker image, the asset is also
+available at `/usr/share/matrix-inline/assets/inline-logo.svg`.
+
+```yaml
+appservice:
+  bot:
+    displayname: Inline bridge bot
+    avatar: mxc://example.com/media-id
+network:
+  displayname: Inline
+  network_url: https://inline.chat
+  network_icon: mxc://example.com/media-id
+```
+
+For Docker deployments, the same values can be injected through environment
+variables. `MATRIX_INLINE_NETWORK_ICON` also sets `appservice.bot.avatar` unless
+`MATRIX_INLINE_BOT_AVATAR` is set.
 
 ## Native Build
 
@@ -211,7 +241,14 @@ database, permissions, and the adapter URL:
 
 ```yaml
 network:
+  displayname: Inline
+  network_url: https://inline.chat
+  network_icon: mxc://example.com/media-id
   sidecar_url: http://127.0.0.1:29342
+appservice:
+  bot:
+    displayname: Inline bridge bot
+    avatar: mxc://example.com/media-id
 ```
 
 Generate registration:

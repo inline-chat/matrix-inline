@@ -73,6 +73,7 @@ RUN apk add --no-cache bash ca-certificates curl jq sqlite-libs su-exec yq-go
 COPY --from=go-builder /out/matrix-inline /usr/bin/matrix-inline
 COPY --from=rust-builder /out-matrix-inline-adapter /usr/bin/matrix-inline-adapter
 COPY matrix-inline/docker-run.sh /docker-run.sh
+COPY matrix-inline/assets /usr/share/matrix-inline/assets
 RUN chmod +x /docker-run.sh
 
 WORKDIR /data

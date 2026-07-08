@@ -12,6 +12,8 @@
 !matrix-inline/Cargo.toml
 !matrix-inline/Cargo.lock
 !matrix-inline/rust-toolchain.toml
+!matrix-inline/assets/
+!matrix-inline/assets/**
 !matrix-inline/cmd/
 !matrix-inline/cmd/**
 !matrix-inline/crates/

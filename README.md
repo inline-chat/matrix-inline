@@ -22,6 +22,7 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Images, videos, files, audio, and voice/audio files
 - [x] Inline member list sync for bridged rooms
 - [x] Matrix ghosts with Inline display names and avatars when available
+- [x] Configurable bridge bot and network profile metadata
 - [x] DM creation with a numeric Inline user ID
 - [x] Basic group/thread creation from Matrix
 - [x] Management commands for status and reconnect
@@ -187,6 +188,11 @@ MATRIX_INLINE_HOMESERVER_ADDRESS=http://synapse:8008
 MATRIX_INLINE_HOMESERVER_DOMAIN=example.com
 MATRIX_INLINE_APPSERVICE_ADDRESS=http://matrix-inline:29343
 MATRIX_INLINE_APPSERVICE_HOSTNAME=0.0.0.0
+MATRIX_INLINE_NETWORK_DISPLAYNAME=Inline
+MATRIX_INLINE_NETWORK_URL=https://inline.chat
+MATRIX_INLINE_NETWORK_ICON=mxc://example.com/media-id
+MATRIX_INLINE_BOT_DISPLAYNAME=Inline bridge bot
+MATRIX_INLINE_BOT_AVATAR=mxc://example.com/media-id
 INLINE_API_BASE_URL=https://api.inline.chat/v1
 INLINE_REALTIME_URL=wss://api.inline.chat/realtime
 RUST_LOG=info
@@ -194,6 +200,28 @@ RUST_LOG=info
 
 The Inline client store contains session credentials. Keep it private and back
 it up with the bridge database.
+
+### Bridge Profile
+
+Matrix bridge icons must be Matrix Content URIs (`mxc://...`). Upload
+[assets/inline-logo.svg](assets/inline-logo.svg) to the homeserver or Beeper
+media store, then set the returned URI in both places. In the Docker image, the
+same asset is available at `/usr/share/matrix-inline/assets/inline-logo.svg`.
+
+```yaml
+appservice:
+  bot:
+    displayname: Inline bridge bot
+    avatar: mxc://example.com/media-id
+network:
+  displayname: Inline
+  network_url: https://inline.chat
+  network_icon: mxc://example.com/media-id
+```
+
+For Docker deployments, `MATRIX_INLINE_NETWORK_ICON` sets both
+`network.network_icon` and `appservice.bot.avatar`. Use
+`MATRIX_INLINE_BOT_AVATAR` only when the bot avatar should be different.
 
 ## Development
 
