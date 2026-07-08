@@ -48,6 +48,9 @@ inline-chat/
   matrix-inline/
 ```
 
+For agent-assisted deployment, use [PROMPT.md](PROMPT.md) as a concise handoff
+that points back to the current setup docs.
+
 ## Docker Setup
 
 Create a data directory:
