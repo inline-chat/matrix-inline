@@ -21,6 +21,7 @@ const (
 
 	defaultDisplayName      = "Inline"
 	defaultNetworkURL       = "https://inline.chat"
+	defaultNetworkIcon      = "mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs"
 	defaultNetworkID        = "inline"
 	defaultBeeperBridgeType = "github.com/inline-chat/matrix-inline"
 	defaultPort             = 29343
@@ -105,7 +106,7 @@ func (ic *InlineConnector) GetName() bridgev2.BridgeName {
 	return bridgev2.BridgeName{
 		DisplayName:          configString(ic.Config.DisplayName, defaultDisplayName),
 		NetworkURL:           configString(ic.Config.NetworkURL, defaultNetworkURL),
-		NetworkIcon:          id.ContentURIString(strings.TrimSpace(ic.Config.NetworkIcon)),
+		NetworkIcon:          id.ContentURIString(configString(ic.Config.NetworkIcon, defaultNetworkIcon)),
 		NetworkID:            defaultNetworkID,
 		BeeperBridgeType:     defaultBeeperBridgeType,
 		DefaultPort:          defaultPort,
@@ -116,8 +117,7 @@ func (ic *InlineConnector) GetName() bridgev2.BridgeName {
 func (ic *InlineConnector) GetConfig() (example string, data any, upgrader configupgrade.Upgrader) {
 	return `displayname: Inline
 network_url: https://inline.chat
-# Matrix Content URI (mxc://...) for the Inline bridge/network icon.
-# Set appservice.bot.avatar to the same URI for a matching bridge bot avatar.
+# Defaults to the official Inline bridge icon. Override with a Matrix Content URI (mxc://...).
 network_icon: ""
 sidecar_url: http://127.0.0.1:29342
 `, &ic.Config, nil

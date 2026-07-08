@@ -15,8 +15,8 @@ func TestGetNameUsesProductionDefaults(t *testing.T) {
 	if name.NetworkURL != defaultNetworkURL {
 		t.Fatalf("NetworkURL = %q, want %q", name.NetworkURL, defaultNetworkURL)
 	}
-	if name.NetworkIcon != "" {
-		t.Fatalf("NetworkIcon = %q, want empty default", name.NetworkIcon)
+	if name.NetworkIcon != defaultNetworkIcon {
+		t.Fatalf("NetworkIcon = %q, want %q", name.NetworkIcon, defaultNetworkIcon)
 	}
 	if name.NetworkID != defaultNetworkID {
 		t.Fatalf("NetworkID = %q, want %q", name.NetworkID, defaultNetworkID)

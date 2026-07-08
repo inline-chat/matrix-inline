@@ -155,9 +155,9 @@ MATRIX_INLINE_APPSERVICE_ADDRESS=http://matrix-inline:29343
 MATRIX_INLINE_APPSERVICE_HOSTNAME=0.0.0.0
 MATRIX_INLINE_NETWORK_DISPLAYNAME=Inline
 MATRIX_INLINE_NETWORK_URL=https://inline.chat
-MATRIX_INLINE_NETWORK_ICON=mxc://example.com/media-id
+MATRIX_INLINE_NETWORK_ICON=mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs
 MATRIX_INLINE_BOT_DISPLAYNAME=Inline bridge bot
-MATRIX_INLINE_BOT_AVATAR=mxc://example.com/media-id
+MATRIX_INLINE_BOT_AVATAR=
 INLINE_API_BASE_URL=https://api.inline.chat/v1
 INLINE_REALTIME_URL=wss://api.inline.chat/realtime
 RUST_LOG=info
@@ -165,28 +165,24 @@ RUST_LOG=info
 
 ## Bridge Profile
 
-Set a bridge icon before adding users in Beeper or Matrix so management rooms,
-bridge info, spaces, and the bridge bot profile have Inline branding.
-
-Matrix profile avatars use Matrix Content URIs (`mxc://...`). Upload
-`assets/inline-logo.svg` with a Matrix client, Beeper tooling, or homeserver
-admin tooling, then use the returned URI. In the Docker image, the asset is also
-available at `/usr/share/matrix-inline/assets/inline-logo.svg`.
+matrix-inline ships with the official Inline display name, URL, and bridge icon.
+Docker deployments also apply the same icon to the appservice bot profile by
+default.
 
 ```yaml
 appservice:
   bot:
     displayname: Inline bridge bot
-    avatar: mxc://example.com/media-id
+    avatar: mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs
 network:
   displayname: Inline
   network_url: https://inline.chat
-  network_icon: mxc://example.com/media-id
+  network_icon: mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs
 ```
 
-For Docker deployments, the same values can be injected through environment
-variables. `MATRIX_INLINE_NETWORK_ICON` also sets `appservice.bot.avatar` unless
-`MATRIX_INLINE_BOT_AVATAR` is set.
+For custom branding, set `MATRIX_INLINE_NETWORK_ICON`. Use
+`MATRIX_INLINE_BOT_AVATAR` only when the bot avatar should be different from the
+bridge icon.
 
 ## Native Build
 
@@ -243,12 +239,12 @@ database, permissions, and the adapter URL:
 network:
   displayname: Inline
   network_url: https://inline.chat
-  network_icon: mxc://example.com/media-id
+  network_icon: mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs
   sidecar_url: http://127.0.0.1:29342
 appservice:
   bot:
     displayname: Inline bridge bot
-    avatar: mxc://example.com/media-id
+    avatar: mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs
 ```
 
 Generate registration:
