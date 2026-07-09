@@ -46,7 +46,8 @@ Commands:
   start    Start Synapse in Docker plus host bridge and adapter binaries.
   smoke    Start if needed, then verify adapter health and Matrix appservice bot round-trip.
   live-check
-           After Inline login, verify adapter resume, dialogs, history, and one member fetch.
+           After Inline login, verify adapter RPCs, bridge status, visible portals,
+           and at least one bridged message when Inline history is available.
   status   Print local service status.
   logs     Tail bridge, adapter, and Synapse logs.
   stop     Stop host bridge/adapter and stop the Synapse container.
@@ -69,6 +70,10 @@ function require_base_commands {
 	require_cmd cargo
 	require_cmd curl
 	require_cmd jq
+}
+
+function require_live_commands {
+	require_cmd sqlite3
 }
 
 function require_docker_commands {
@@ -356,6 +361,25 @@ function matrix_auth_json {
 	fi
 }
 
+function create_management_room {
+	local token=$1 bot_mxid=$2 name=$3
+	local room_body
+	room_body=$(jq -nc \
+		--arg bot "${bot_mxid}" \
+		--arg name "${name}" \
+		'{preset:"private_chat", is_direct:true, invite:[$bot], name:$name}')
+	matrix_auth_json "${token}" POST "/_matrix/client/v3/createRoom" "${room_body}" | jq -r '.room_id'
+}
+
+function send_matrix_text {
+	local token=$1 room_id=$2 body=$3
+	local txn send_body encoded_room
+	txn="e2e-$(date +%s%N)"
+	send_body=$(jq -nc --arg body "${body}" '{msgtype:"m.text", body:$body}')
+	encoded_room=$(uri_encode "${room_id}")
+	matrix_auth_json "${token}" PUT "/_matrix/client/v3/rooms/${encoded_room}/send/m.room.message/${txn}" "${send_body}" >/dev/null
+}
+
 function sidecar_post_json {
 	local path=$1 body=${2:-}
 	if [[ -n "${body}" ]]; then
@@ -411,6 +435,64 @@ function wait_for_bot_message {
 	return 1
 }
 
+function bridge_db_scalar {
+	local query=$1
+	sqlite3 -readonly -cmd ".timeout 5000" "${BRIDGE_DATA}/matrix-inline.db" "${query}"
+}
+
+function bridge_portal_rooms_json {
+	bridge_db_scalar "SELECT mxid FROM portal WHERE mxid IS NOT NULL AND mxid <> '' ORDER BY mxid;" \
+		| jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
+function matrix_visible_portal_count {
+	local token=$1 portals_json=$2
+	local sync_response
+	sync_response=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/sync?timeout=0")
+	jq -r --argjson portals "${portals_json}" '
+		[(((.rooms.join // {}) + (.rooms.invite // {})) | keys[]) as $room
+			| select($portals | index($room))]
+		| length
+	' <<<"${sync_response}"
+}
+
+function wait_for_bridge_delivery {
+	local token=$1 dialog_count=$2 sampled_history_count=$3
+	local min_portals min_messages wait_seconds db_portals visible_portals bridged_messages rooms_json
+	min_portals="${MATRIX_INLINE_E2E_MIN_VISIBLE_PORTALS:-1}"
+	min_messages="${MATRIX_INLINE_E2E_MIN_BRIDGED_MESSAGES:-0}"
+	wait_seconds="${MATRIX_INLINE_E2E_BRIDGE_WAIT_SECONDS:-120}"
+
+	if [[ "${dialog_count}" == "0" ]]; then
+		return 0
+	fi
+	if (( sampled_history_count > 0 && min_messages == 0 )); then
+		min_messages=1
+	fi
+
+	echo "==> Waiting for Matrix-visible portal delivery"
+	for _ in $(seq 1 "${wait_seconds}"); do
+		rooms_json=$(bridge_portal_rooms_json)
+		db_portals=$(jq -r 'length' <<<"${rooms_json}")
+		visible_portals=$(matrix_visible_portal_count "${token}" "${rooms_json}")
+		bridged_messages=$(bridge_db_scalar "SELECT COUNT(*) FROM message;")
+
+		if (( db_portals >= min_portals && visible_portals >= min_portals && bridged_messages >= min_messages )); then
+			echo "Bridge portals visible: ${visible_portals}/${db_portals}; bridged messages: ${bridged_messages}"
+			return 0
+		fi
+		sleep 1
+	done
+
+	echo "Bridge delivery check failed after ${wait_seconds}s." >&2
+	echo "Portal rooms in bridge DB: ${db_portals:-0}" >&2
+	echo "Portal rooms visible to Matrix user: ${visible_portals:-0}" >&2
+	echo "Bridged message rows: ${bridged_messages:-0}" >&2
+	echo "Expected at least ${min_portals} visible portal(s) and ${min_messages} bridged message row(s)." >&2
+	echo "If bridge DB portals exist but visible portals are 0, portal rooms may be missing the Matrix user's invite/join membership." >&2
+	return 1
+}
+
 function smoke {
 	start
 
@@ -419,23 +501,17 @@ function smoke {
 	echo "==> Adapter resume"
 	curl -fsS -X POST "${SIDECAR_URL}/rpc/resume" | jq .
 
-	local token bot_localpart bot_mxid room_body room_id txn send_body encoded_room
+	local token bot_localpart bot_mxid room_id
 	token=$(matrix_login_token)
 	bot_localpart=$(bridge_config_value appservice.bot.username)
 	bot_mxid="@${bot_localpart}:${SERVER_NAME}"
 
 	echo "==> Creating management room with ${bot_mxid}"
-	room_body=$(jq -nc \
-		--arg bot "${bot_mxid}" \
-		'{preset:"private_chat", is_direct:true, invite:[$bot], name:"matrix-inline e2e management"}')
-	room_id=$(matrix_auth_json "${token}" POST "/_matrix/client/v3/createRoom" "${room_body}" | jq -r '.room_id')
+	room_id=$(create_management_room "${token}" "${bot_mxid}" "matrix-inline e2e management")
 	wait_for_bot_message "${token}" "${room_id}" "${bot_mxid}" "Inline bridge bot|management room|Use .*help"
 
 	echo "==> Sending command through Matrix appservice transaction"
-	txn="e2e-$(date +%s)"
-	send_body=$(jq -nc '{msgtype:"m.text", body:"!inline list-logins"}')
-	encoded_room=$(uri_encode "${room_id}")
-	matrix_auth_json "${token}" PUT "/_matrix/client/v3/rooms/${encoded_room}/send/m.room.message/${txn}" "${send_body}" >/dev/null
+	send_matrix_text "${token}" "${room_id}" "!inline list-logins"
 	wait_for_bot_message "${token}" "${room_id}" "${bot_mxid}" "not logged in"
 
 	echo "Local Matrix/appservice smoke check passed."
@@ -443,8 +519,10 @@ function smoke {
 
 function live_check {
 	start
+	require_live_commands
 
 	local resume status dialog_limit history_limit dialogs_body dialogs_response dialog_count chat_id history_body history_response message_count group_chat_id participants_body participants_response participants_count
+	local token bot_localpart bot_mxid room_id login_count named_login_count profile_name_count avatar_count
 	echo "==> Resuming Inline adapter session"
 	resume=$(sidecar_post_json "/rpc/resume")
 	require_sidecar_ok "resume" "${resume}"
@@ -458,6 +536,26 @@ function live_check {
 		;;
 	esac
 	echo "Inline adapter status: ${status}"
+
+	token=$(matrix_login_token)
+	bot_localpart=$(bridge_config_value appservice.bot.username)
+	bot_mxid="@${bot_localpart}:${SERVER_NAME}"
+
+	echo "==> Checking bridge-visible Inline status through Matrix"
+	room_id=$(create_management_room "${token}" "${bot_mxid}" "matrix-inline e2e live check")
+	wait_for_bot_message "${token}" "${room_id}" "${bot_mxid}" "Inline bridge bot|management room|Use .*help"
+	send_matrix_text "${token}" "${room_id}" "!inline inline-status"
+	wait_for_bot_message "${token}" "${room_id}" "${bot_mxid}" 'Sidecar: `?(Connected|Reconnecting)'
+
+	login_count=$(bridge_db_scalar "SELECT COUNT(*) FROM user_login;")
+	named_login_count=$(bridge_db_scalar "SELECT COUNT(*) FROM user_login WHERE remote_name = 'Inline';")
+	profile_name_count=$(bridge_db_scalar "SELECT COUNT(*) FROM user_login WHERE remote_profile LIKE '%Inline%';")
+	avatar_count=$(bridge_db_scalar "SELECT COUNT(*) FROM user_login WHERE remote_profile LIKE '%mxc://%';")
+	echo "Bridge logins: ${login_count}; names pinned: ${named_login_count}; profiles named: ${profile_name_count}; profiles with avatar: ${avatar_count}"
+	if (( login_count == 0 || named_login_count != login_count || profile_name_count != login_count || avatar_count == 0 )); then
+		echo "Bridge user_login metadata is missing or not pinned to Inline." >&2
+		return 1
+	fi
 
 	dialog_limit="${MATRIX_INLINE_E2E_DIALOG_LIMIT:-20}"
 	history_limit="${MATRIX_INLINE_E2E_HISTORY_LIMIT:-5}"
@@ -502,6 +600,8 @@ function live_check {
 	else
 		echo "No group chat found in the first ${dialog_limit} dialogs; skipping participant fetch."
 	fi
+
+	wait_for_bridge_delivery "${token}" "${dialog_count}" "${message_count}"
 
 	echo "Live Inline adapter check passed."
 }
