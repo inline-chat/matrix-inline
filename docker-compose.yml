@@ -7,6 +7,8 @@ services:
       INLINE_SIDECAR_BIND: 127.0.0.1:29342
       INLINE_SIDECAR_URL: http://127.0.0.1:29342
       INLINE_CLIENT_STORE: /data/inline-client/inline-client.sqlite3
+      INLINE_API_BASE_URL: ${INLINE_API_BASE_URL:-https://api.inline.chat/v1}
+      INLINE_REALTIME_URL: ${INLINE_REALTIME_URL:-wss://api.inline.chat/realtime}
       MATRIX_INLINE_DB_URI: file:/data/matrix-inline.db?_txlock=immediate
       MATRIX_INLINE_HOMESERVER_ADDRESS: ${MATRIX_INLINE_HOMESERVER_ADDRESS:-}
       MATRIX_INLINE_HOMESERVER_DOMAIN: ${MATRIX_INLINE_HOMESERVER_DOMAIN:-}
