@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
 )
@@ -88,6 +90,60 @@ func TestInlineCodeLoginDefersInviteSignup(t *testing.T) {
 	if login.contact != "" || login.challengeToken != "" {
 		t.Fatalf("login state contact=%q challenge=%q, want empty", login.contact, login.challengeToken)
 	}
+}
+
+func TestConnectCompletedLoginCallsNetworkConnectSynchronously(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	client := &recordingLoginClient{}
+	connectCompletedLogin(requestCtx, &bridgev2.UserLogin{Client: client})
+
+	if client.connectCalls != 1 {
+		t.Fatalf("connectCalls = %d, want 1", client.connectCalls)
+	}
+	if client.connectCtx == requestCtx {
+		t.Fatal("Connect received the cancelable request context")
+	}
+	if err := client.connectCtx.Err(); err != nil {
+		t.Fatalf("Connect context is canceled: %v", err)
+	}
+}
+
+type recordingLoginClient struct {
+	connectCalls int
+	connectCtx   context.Context
+}
+
+func (client *recordingLoginClient) Connect(ctx context.Context) {
+	client.connectCalls++
+	client.connectCtx = ctx
+}
+
+func (client *recordingLoginClient) Disconnect() {}
+
+func (client *recordingLoginClient) IsLoggedIn() bool { return true }
+
+func (client *recordingLoginClient) LogoutRemote(context.Context) {}
+
+func (client *recordingLoginClient) IsThisUser(context.Context, networkid.UserID) bool {
+	return false
+}
+
+func (client *recordingLoginClient) GetChatInfo(context.Context, *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
+	return nil, nil
+}
+
+func (client *recordingLoginClient) GetUserInfo(context.Context, *bridgev2.Ghost) (*bridgev2.UserInfo, error) {
+	return nil, nil
+}
+
+func (client *recordingLoginClient) GetCapabilities(context.Context, *bridgev2.Portal) *event.RoomFeatures {
+	return &event.RoomFeatures{}
+}
+
+func (client *recordingLoginClient) HandleMatrixMessage(context.Context, *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
+	return nil, nil
 }
 
 func writeLoginRPCResult(t *testing.T, w http.ResponseWriter, resultType string, data any) {

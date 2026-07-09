@@ -9,7 +9,6 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
-	"maunium.net/go/mautrix/bridgev2/status"
 
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
 )
@@ -106,8 +105,7 @@ func (login *InlineCodeLogin) submitCode(ctx context.Context, input map[string]s
 		return nil, fmt.Errorf("failed to create Inline user login: %w", err)
 	}
 
-	go ul.Client.Connect(context.Background())
-	ul.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+	connectCompletedLogin(ctx, ul)
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,
 		StepID:       "chat.inline.matrix.complete",
@@ -117,6 +115,17 @@ func (login *InlineCodeLogin) submitCode(ctx context.Context, input map[string]s
 			UserLogin:   ul,
 		},
 	}, nil
+}
+
+func connectCompletedLogin(ctx context.Context, ul *bridgev2.UserLogin) {
+	if ul == nil || ul.Client == nil {
+		return
+	}
+	connectCtx := context.WithoutCancel(ctx)
+	if ul.Bridge != nil && ul.Bridge.BackgroundCtx != nil {
+		connectCtx = ul.Bridge.BackgroundCtx
+	}
+	ul.Client.Connect(connectCtx)
 }
 
 func (login *InlineCodeLogin) Cancel() {}

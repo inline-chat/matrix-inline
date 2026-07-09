@@ -669,11 +669,12 @@ func (ic *InlineClient) syncDialogs(ctx context.Context) error {
 	cursor := ""
 	seenCursors := make(map[string]struct{})
 	remainingRPCs := dialogSyncRPCBudget
+	deferredWork := make([]sidecar.DialogRecord, 0)
 
 	for {
 		if remainingRPCs <= 0 {
 			ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
-			return nil
+			break
 		}
 		page, err := ic.Sidecar.Dialogs(ctx, sidecar.DialogsRequest{
 			Limit:  &limit,
@@ -693,51 +694,64 @@ func (ic *InlineClient) syncDialogs(ctx context.Context) error {
 			if changed {
 				ic.queueDialogResync(ctx, dialog)
 			}
-			if !isDMDialog(dialog) && ic.needsDialogDetailsSync(dialog.ChatID) {
-				if remainingRPCs <= 0 {
-					ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
-					return nil
-				}
-				if err := ic.syncDialogDetails(ctx, dialog); err != nil {
-					if isRateLimitedError(err) {
-						return err
-					}
-					ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline chat details")
-				} else {
-					ic.markDialogDetailsSynced(dialog.ChatID)
-				}
-				remainingRPCs--
-				if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
-					return err
-				}
-			}
-			if dialogNeedsStartupHistory(dialog) {
-				if remainingRPCs <= 0 {
-					ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
-					return nil
-				}
-				if err := ic.syncRecentHistory(ctx, dialog); err != nil {
-					if isRateLimitedError(err) {
-						return err
-					}
-					ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline startup history")
-				}
-				remainingRPCs--
-				if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
-					return err
-				}
+			if (!isDMDialog(dialog) && ic.needsDialogDetailsSync(dialog.ChatID)) || dialogNeedsStartupHistory(dialog) {
+				deferredWork = append(deferredWork, dialog)
 			}
 		}
 
 		if page.NextCursor == "" {
-			return nil
+			break
 		}
 		if _, ok := seenCursors[page.NextCursor]; ok {
-			return nil
+			break
 		}
 		seenCursors[page.NextCursor] = struct{}{}
 		cursor = page.NextCursor
 	}
+	return ic.syncDeferredDialogWork(ctx, deferredWork, remainingRPCs)
+}
+
+func (ic *InlineClient) syncDeferredDialogWork(ctx context.Context, dialogs []sidecar.DialogRecord, remainingRPCs int) error {
+	for _, dialog := range dialogs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !isDMDialog(dialog) && ic.needsDialogDetailsSync(dialog.ChatID) {
+			if remainingRPCs <= 0 {
+				ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
+				return nil
+			}
+			if err := ic.syncDialogDetails(ctx, dialog); err != nil {
+				if isRateLimitedError(err) {
+					return err
+				}
+				ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline chat details")
+			} else {
+				ic.markDialogDetailsSynced(dialog.ChatID)
+			}
+			remainingRPCs--
+			if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
+				return err
+			}
+		}
+		if dialogNeedsStartupHistory(dialog) {
+			if remainingRPCs <= 0 {
+				ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
+				return nil
+			}
+			if err := ic.syncRecentHistory(ctx, dialog); err != nil {
+				if isRateLimitedError(err) {
+					return err
+				}
+				ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline startup history")
+			}
+			remainingRPCs--
+			if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (ic *InlineClient) syncDialogDetails(ctx context.Context, dialog sidecar.DialogRecord) error {
@@ -1115,7 +1129,9 @@ func dialogName(dialog sidecar.DialogRecord) *string {
 func (ic *InlineClient) queueChatResyncByID(ctx context.Context, chatID int64) {
 	if dialog, ok := ic.cachedDialog(chatID); ok {
 		ic.queueDialogResync(ctx, dialog)
+		return
 	}
+	ic.queueDialogResync(ctx, sidecar.DialogRecord{ChatID: chatID})
 }
 
 func (ic *InlineClient) cacheUsers(users []sidecar.UserRecord) {
