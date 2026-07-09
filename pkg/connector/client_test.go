@@ -705,6 +705,40 @@ func TestIsRateLimitedErrorDetectsInlineFloodResponses(t *testing.T) {
 	}
 }
 
+func TestSyncDeferredDialogWorkStopsOnRateLimitedHistory(t *testing.T) {
+	var historyCalls int
+	var participantsCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/rpc/history":
+			historyCalls++
+			writeConnectorSidecarError(t, w, "Network", "websocket error: HTTP error: 420 <unknown status code>")
+		case "/rpc/chat/participants":
+			participantsCalls++
+			t.Fatalf("participants should not be fetched after a rate-limited history request")
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	last := int64(20)
+	ic := &InlineClient{Sidecar: sidecar.NewClient(server.URL)}
+	err := ic.syncDeferredDialogWork(context.Background(), []sidecar.DialogRecord{{
+		ChatID:        7,
+		LastMessageID: &last,
+	}}, dialogSyncRPCBudget)
+	if !isRateLimitedError(err) {
+		t.Fatalf("syncDeferredDialogWork() error = %v, want rate-limit error", err)
+	}
+	if historyCalls != 1 {
+		t.Fatalf("history calls = %d, want 1", historyCalls)
+	}
+	if participantsCalls != 0 {
+		t.Fatalf("participants calls = %d, want 0", participantsCalls)
+	}
+}
+
 func TestGetUserInfoUsesCachedInlineUser(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/avatar.jpg" {
@@ -808,6 +842,24 @@ func writeConnectorSidecarResult(t *testing.T, w http.ResponseWriter, resultType
 		Outcome: sidecar.ResponseOutcome{
 			Status: "ok",
 			Data:   responseData,
+		},
+	}); err != nil {
+		t.Fatalf("encode sidecar response: %v", err)
+	}
+}
+
+func writeConnectorSidecarError(t *testing.T, w http.ResponseWriter, category, message string) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(sidecar.Response{
+		ProtocolVersion: sidecar.ProtocolVersion,
+		ID:              "test-1",
+		Outcome: sidecar.ResponseOutcome{
+			Status: "error",
+			Data: mustConnectorJSON(t, sidecar.Error{
+				Category: category,
+				Message:  message,
+			}),
 		},
 	}); err != nil {
 		t.Fatalf("encode sidecar response: %v", err)
