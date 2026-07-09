@@ -49,6 +49,7 @@ For a deterministic bridge-level check that does not require an Inline account:
 
 ```sh
 scripts/e2e-local.sh fixture-check
+scripts/e2e-local.sh fixture-restart-check
 scripts/e2e-local.sh fixture-stop
 ```
 
@@ -56,7 +57,9 @@ This uses a local fixture sidecar instead of the Rust adapter. Synapse and the
 Go bridge still run normally. The check logs in through the bridge provisioning
 API, waits for DM and group portals to become visible to the Matrix test user,
 verifies backfilled messages, sends a Matrix message through a portal, and pushes
-a fixture realtime inbound message into the bridge.
+a fixture realtime inbound message into the bridge. The restart check also stops
+and restarts bridge-side processes to verify missed-message catch-up and realtime
+delivery after an existing login reconnects.
 
 Fixture data is stored under `data/e2e-fixture/` by default.
 

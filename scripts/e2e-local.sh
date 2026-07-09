@@ -51,7 +51,7 @@ REGISTRATION_SECRET_FILE="${SYNAPSE_DATA}/registration_shared_secret"
 
 function usage {
 	cat <<EOF
-Usage: scripts/e2e-local.sh <prepare|start|smoke|live-check|fixture-check|fixture-status|fixture-logs|fixture-stop|status|logs|stop|restart>
+Usage: scripts/e2e-local.sh <prepare|start|smoke|live-check|fixture-check|fixture-restart-check|fixture-status|fixture-logs|fixture-stop|status|logs|stop|restart>
 
 Commands:
   prepare  Build host binaries and generate local Synapse/bridge configs.
@@ -63,6 +63,9 @@ Commands:
   fixture-check
            Run a deterministic fake-sidecar E2E check for login, portals,
            backfill, outbound Matrix -> Inline, and inbound realtime delivery.
+  fixture-restart-check
+           Run fixture-check plus bridge/sidecar restart recovery and missed
+           message catch-up checks.
   fixture-status, fixture-logs, fixture-stop
            Inspect or stop the fixture E2E environment.
   status   Print local service status.
@@ -348,6 +351,7 @@ function stop_pid {
 			fi
 			sleep 0.5
 		done
+		wait "${pid}" 2>/dev/null || true
 	fi
 }
 
@@ -599,6 +603,10 @@ function fixture_sent_count {
 	curl -fsS "${SIDECAR_URL}/fixture/sent" | jq -r '.sent_texts | length'
 }
 
+function fixture_event_client_count {
+	curl -fsS "${SIDECAR_URL}/fixture/status" | jq -r '.event_clients'
+}
+
 function wait_for_fixture_sent_count {
 	local min_count=$1
 	local count
@@ -611,6 +619,21 @@ function wait_for_fixture_sent_count {
 		sleep 1
 	done
 	echo "Timed out waiting for fixture sidecar to record ${min_count} outbound send(s)." >&2
+	return 1
+}
+
+function wait_for_fixture_event_clients {
+	local min_count=${1:-1}
+	local count
+	for _ in $(seq 1 60); do
+		count=$(fixture_event_client_count)
+		if (( count >= min_count )); then
+			echo "Fixture sidecar has ${count} realtime event client(s)."
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Timed out waiting for fixture sidecar to have ${min_count} realtime event client(s)." >&2
 	return 1
 }
 
@@ -649,6 +672,42 @@ function fixture_login {
 		return 1
 	fi
 	echo "Fixture login completed as $(jq -r '.complete.user_login_id // "unknown"' <<<"${code_response}")."
+}
+
+function fixture_ensure_login {
+	local token=$1
+	local whoami_count
+	whoami_count=$(provisioning_json "${token}" GET "/v3/whoami" | jq -r '.logins | length')
+	if (( whoami_count == 0 )); then
+		fixture_login "${token}"
+		whoami_count=$(provisioning_json "${token}" GET "/v3/whoami" | jq -r '.logins | length')
+	else
+		echo "Fixture login already exists; reusing it."
+	fi
+	if (( whoami_count == 0 )); then
+		echo "Provisioning whoami returned no logins after fixture login." >&2
+		return 1
+	fi
+}
+
+function fixture_prepare_logged_in_portals {
+	local token=$1 bot_mxid=$2
+	local room_id dm_room group_room
+	echo "==> Creating fixture management room with ${bot_mxid}"
+	room_id=$(create_management_room "${token}" "${bot_mxid}" "matrix-inline fixture management")
+	wait_for_bot_message "${token}" "${room_id}" "${bot_mxid}" "Inline bridge bot|management room|Use .*help"
+	fixture_ensure_login "${token}"
+
+	echo "==> Waiting for fixture portals and backfilled messages"
+	wait_for_bridge_delivery "${token}" 2 1
+	dm_room=$(wait_for_portal_room 101)
+	group_room=$(wait_for_portal_room 202)
+	matrix_join_room "${token}" "${dm_room}"
+	matrix_join_room "${token}" "${group_room}"
+	wait_for_room_message_body "${token}" "${dm_room}" "fixture dm hello"
+	wait_for_room_message_body "${token}" "${group_room}" "fixture group hello"
+	FIXTURE_DM_ROOM="${dm_room}"
+	FIXTURE_GROUP_ROOM="${group_room}"
 }
 
 function smoke {
@@ -769,35 +828,13 @@ function fixture_check {
 	require_live_commands
 	start
 
-	local token bot_localpart bot_mxid room_id dm_room group_room initial_sent_count final_sent_count inbound_text whoami_count
+	local token bot_localpart bot_mxid dm_room initial_sent_count final_sent_count inbound_text
 	token=$(matrix_login_token)
 	bot_localpart=$(bridge_config_value appservice.bot.username)
 	bot_mxid="@${bot_localpart}:${SERVER_NAME}"
 
-	echo "==> Creating fixture management room with ${bot_mxid}"
-	room_id=$(create_management_room "${token}" "${bot_mxid}" "matrix-inline fixture management")
-	wait_for_bot_message "${token}" "${room_id}" "${bot_mxid}" "Inline bridge bot|management room|Use .*help"
-
-	whoami_count=$(provisioning_json "${token}" GET "/v3/whoami" | jq -r '.logins | length')
-	if (( whoami_count == 0 )); then
-		fixture_login "${token}"
-		whoami_count=$(provisioning_json "${token}" GET "/v3/whoami" | jq -r '.logins | length')
-	else
-		echo "Fixture login already exists; reusing it."
-	fi
-	if (( whoami_count == 0 )); then
-		echo "Provisioning whoami returned no logins after fixture login." >&2
-		return 1
-	fi
-
-	echo "==> Waiting for fixture portals and backfilled messages"
-	wait_for_bridge_delivery "${token}" 2 1
-	dm_room=$(wait_for_portal_room 101)
-	group_room=$(wait_for_portal_room 202)
-	matrix_join_room "${token}" "${dm_room}"
-	matrix_join_room "${token}" "${group_room}"
-	wait_for_room_message_body "${token}" "${dm_room}" "fixture dm hello"
-	wait_for_room_message_body "${token}" "${group_room}" "fixture group hello"
+	fixture_prepare_logged_in_portals "${token}" "${bot_mxid}"
+	dm_room="${FIXTURE_DM_ROOM}"
 
 	echo "==> Sending Matrix outbound message through DM portal"
 	initial_sent_count=$(fixture_sent_count)
@@ -807,10 +844,46 @@ function fixture_check {
 
 	echo "==> Pushing fixture realtime inbound message"
 	inbound_text="fixture realtime inbound $(date +%s)"
+	wait_for_fixture_event_clients 1
 	fixture_push_message 101 "${inbound_text}"
 	wait_for_room_message_body "${token}" "${dm_room}" "${inbound_text}"
 
 	echo "Fixture Matrix/appservice portal and message flow passed."
+}
+
+function fixture_restart_check {
+	SIDECAR_MODE=fixture
+	require_live_commands
+	start
+
+	local token bot_localpart bot_mxid dm_room catchup_text realtime_text
+	token=$(matrix_login_token)
+	bot_localpart=$(bridge_config_value appservice.bot.username)
+	bot_mxid="@${bot_localpart}:${SERVER_NAME}"
+	fixture_prepare_logged_in_portals "${token}" "${bot_mxid}"
+	dm_room="${FIXTURE_DM_ROOM}"
+
+	echo "==> Stopping Go bridge and queuing fixture message while bridge is down"
+	stop_pid "bridge" "${RUN_DIR}/bridge.pid"
+	catchup_text="fixture catchup after bridge restart $(date +%s)"
+	fixture_push_message 101 "${catchup_text}"
+
+	echo "==> Restarting Go bridge and waiting for missed message catch-up"
+	start_bridge
+	wait_for_room_message_body "${token}" "${dm_room}" "${catchup_text}"
+
+	echo "==> Restarting bridge and fixture sidecar, then verifying realtime resumes"
+	stop_pid "bridge" "${RUN_DIR}/bridge.pid"
+	stop_pid "adapter" "${RUN_DIR}/adapter.pid"
+	start_adapter
+	start_bridge
+	fixture_ensure_login "${token}"
+	realtime_text="fixture realtime after full restart $(date +%s)"
+	wait_for_fixture_event_clients 1
+	fixture_push_message 101 "${realtime_text}"
+	wait_for_room_message_body "${token}" "${dm_room}" "${realtime_text}"
+
+	echo "Fixture restart recovery and catch-up check passed."
 }
 
 function status {
@@ -865,6 +938,7 @@ start) start ;;
 smoke) smoke ;;
 live-check) live_check ;;
 fixture-check) fixture_check ;;
+fixture-restart-check) fixture_restart_check ;;
 fixture-status) status ;;
 fixture-logs) logs ;;
 fixture-stop) stop ;;

@@ -10,11 +10,13 @@ From the repo root:
 scripts/check.sh
 scripts/smoke-local.sh --start-adapter
 scripts/e2e-local.sh fixture-check
+scripts/e2e-local.sh fixture-restart-check
 ```
 
 `fixture-check` uses a deterministic local sidecar to verify Matrix portal
 creation, backfill, outbound messages, and inbound realtime delivery without an
-Inline account.
+Inline account. `fixture-restart-check` extends that coverage to bridge restart
+catch-up and realtime delivery after reconnecting an existing login.
 
 For an installed bridge:
 

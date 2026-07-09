@@ -134,6 +134,7 @@ func (srv *fixtureServer) register(mux *http.ServeMux) {
 	mux.HandleFunc("/rpc/typing", srv.handleEmpty)
 	mux.HandleFunc("/ws/events", srv.handleEvents)
 	mux.HandleFunc("/fixture/sent", srv.handleFixtureSent)
+	mux.HandleFunc("/fixture/status", srv.handleFixtureStatus)
 	mux.HandleFunc("/fixture/push-message", srv.handleFixturePushMessage)
 }
 
@@ -332,6 +333,17 @@ func (srv *fixtureServer) handleFixtureSent(w http.ResponseWriter, r *http.Reque
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	srv.writeJSON(w, map[string]any{"sent_texts": srv.sent})
+}
+
+func (srv *fixtureServer) handleFixtureStatus(w http.ResponseWriter, r *http.Request) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.writeJSON(w, map[string]any{
+		"logged_in":       srv.loggedIn,
+		"event_clients":   len(srv.clients),
+		"sent_texts":      len(srv.sent),
+		"next_message_id": srv.nextMessageID,
+	})
 }
 
 func (srv *fixtureServer) handleFixturePushMessage(w http.ResponseWriter, r *http.Request) {
