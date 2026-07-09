@@ -13,7 +13,7 @@ if [[ ! -d "${INLINE_PUBLIC}" ]]; then
 fi
 
 echo "==> Go format"
-gofmt_files="$(gofmt -l cmd pkg scripts/e2econfig)"
+gofmt_files="$(gofmt -l cmd pkg scripts/e2econfig scripts/e2efixture)"
 if [[ -n "${gofmt_files}" ]]; then
 	echo "Go files need gofmt:" >&2
 	echo "${gofmt_files}" >&2

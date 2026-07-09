@@ -9,7 +9,12 @@ From the repo root:
 ```sh
 scripts/check.sh
 scripts/smoke-local.sh --start-adapter
+scripts/e2e-local.sh fixture-check
 ```
+
+`fixture-check` uses a deterministic local sidecar to verify Matrix portal
+creation, backfill, outbound messages, and inbound realtime delivery without an
+Inline account.
 
 For an installed bridge:
 

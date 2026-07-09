@@ -2,8 +2,18 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-E2E_ROOT="${MATRIX_INLINE_E2E_ROOT:-${ROOT}/data/e2e}"
-PROJECT="${MATRIX_INLINE_E2E_PROJECT:-matrix-inline-e2e}"
+COMMAND="${1:-}"
+DEFAULT_E2E_ROOT="${ROOT}/data/e2e"
+DEFAULT_PROJECT="matrix-inline-e2e"
+if [[ "${COMMAND}" == fixture-* ]]; then
+	DEFAULT_E2E_ROOT="${ROOT}/data/e2e-fixture"
+	DEFAULT_PROJECT="matrix-inline-e2e-fixture"
+fi
+E2E_ROOT="${MATRIX_INLINE_E2E_ROOT:-${DEFAULT_E2E_ROOT}}"
+if [[ "${E2E_ROOT}" != /* ]]; then
+	E2E_ROOT="${ROOT}/${E2E_ROOT}"
+fi
+PROJECT="${MATRIX_INLINE_E2E_PROJECT:-${DEFAULT_PROJECT}}"
 
 SYNAPSE_IMAGE="${MATRIX_INLINE_E2E_SYNAPSE_IMAGE:-matrixdotorg/synapse:latest}"
 SERVER_NAME="${MATRIX_INLINE_E2E_SERVER_NAME:-localhost}"
@@ -15,6 +25,7 @@ HOMESERVER_ADDRESS="${MATRIX_INLINE_E2E_HOMESERVER_ADDRESS:-http://127.0.0.1:${S
 
 SIDECAR_BIND="${INLINE_SIDECAR_BIND:-127.0.0.1:29342}"
 SIDECAR_URL="${INLINE_SIDECAR_URL:-http://${SIDECAR_BIND}}"
+SIDECAR_MODE="${MATRIX_INLINE_E2E_SIDECAR:-rust}"
 INLINE_API_BASE_URL="${INLINE_API_BASE_URL:-https://api.inline.chat/v1}"
 INLINE_REALTIME_URL="${INLINE_REALTIME_URL:-wss://api.inline.chat/realtime}"
 
@@ -30,6 +41,7 @@ SYNAPSE_DATA="${E2E_ROOT}/synapse"
 
 BRIDGE_BIN="${BIN_DIR}/matrix-inline"
 ADAPTER_BIN="${ROOT}/target/debug/matrix-inline-adapter"
+FIXTURE_SIDECAR_BIN="${BIN_DIR}/matrix-inline-fixture-sidecar"
 BRIDGE_CONFIG="${BRIDGE_DATA}/config.yaml"
 BRIDGE_REGISTRATION="${BRIDGE_DATA}/registration.yaml"
 SYNAPSE_CONFIG="${SYNAPSE_DATA}/homeserver.yaml"
@@ -39,7 +51,7 @@ REGISTRATION_SECRET_FILE="${SYNAPSE_DATA}/registration_shared_secret"
 
 function usage {
 	cat <<EOF
-Usage: scripts/e2e-local.sh <prepare|start|smoke|live-check|status|logs|stop|restart>
+Usage: scripts/e2e-local.sh <prepare|start|smoke|live-check|fixture-check|fixture-status|fixture-logs|fixture-stop|status|logs|stop|restart>
 
 Commands:
   prepare  Build host binaries and generate local Synapse/bridge configs.
@@ -48,6 +60,11 @@ Commands:
   live-check
            After Inline login, verify adapter RPCs, bridge status, visible portals,
            and at least one bridged message when Inline history is available.
+  fixture-check
+           Run a deterministic fake-sidecar E2E check for login, portals,
+           backfill, outbound Matrix -> Inline, and inbound realtime delivery.
+  fixture-status, fixture-logs, fixture-stop
+           Inspect or stop the fixture E2E environment.
   status   Print local service status.
   logs     Tail bridge, adapter, and Synapse logs.
   stop     Stop host bridge/adapter and stop the Synapse container.
@@ -67,9 +84,11 @@ function require_cmd {
 
 function require_base_commands {
 	require_cmd go
-	require_cmd cargo
 	require_cmd curl
 	require_cmd jq
+	if [[ "${SIDECAR_MODE}" != "fixture" ]]; then
+		require_cmd cargo
+	fi
 }
 
 function require_live_commands {
@@ -122,8 +141,13 @@ function build_binaries {
 	mkdir -p "${BIN_DIR}"
 	echo "==> Building Go bridge"
 	(cd "${ROOT}" && go build -tags goolm -o "${BRIDGE_BIN}" ./cmd/matrix-inline)
-	echo "==> Building Rust adapter"
-	(cd "${ROOT}" && cargo build -p matrix-inline-adapter)
+	if [[ "${SIDECAR_MODE}" == "fixture" ]]; then
+		echo "==> Building fixture sidecar"
+		(cd "${ROOT}" && go build -tags goolm -o "${FIXTURE_SIDECAR_BIN}" ./scripts/e2efixture)
+	else
+		echo "==> Building Rust adapter"
+		(cd "${ROOT}" && cargo build -p matrix-inline-adapter)
+	fi
 }
 
 function generate_bridge_config {
@@ -261,6 +285,17 @@ function start_adapter {
 		return 0
 	fi
 
+	if [[ "${SIDECAR_MODE}" == "fixture" ]]; then
+		echo "==> Starting fixture sidecar"
+		mkdir -p "${BRIDGE_DATA}/inline-client" "${LOG_DIR}" "${RUN_DIR}"
+		start_background "${LOG_DIR}/adapter.log" \
+			"${FIXTURE_SIDECAR_BIN}" \
+			--bind "${SIDECAR_BIND}" \
+			--state "${BRIDGE_DATA}/fixture-sidecar.json" >"${pid_file}"
+		wait_for_http "fixture sidecar health" "${SIDECAR_URL}/health"
+		return 0
+	fi
+
 	echo "==> Starting Rust adapter"
 	mkdir -p "${BRIDGE_DATA}/inline-client" "${LOG_DIR}" "${RUN_DIR}"
 	start_background "${LOG_DIR}/adapter.log" \
@@ -361,6 +396,29 @@ function matrix_auth_json {
 	fi
 }
 
+function test_user_mxid {
+	echo "@${TEST_USER}:${SERVER_NAME}"
+}
+
+function provisioning_json {
+	local token=$1 method=$2 path=$3 body=${4:-}
+	local user_param
+	user_param=$(uri_encode "$(test_user_mxid)")
+	if [[ -n "${body}" ]]; then
+		curl -fsS \
+			-X "${method}" \
+			-H "Authorization: Bearer ${token}" \
+			-H "Content-Type: application/json" \
+			-d "${body}" \
+			"http://127.0.0.1:${BRIDGE_PORT}/_matrix/provision${path}?user_id=${user_param}"
+	else
+		curl -fsS \
+			-X "${method}" \
+			-H "Authorization: Bearer ${token}" \
+			"http://127.0.0.1:${BRIDGE_PORT}/_matrix/provision${path}?user_id=${user_param}"
+	fi
+}
+
 function create_management_room {
 	local token=$1 bot_mxid=$2 name=$3
 	local room_body
@@ -378,6 +436,35 @@ function send_matrix_text {
 	send_body=$(jq -nc --arg body "${body}" '{msgtype:"m.text", body:$body}')
 	encoded_room=$(uri_encode "${room_id}")
 	matrix_auth_json "${token}" PUT "/_matrix/client/v3/rooms/${encoded_room}/send/m.room.message/${txn}" "${send_body}" >/dev/null
+}
+
+function matrix_join_room {
+	local token=$1 room_id=$2
+	local encoded_room
+	encoded_room=$(uri_encode "${room_id}")
+	matrix_auth_json "${token}" POST "/_matrix/client/v3/rooms/${encoded_room}/join" "{}" >/dev/null
+}
+
+function wait_for_room_message_body {
+	local token=$1 room_id=$2 pattern=$3
+	local encoded_room response
+	encoded_room=$(uri_encode "${room_id}")
+	for _ in $(seq 1 60); do
+		response=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/rooms/${encoded_room}/messages?dir=b&limit=50")
+		if jq -e --arg pattern "${pattern}" '
+			($pattern | ascii_downcase) as $needle
+			|
+			.chunk[]?
+			| (.content.body? // "")
+			| ascii_downcase
+			| select(contains($needle))
+		' >/dev/null <<<"${response}"; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Timed out waiting for Matrix room message containing ${pattern}" >&2
+	return 1
 }
 
 function sidecar_post_json {
@@ -493,6 +580,77 @@ function wait_for_bridge_delivery {
 	return 1
 }
 
+function wait_for_portal_room {
+	local chat_id=$1
+	local room_id
+	for _ in $(seq 1 120); do
+		room_id=$(bridge_db_scalar "SELECT mxid FROM portal WHERE id = '${chat_id}' AND mxid IS NOT NULL AND mxid <> '' LIMIT 1;")
+		if [[ -n "${room_id}" ]]; then
+			echo "${room_id}"
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Timed out waiting for portal room for Inline chat ${chat_id}" >&2
+	return 1
+}
+
+function fixture_sent_count {
+	curl -fsS "${SIDECAR_URL}/fixture/sent" | jq -r '.sent_texts | length'
+}
+
+function wait_for_fixture_sent_count {
+	local min_count=$1
+	local count
+	for _ in $(seq 1 60); do
+		count=$(fixture_sent_count)
+		if (( count >= min_count )); then
+			echo "Fixture sidecar recorded ${count} outbound send(s)."
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Timed out waiting for fixture sidecar to record ${min_count} outbound send(s)." >&2
+	return 1
+}
+
+function fixture_push_message {
+	local chat_id=$1 text=$2
+	local body
+	body=$(jq -nc --argjson chat_id "${chat_id}" --arg text "${text}" '{chat_id:$chat_id, text:$text}')
+	curl -fsS \
+		-X POST \
+		-H "Content-Type: application/json" \
+		-d "${body}" \
+		"${SIDECAR_URL}/fixture/push-message" >/dev/null
+}
+
+function fixture_login {
+	local token=$1
+	local start_response login_id step_id step_type contact_response code_response
+	echo "==> Logging into fixture sidecar through bridge provisioning"
+	start_response=$(provisioning_json "${token}" POST "/v3/login/start/chat.inline.matrix.email")
+	login_id=$(jq -r '.login_id' <<<"${start_response}")
+	step_id=$(jq -r '.step_id' <<<"${start_response}")
+	step_type=$(jq -r '.type' <<<"${start_response}")
+	if [[ -z "${login_id}" || "${login_id}" == "null" ]]; then
+		echo "Provisioning login start did not return a login_id:" >&2
+		jq . >&2 <<<"${start_response}"
+		return 1
+	fi
+
+	contact_response=$(provisioning_json "${token}" POST "/v3/login/step/${login_id}/${step_id}/${step_type}" '{"email":"fixture@example.com"}')
+	step_id=$(jq -r '.step_id' <<<"${contact_response}")
+	step_type=$(jq -r '.type' <<<"${contact_response}")
+	code_response=$(provisioning_json "${token}" POST "/v3/login/step/${login_id}/${step_id}/${step_type}" '{"verification_code":"123456"}')
+	if [[ "$(jq -r '.type' <<<"${code_response}")" != "complete" ]]; then
+		echo "Provisioning fixture login did not complete:" >&2
+		jq . >&2 <<<"${code_response}"
+		return 1
+	fi
+	echo "Fixture login completed as $(jq -r '.complete.user_login_id // "unknown"' <<<"${code_response}")."
+}
+
 function smoke {
 	start
 
@@ -606,6 +764,55 @@ function live_check {
 	echo "Live Inline adapter check passed."
 }
 
+function fixture_check {
+	SIDECAR_MODE=fixture
+	require_live_commands
+	start
+
+	local token bot_localpart bot_mxid room_id dm_room group_room initial_sent_count final_sent_count inbound_text whoami_count
+	token=$(matrix_login_token)
+	bot_localpart=$(bridge_config_value appservice.bot.username)
+	bot_mxid="@${bot_localpart}:${SERVER_NAME}"
+
+	echo "==> Creating fixture management room with ${bot_mxid}"
+	room_id=$(create_management_room "${token}" "${bot_mxid}" "matrix-inline fixture management")
+	wait_for_bot_message "${token}" "${room_id}" "${bot_mxid}" "Inline bridge bot|management room|Use .*help"
+
+	whoami_count=$(provisioning_json "${token}" GET "/v3/whoami" | jq -r '.logins | length')
+	if (( whoami_count == 0 )); then
+		fixture_login "${token}"
+		whoami_count=$(provisioning_json "${token}" GET "/v3/whoami" | jq -r '.logins | length')
+	else
+		echo "Fixture login already exists; reusing it."
+	fi
+	if (( whoami_count == 0 )); then
+		echo "Provisioning whoami returned no logins after fixture login." >&2
+		return 1
+	fi
+
+	echo "==> Waiting for fixture portals and backfilled messages"
+	wait_for_bridge_delivery "${token}" 2 1
+	dm_room=$(wait_for_portal_room 101)
+	group_room=$(wait_for_portal_room 202)
+	matrix_join_room "${token}" "${dm_room}"
+	matrix_join_room "${token}" "${group_room}"
+	wait_for_room_message_body "${token}" "${dm_room}" "fixture dm hello"
+	wait_for_room_message_body "${token}" "${group_room}" "fixture group hello"
+
+	echo "==> Sending Matrix outbound message through DM portal"
+	initial_sent_count=$(fixture_sent_count)
+	send_matrix_text "${token}" "${dm_room}" "fixture outbound from matrix"
+	final_sent_count=$((initial_sent_count + 1))
+	wait_for_fixture_sent_count "${final_sent_count}"
+
+	echo "==> Pushing fixture realtime inbound message"
+	inbound_text="fixture realtime inbound $(date +%s)"
+	fixture_push_message 101 "${inbound_text}"
+	wait_for_room_message_body "${token}" "${dm_room}" "${inbound_text}"
+
+	echo "Fixture Matrix/appservice portal and message flow passed."
+}
+
 function status {
 	echo "E2E root: ${E2E_ROOT}"
 	if [[ -f "${COMPOSE_FILE}" ]]; then
@@ -657,6 +864,10 @@ prepare) prepare ;;
 start) start ;;
 smoke) smoke ;;
 live-check) live_check ;;
+fixture-check) fixture_check ;;
+fixture-status) status ;;
+fixture-logs) logs ;;
+fixture-stop) stop ;;
 status) status ;;
 logs) logs ;;
 stop) stop ;;

@@ -43,6 +43,23 @@ scripts/e2e-local.sh logs
 scripts/e2e-local.sh stop
 ```
 
+## Fixture Flow
+
+For a deterministic bridge-level check that does not require an Inline account:
+
+```sh
+scripts/e2e-local.sh fixture-check
+scripts/e2e-local.sh fixture-stop
+```
+
+This uses a local fixture sidecar instead of the Rust adapter. Synapse and the
+Go bridge still run normally. The check logs in through the bridge provisioning
+API, waits for DM and group portals to become visible to the Matrix test user,
+verifies backfilled messages, sends a Matrix message through a portal, and pushes
+a fixture realtime inbound message into the bridge.
+
+Fixture data is stored under `data/e2e-fixture/` by default.
+
 ## Configuration
 
 The defaults are local-only except for the appservice bind address, which must
@@ -113,3 +130,6 @@ MATRIX_INLINE_E2E_MIN_VISIBLE_PORTALS=1
 MATRIX_INLINE_E2E_MIN_BRIDGED_MESSAGES=0
 MATRIX_INLINE_E2E_BRIDGE_WAIT_SECONDS=120
 ```
+
+`fixture-check` is not a replacement for `live-check`: it does not exercise the
+real Inline API, Rust adapter, auth provider, or production realtime server.
