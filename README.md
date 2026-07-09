@@ -239,6 +239,12 @@ Run a local adapter smoke test:
 scripts/smoke-local.sh --start-adapter
 ```
 
+Run the local Matrix/appservice E2E smoke harness:
+
+```sh
+scripts/e2e-local.sh smoke
+```
+
 Local Go commands use `-tags goolm` so development builds do not require system
 libolm headers.
 
@@ -247,6 +253,7 @@ libolm headers.
 - [Deployment](docs/deployment.md)
 - [Operations](docs/operations.md)
 - [Smoke test](docs/smoke-test.md)
+- [Local E2E harness](docs/local-e2e.md)
 - [systemd units](deploy/systemd)
 
 ## License

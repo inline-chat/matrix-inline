@@ -13,7 +13,7 @@ if [[ ! -d "${INLINE_PUBLIC}" ]]; then
 fi
 
 echo "==> Go format"
-gofmt_files="$(gofmt -l cmd pkg)"
+gofmt_files="$(gofmt -l cmd pkg scripts/e2econfig)"
 if [[ -n "${gofmt_files}" ]]; then
 	echo "Go files need gofmt:" >&2
 	echo "${gofmt_files}" >&2
@@ -24,7 +24,7 @@ echo "==> Go module tidy"
 go mod tidy -diff
 
 echo "==> Shell syntax"
-bash -n scripts/check.sh scripts/smoke-local.sh docker-run.sh
+bash -n scripts/check.sh scripts/smoke-local.sh scripts/e2e-local.sh docker-run.sh
 
 echo "==> Compose config"
 docker compose config >/dev/null
