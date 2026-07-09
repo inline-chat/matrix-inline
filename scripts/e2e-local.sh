@@ -39,12 +39,14 @@ REGISTRATION_SECRET_FILE="${SYNAPSE_DATA}/registration_shared_secret"
 
 function usage {
 	cat <<EOF
-Usage: scripts/e2e-local.sh <prepare|start|smoke|status|logs|stop|restart>
+Usage: scripts/e2e-local.sh <prepare|start|smoke|live-check|status|logs|stop|restart>
 
 Commands:
   prepare  Build host binaries and generate local Synapse/bridge configs.
   start    Start Synapse in Docker plus host bridge and adapter binaries.
   smoke    Start if needed, then verify adapter health and Matrix appservice bot round-trip.
+  live-check
+           After Inline login, verify adapter resume, dialogs, history, and one member fetch.
   status   Print local service status.
   logs     Tail bridge, adapter, and Synapse logs.
   stop     Stop host bridge/adapter and stop the Synapse container.
@@ -354,6 +356,29 @@ function matrix_auth_json {
 	fi
 }
 
+function sidecar_post_json {
+	local path=$1 body=${2:-}
+	if [[ -n "${body}" ]]; then
+		curl -fsS \
+			-X POST \
+			-H "Content-Type: application/json" \
+			-d "${body}" \
+			"${SIDECAR_URL}${path}"
+	else
+		curl -fsS -X POST "${SIDECAR_URL}${path}"
+	fi
+}
+
+function require_sidecar_ok {
+	local label=$1 response=$2
+	if jq -e '.outcome.status == "ok"' >/dev/null <<<"${response}"; then
+		return 0
+	fi
+	echo "Sidecar ${label} failed:" >&2
+	jq . >&2 <<<"${response}"
+	return 1
+}
+
 function uri_encode {
 	jq -rn --arg value "$1" '$value|@uri'
 }
@@ -416,6 +441,71 @@ function smoke {
 	echo "Local Matrix/appservice smoke check passed."
 }
 
+function live_check {
+	start
+
+	local resume status dialog_limit history_limit dialogs_body dialogs_response dialog_count chat_id history_body history_response message_count group_chat_id participants_body participants_response participants_count
+	echo "==> Resuming Inline adapter session"
+	resume=$(sidecar_post_json "/rpc/resume")
+	require_sidecar_ok "resume" "${resume}"
+	status=$(jq -r '.outcome.data.data.status // empty' <<<"${resume}")
+	case "${status}" in
+	Connected | Reconnecting) ;;
+	*)
+		echo "Inline adapter status is ${status:-unknown}, not Connected/Reconnecting." >&2
+		echo "Run scripts/e2e-local.sh smoke to create a local management room, log in there, then rerun scripts/e2e-local.sh live-check." >&2
+		return 1
+		;;
+	esac
+	echo "Inline adapter status: ${status}"
+
+	dialog_limit="${MATRIX_INLINE_E2E_DIALOG_LIMIT:-20}"
+	history_limit="${MATRIX_INLINE_E2E_HISTORY_LIMIT:-5}"
+	dialogs_body=$(jq -nc --argjson limit "${dialog_limit}" '{limit:$limit}')
+
+	echo "==> Fetching Inline dialogs"
+	dialogs_response=$(sidecar_post_json "/rpc/dialogs" "${dialogs_body}")
+	require_sidecar_ok "dialogs" "${dialogs_response}"
+	dialog_count=$(jq -r '.outcome.data.data.dialogs | length' <<<"${dialogs_response}")
+	echo "Inline dialogs returned: ${dialog_count}"
+	if [[ "${dialog_count}" == "0" && "${MATRIX_INLINE_E2E_ALLOW_EMPTY_DIALOGS:-0}" != "1" ]]; then
+		echo "No Inline dialogs returned. Set MATRIX_INLINE_E2E_ALLOW_EMPTY_DIALOGS=1 only for an intentionally empty account." >&2
+		return 1
+	fi
+	if [[ "${dialog_count}" == "0" ]]; then
+		echo "Live adapter check passed for an empty Inline account."
+		return 0
+	fi
+
+	chat_id=$(jq -r '
+		(.outcome.data.data.dialogs | map(select(.last_message_id != null))[0].chat_id)
+		// (.outcome.data.data.dialogs[0].chat_id)
+	' <<<"${dialogs_response}")
+	history_body=$(jq -nc --argjson chat_id "${chat_id}" --argjson limit "${history_limit}" '{chat_id:$chat_id, limit:$limit}')
+
+	echo "==> Fetching Inline history for chat ${chat_id}"
+	history_response=$(sidecar_post_json "/rpc/history" "${history_body}")
+	require_sidecar_ok "history" "${history_response}"
+	message_count=$(jq -r '.outcome.data.data.messages | length' <<<"${history_response}")
+	echo "Inline history messages returned: ${message_count}"
+
+	group_chat_id=$(jq -r '
+		(.outcome.data.data.dialogs | map(select(.peer_user_id == null))[0].chat_id) // empty
+	' <<<"${dialogs_response}")
+	if [[ -n "${group_chat_id}" ]]; then
+		participants_body=$(jq -nc --argjson chat_id "${group_chat_id}" '{chat_id:$chat_id}')
+		echo "==> Fetching Inline participants for group chat ${group_chat_id}"
+		participants_response=$(sidecar_post_json "/rpc/chat/participants" "${participants_body}")
+		require_sidecar_ok "chat participants" "${participants_response}"
+		participants_count=$(jq -r '.outcome.data.data.participants | length' <<<"${participants_response}")
+		echo "Inline participants returned: ${participants_count}"
+	else
+		echo "No group chat found in the first ${dialog_limit} dialogs; skipping participant fetch."
+	fi
+
+	echo "Live Inline adapter check passed."
+}
+
 function status {
 	echo "E2E root: ${E2E_ROOT}"
 	if [[ -f "${COMPOSE_FILE}" ]]; then
@@ -466,6 +556,7 @@ case "${cmd}" in
 prepare) prepare ;;
 start) start ;;
 smoke) smoke ;;
+live-check) live_check ;;
 status) status ;;
 logs) logs ;;
 stop) stop ;;

@@ -34,6 +34,7 @@ Expected adapter states:
 4. Enter the verification code sent by Inline.
 5. Run `inline-status`.
 6. Confirm the account ID and sidecar status are shown.
+7. For the local E2E harness, run `scripts/e2e-local.sh live-check`.
 
 ## Messaging
 

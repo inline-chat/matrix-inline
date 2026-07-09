@@ -80,6 +80,12 @@ The default smoke test verifies:
 After logging into Inline through the management room, use the checklist in
 [Smoke Test](smoke-test.md) to verify:
 
+- adapter resume and live Inline RPCs:
+
+```sh
+scripts/e2e-local.sh live-check
+```
+
 - DM and group portal creation
 - startup sync and catch-up
 - inbound Inline to Matrix delivery
@@ -89,3 +95,7 @@ After logging into Inline through the management room, use the checklist in
 
 The local harness intentionally does not store Inline credentials outside the
 normal adapter store in `data/e2e/bridge/inline-client/`.
+
+`live-check` does not take Inline credentials. It verifies the already-logged-in
+adapter session by fetching dialogs, recent history, and one group member list
+when a group chat is available.
