@@ -42,7 +42,8 @@ Expected adapter states:
 5. Run `inline-status`.
 6. Confirm the account ID and sidecar status are shown.
 7. For the local E2E harness, run `scripts/e2e-local.sh live-check`.
-8. Confirm `live-check` reports at least one Matrix-visible portal for a
+8. For local restart validation, run `scripts/e2e-local.sh live-restart-check`.
+9. Confirm `live-check` reports at least one Matrix-visible portal for a
    non-empty Inline account.
 
 ## Messaging
@@ -78,14 +79,15 @@ Verify both directions:
 ## Restart
 
 1. Restart the bridge and adapter.
-2. Confirm `inline-status` returns `Connected`.
-3. Confirm existing rooms keep their Matrix mappings.
-4. Send a message after restart in both directions.
-5. Confirm messages sent during downtime are synced after reconnect.
+2. For the local E2E harness, run `scripts/e2e-local.sh live-restart-check`.
+3. Confirm `inline-status` returns `Connected`.
+4. Confirm existing rooms keep their Matrix mappings.
+5. Send a message after restart in both directions.
+6. Confirm messages sent during downtime are synced after reconnect.
 
-The local `live-check` command catches the common failure where the bridge has
-created portal rows internally but the Matrix user has not been invited to or
-joined to those rooms.
+The local `live-check` and `live-restart-check` commands catch the common
+failure where the bridge has created portal rows internally but the Matrix user
+has not been invited to or joined to those rooms.
 
 ## Known Limitations
 

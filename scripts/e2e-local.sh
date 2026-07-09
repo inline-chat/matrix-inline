@@ -51,7 +51,7 @@ REGISTRATION_SECRET_FILE="${SYNAPSE_DATA}/registration_shared_secret"
 
 function usage {
 	cat <<EOF
-Usage: scripts/e2e-local.sh <prepare|start|smoke|live-check|fixture-check|fixture-restart-check|fixture-status|fixture-logs|fixture-stop|status|logs|stop|restart>
+Usage: scripts/e2e-local.sh <prepare|start|smoke|live-check|live-restart-check|fixture-check|fixture-restart-check|fixture-status|fixture-logs|fixture-stop|status|logs|stop|restart>
 
 Commands:
   prepare  Build host binaries and generate local Synapse/bridge configs.
@@ -60,6 +60,9 @@ Commands:
   live-check
            After Inline login, verify adapter RPCs, bridge status, visible portals,
            and at least one bridged message when Inline history is available.
+  live-restart-check
+           Run live-check, restart the Rust adapter and Go bridge, then verify
+           the existing Inline login reconnects.
   fixture-check
            Run a deterministic fake-sidecar E2E check for login, portals,
            backfill, outbound Matrix -> Inline, and inbound realtime delivery.
@@ -734,10 +737,7 @@ function smoke {
 	echo "Local Matrix/appservice smoke check passed."
 }
 
-function live_check {
-	start
-	require_live_commands
-
+function live_assert_logged_in_adapter {
 	local resume status dialog_limit history_limit dialogs_body dialogs_response dialog_count chat_id history_body history_response message_count group_chat_id participants_body participants_response participants_count
 	local token bot_localpart bot_mxid room_id login_count named_login_count profile_name_count avatar_count
 	echo "==> Resuming Inline adapter session"
@@ -748,7 +748,7 @@ function live_check {
 	Connected | Reconnecting) ;;
 	*)
 		echo "Inline adapter status is ${status:-unknown}, not Connected/Reconnecting." >&2
-		echo "Run scripts/e2e-local.sh smoke to create a local management room, log in there, then rerun scripts/e2e-local.sh live-check." >&2
+		echo "Run scripts/e2e-local.sh smoke to create a local management room, log in there, then rerun scripts/e2e-local.sh live-check or scripts/e2e-local.sh live-restart-check." >&2
 		return 1
 		;;
 	esac
@@ -821,6 +821,27 @@ function live_check {
 	wait_for_bridge_delivery "${token}" "${dialog_count}" "${message_count}"
 
 	echo "Live Inline adapter check passed."
+}
+
+function live_check {
+	start
+	require_live_commands
+	live_assert_logged_in_adapter
+}
+
+function live_restart_check {
+	start
+	require_live_commands
+	live_assert_logged_in_adapter
+
+	echo "==> Restarting Rust adapter and Go bridge"
+	stop_pid "bridge" "${RUN_DIR}/bridge.pid"
+	stop_pid "adapter" "${RUN_DIR}/adapter.pid"
+	start_adapter
+	start_bridge
+	live_assert_logged_in_adapter
+
+	echo "Live Inline adapter restart check passed."
 }
 
 function fixture_check {
@@ -937,6 +958,7 @@ prepare) prepare ;;
 start) start ;;
 smoke) smoke ;;
 live-check) live_check ;;
+live-restart-check) live_restart_check ;;
 fixture-check) fixture_check ;;
 fixture-restart-check) fixture_restart_check ;;
 fixture-status) status ;;

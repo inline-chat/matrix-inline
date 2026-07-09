@@ -106,6 +106,7 @@ After logging into Inline through the management room, use the checklist in
 
 ```sh
 scripts/e2e-local.sh live-check
+scripts/e2e-local.sh live-restart-check
 ```
 
 - DM and group portal creation
@@ -125,6 +126,9 @@ It also checks that the stored bridge login is named `Inline` and has an uploade
 account avatar, then waits for at least one bridge-created portal room to be
 visible to the local Matrix user. If sampled Inline history contains messages,
 it also requires at least one bridged message row.
+
+`live-restart-check` runs the same verification, restarts the Rust adapter and
+Go bridge, then repeats the verification against the existing Inline login.
 
 Optional tuning:
 
