@@ -105,6 +105,15 @@ func (ic *InlineClient) Connect(ctx context.Context) {
 		ic.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 		ic.ensureRemoteProfile(ctx)
 		ic.startSidecarLoops(ctx)
+	case sidecar.StatusReconnecting:
+		ic.setLoggedIn(true)
+		ic.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateTransientDisconnect,
+			Error:      "inline-sidecar-reconnecting",
+			Message:    "Inline sidecar is reconnecting",
+		})
+		ic.ensureRemoteProfile(ctx)
+		ic.startSidecarLoops(ctx)
 	case sidecar.StatusAuthRequired, sidecar.StatusAuthExpired, sidecar.StatusLoggedOut:
 		ic.setLoggedIn(false)
 		ic.markBadCredentials("inline-auth-required", "Inline session needs relogin")
@@ -1177,6 +1186,17 @@ func (ic *InlineClient) handleStatusChanged(evt *sidecar.StatusChangedEvent) {
 	case sidecar.StatusConnected:
 		ic.setLoggedIn(true)
 		ic.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+	case sidecar.StatusReconnecting:
+		ic.setLoggedIn(true)
+		bridgeState := status.BridgeState{
+			StateEvent: status.StateTransientDisconnect,
+			Error:      "inline-sidecar-reconnecting",
+			Message:    "Inline sidecar is reconnecting",
+		}
+		if evt.Failure != nil {
+			bridgeState.Message = evt.Failure.Message
+		}
+		ic.UserLogin.BridgeState.Send(bridgeState)
 	case sidecar.StatusAuthRequired, sidecar.StatusAuthExpired, sidecar.StatusLoggedOut:
 		ic.setLoggedIn(false)
 		ic.markBadCredentials("inline-auth-required", "Inline session needs relogin")
