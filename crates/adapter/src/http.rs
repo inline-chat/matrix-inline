@@ -20,7 +20,7 @@ use axum::{
 };
 use inline_client::{
     AuthStartRequest, AuthVerifyRequest, ChatParticipantsRequest, ClientCommandError,
-    ClientErrorCategory, ClientRequestError, ConnectRequest, CreateDmRequest,
+    ClientErrorCategory, ClientRequestError, ClientStatus, ConnectRequest, CreateDmRequest,
     CreateReplyThreadRequest, CreateThreadRequest, DeleteMessageRequest, DialogsRequest,
     EditMessageRequest, HistoryRequest, InlineClient, ReactRequest, ReadRequest, SendTextRequest,
     TypingRequest, UploadRequest,
@@ -380,11 +380,20 @@ async fn handle_command(
             .auth_verify(auth)
             .await
             .map(|result| SidecarResult::AuthVerify(result.into())),
-        SidecarCommand::Resume => client
-            .resume_session()
-            .await
-            .map(SidecarStatus::from_client)
-            .map(SidecarResult::Status),
+        SidecarCommand::Resume => {
+            let snapshot = client.status_snapshot();
+            if matches!(
+                snapshot.status,
+                ClientStatus::Connected | ClientStatus::Reconnecting
+            ) {
+                return Ok(SidecarResult::Status(SidecarStatus::from_client(snapshot)));
+            }
+            client
+                .resume_session()
+                .await
+                .map(SidecarStatus::from_client)
+                .map(SidecarResult::Status)
+        }
         SidecarCommand::Connect(connect) => client
             .connect(connect)
             .await
@@ -583,6 +592,36 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: SidecarResponse = json_response(response).await;
+        match response.outcome {
+            SidecarOutcome::Ok(SidecarResult::Status(status)) => {
+                assert_eq!(status.status, inline_client::ClientStatus::Connected);
+                assert_eq!(status.protocol.protocol_version, PROTOCOL_VERSION);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_endpoint_returns_current_status_when_already_connected() {
+        let client = InlineClient::builder()
+            .initial_status(inline_client::ClientStatus::Connected)
+            .build()
+            .spawn();
+        let app = sidecar_router(client);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc/resume")
                     .body(Body::empty())
                     .unwrap(),
             )

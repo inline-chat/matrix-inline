@@ -28,6 +28,7 @@ func TestPatchBridgeConfigSetsLocalE2EFields(t *testing.T) {
 	})
 
 	assertPath(t, doc, "network.sidecar_url", "http://127.0.0.1:29342")
+	assertPath(t, doc, "sidecar_url", "http://127.0.0.1:29342")
 	assertPath(t, doc, "database.type", "sqlite3-fk-wal")
 	assertPath(t, doc, "database.uri", "file:/tmp/matrix-inline-e2e.db?_txlock=immediate")
 	assertPath(t, doc, "database.max_open_conns", "1")

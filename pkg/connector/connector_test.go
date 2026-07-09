@@ -65,3 +65,20 @@ func TestValidateConfigAcceptsMXCNetworkIcon(t *testing.T) {
 		t.Fatalf("validateConfig() error = %v", err)
 	}
 }
+
+func TestSidecarURLPrecedence(t *testing.T) {
+	t.Setenv("INLINE_SIDECAR_URL", "http://127.0.0.1:29352")
+	connector := &InlineConnector{Config: Config{SidecarURL: "http://127.0.0.1:29342"}}
+
+	if got := connector.sidecarURL("http://127.0.0.1:29399"); got != "http://127.0.0.1:29399" {
+		t.Fatalf("sidecarURL override = %q", got)
+	}
+	if got := connector.sidecarURL(""); got != "http://127.0.0.1:29352" {
+		t.Fatalf("sidecarURL env = %q", got)
+	}
+
+	t.Setenv("INLINE_SIDECAR_URL", "")
+	if got := connector.sidecarURL(""); got != "http://127.0.0.1:29342" {
+		t.Fatalf("sidecarURL config = %q", got)
+	}
+}

@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"go.mau.fi/util/configupgrade"
@@ -174,6 +175,9 @@ func (ic *InlineConnector) CreateLogin(ctx context.Context, user *bridgev2.User,
 func (ic *InlineConnector) sidecarURL(override string) string {
 	if strings.TrimSpace(override) != "" {
 		return override
+	}
+	if envURL := strings.TrimSpace(os.Getenv("INLINE_SIDECAR_URL")); envURL != "" {
+		return envURL
 	}
 	if strings.TrimSpace(ic.Config.SidecarURL) != "" {
 		return ic.Config.SidecarURL

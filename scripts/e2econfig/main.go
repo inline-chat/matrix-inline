@@ -131,6 +131,7 @@ func patchBridgeConfig(doc map[string]any, patch bridgePatch) {
 	setPath(doc, "network.displayname", "Inline")
 	setPath(doc, "network.network_url", "https://inline.chat")
 	setPath(doc, "network.sidecar_url", patch.SidecarURL)
+	setPath(doc, "sidecar_url", patch.SidecarURL)
 
 	setPath(doc, "database.type", "sqlite3-fk-wal")
 	setPath(doc, "database.uri", patch.DatabaseURI)

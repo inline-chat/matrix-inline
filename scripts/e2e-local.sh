@@ -156,12 +156,7 @@ function build_binaries {
 	fi
 }
 
-function generate_bridge_config {
-	mkdir -p "${BRIDGE_DATA}"
-	if [[ ! -f "${BRIDGE_CONFIG}" ]]; then
-		"${BRIDGE_BIN}" -c "${BRIDGE_CONFIG}" -e
-	fi
-
+function patch_bridge_config {
 	(cd "${ROOT}" && go run ./scripts/e2econfig patch-bridge \
 		--config "${BRIDGE_CONFIG}" \
 		--homeserver-address "${HOMESERVER_ADDRESS}" \
@@ -172,10 +167,30 @@ function generate_bridge_config {
 		--sidecar-url "${SIDECAR_URL}" \
 		--database-uri "file:${BRIDGE_DATA}/matrix-inline.db?_txlock=immediate" \
 		--admin-localpart "${TEST_USER}")
+}
+
+function assert_bridge_config {
+	local configured_sidecar
+	configured_sidecar=$(bridge_config_value network.sidecar_url)
+	if [[ "${configured_sidecar}" != "${SIDECAR_URL}" ]]; then
+		echo "Generated bridge config sidecar_url is ${configured_sidecar}, expected ${SIDECAR_URL}" >&2
+		return 1
+	fi
+}
+
+function generate_bridge_config {
+	mkdir -p "${BRIDGE_DATA}"
+	if [[ ! -f "${BRIDGE_CONFIG}" ]]; then
+		"${BRIDGE_BIN}" -c "${BRIDGE_CONFIG}" -e
+	fi
+
+	patch_bridge_config
 
 	if [[ ! -f "${BRIDGE_REGISTRATION}" ]]; then
 		"${BRIDGE_BIN}" -g -c "${BRIDGE_CONFIG}" -r "${BRIDGE_REGISTRATION}"
 	fi
+	patch_bridge_config
+	assert_bridge_config
 	cp "${BRIDGE_REGISTRATION}" "${SYNAPSE_REGISTRATION}"
 }
 
@@ -325,7 +340,7 @@ function start_bridge {
 
 	echo "==> Starting Go bridge"
 	start_background "${LOG_DIR}/bridge.log" \
-		env BRIDGEV2=1 \
+		env BRIDGEV2=1 INLINE_SIDECAR_URL="${SIDECAR_URL}" \
 		"${BRIDGE_BIN}" -c "${BRIDGE_CONFIG}" -r "${BRIDGE_REGISTRATION}" >"${pid_file}"
 	wait_for_tcp "bridge appservice" "127.0.0.1" "${BRIDGE_PORT}"
 }
