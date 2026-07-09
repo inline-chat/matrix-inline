@@ -28,6 +28,8 @@ bash -n scripts/check.sh scripts/smoke-local.sh scripts/e2e-local.sh docker-run.
 
 echo "==> Compose config"
 docker compose config >/dev/null
+docker compose config | grep -q 'INLINE_API_BASE_URL:'
+docker compose config | grep -q 'INLINE_REALTIME_URL:'
 
 echo "==> Go tests"
 go test -tags goolm ./...
