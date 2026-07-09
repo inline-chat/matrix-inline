@@ -19,6 +19,8 @@ const (
 	loginFlowEmail = "chat.inline.matrix.email"
 	loginFlowPhone = "chat.inline.matrix.phone"
 
+	inlineRemoteDisplayName = "Inline"
+
 	defaultDisplayName      = "Inline"
 	defaultNetworkURL       = "https://inline.chat"
 	defaultNetworkIcon      = "mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs"
@@ -206,6 +208,7 @@ func newInlineClient(login *bridgev2.UserLogin, meta *UserLoginMetadata, sidecar
 		users:     make(map[int64]sidecar.UserRecord),
 		dialogs:   make(map[int64]sidecar.DialogRecord),
 		details:   make(map[int64]struct{}),
+		history:   make(map[int64]int64),
 	}
 }
 

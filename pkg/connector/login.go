@@ -9,6 +9,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/status"
 
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
 )
@@ -83,18 +84,18 @@ func (login *InlineCodeLogin) submitCode(ctx context.Context, input map[string]s
 		storeNamespace = accountID
 	}
 
-	remoteName := "Inline " + accountID
 	meta := &UserLoginMetadata{
 		AccountID:      accountID,
-		RemoteName:     remoteName,
+		RemoteName:     inlineRemoteDisplayName,
 		SidecarURL:     sidecarClient.BaseURL,
 		StoreNamespace: storeNamespace,
 	}
 
 	ul, err := login.User.NewLogin(ctx, &database.UserLogin{
-		ID:         networkid.UserLoginID(accountID),
-		RemoteName: remoteName,
-		Metadata:   meta,
+		ID:            networkid.UserLoginID(accountID),
+		RemoteName:    inlineRemoteDisplayName,
+		RemoteProfile: status.RemoteProfile{Name: inlineRemoteDisplayName},
+		Metadata:      meta,
 	}, &bridgev2.NewLoginParams{
 		LoadUserLogin: func(ctx context.Context, ul *bridgev2.UserLogin) error {
 			ul.Client = newInlineClient(ul, meta, sidecarClient.BaseURL)

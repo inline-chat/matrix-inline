@@ -53,6 +53,7 @@ type InlineClient struct {
 	users    map[int64]sidecar.UserRecord
 	dialogs  map[int64]sidecar.DialogRecord
 	details  map[int64]struct{}
+	history  map[int64]int64
 
 	runCancel context.CancelFunc
 	wg        sync.WaitGroup
@@ -102,6 +103,7 @@ func (ic *InlineClient) Connect(ctx context.Context) {
 	case sidecar.StatusConnected:
 		ic.setLoggedIn(true)
 		ic.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+		ic.ensureRemoteProfile(ctx)
 		ic.startSidecarLoops(ctx)
 	case sidecar.StatusAuthRequired, sidecar.StatusAuthExpired, sidecar.StatusLoggedOut:
 		ic.setLoggedIn(false)
@@ -694,7 +696,7 @@ func (ic *InlineClient) syncDialogs(ctx context.Context) error {
 			if changed {
 				ic.queueDialogResync(ctx, dialog)
 			}
-			if (!isDMDialog(dialog) && ic.needsDialogDetailsSync(dialog.ChatID)) || dialogNeedsStartupHistory(dialog) {
+			if (!isDMDialog(dialog) && ic.needsDialogDetailsSync(dialog.ChatID)) || ic.needsHistoryDelivery(dialog) {
 				deferredWork = append(deferredWork, dialog)
 			}
 		}
@@ -712,6 +714,26 @@ func (ic *InlineClient) syncDialogs(ctx context.Context) error {
 }
 
 func (ic *InlineClient) syncDeferredDialogWork(ctx context.Context, dialogs []sidecar.DialogRecord, remainingRPCs int) error {
+	for _, dialog := range ic.prioritizedHistoryDialogs(dialogs) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if remainingRPCs <= 0 {
+			ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
+			return nil
+		}
+		if err := ic.syncRecentHistory(ctx, dialog); err != nil {
+			if isRateLimitedError(err) {
+				return err
+			}
+			ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline startup history")
+		}
+		remainingRPCs--
+		if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
+			return err
+		}
+	}
+
 	for _, dialog := range dialogs {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -734,24 +756,34 @@ func (ic *InlineClient) syncDeferredDialogWork(ctx context.Context, dialogs []si
 				return err
 			}
 		}
-		if dialogNeedsStartupHistory(dialog) {
-			if remainingRPCs <= 0 {
-				ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
-				return nil
-			}
-			if err := ic.syncRecentHistory(ctx, dialog); err != nil {
-				if isRateLimitedError(err) {
-					return err
-				}
-				ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to fetch Inline startup history")
-			}
-			remainingRPCs--
-			if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
+}
+
+func (ic *InlineClient) prioritizedHistoryDialogs(dialogs []sidecar.DialogRecord) []sidecar.DialogRecord {
+	work := make([]sidecar.DialogRecord, 0, len(dialogs))
+	for _, dialog := range dialogs {
+		if ic.needsHistoryDelivery(dialog) {
+			work = append(work, dialog)
+		}
+	}
+	sort.SliceStable(work, func(i, j int) bool {
+		left, right := work[i], work[j]
+		leftCheckpointed := ic.historyCheckpoint(left.ChatID) > 0
+		rightCheckpointed := ic.historyCheckpoint(right.ChatID) > 0
+		if leftCheckpointed != rightCheckpointed {
+			return leftCheckpointed
+		}
+		if isDMDialog(left) != isDMDialog(right) {
+			return isDMDialog(left)
+		}
+		leftLast, rightLast := lastMessageIDValue(left), lastMessageIDValue(right)
+		if leftLast != rightLast {
+			return leftLast > rightLast
+		}
+		return left.ChatID < right.ChatID
+	})
+	return work
 }
 
 func (ic *InlineClient) syncDialogDetails(ctx context.Context, dialog sidecar.DialogRecord) error {
@@ -773,17 +805,10 @@ func (ic *InlineClient) syncDialogDetails(ctx context.Context, dialog sidecar.Di
 }
 
 func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.DialogRecord) error {
-	if !dialogNeedsStartupHistory(dialog) {
+	if !ic.needsHistoryDelivery(dialog) {
 		return nil
 	}
-	limit := uint32(startupHistoryLimit)
-	request := sidecar.HistoryRequest{
-		ChatID: dialog.ChatID,
-		Limit:  &limit,
-	}
-	if dialog.SyncedThroughMessageID != nil {
-		request.AfterMessageID = dialog.SyncedThroughMessageID
-	}
+	request := historyRequestForDelivery(dialog, ic.historyCheckpoint(dialog.ChatID), startupHistoryLimit)
 	page, err := ic.Sidecar.History(ctx, request)
 	if err != nil {
 		return err
@@ -807,14 +832,52 @@ func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.Di
 	return nil
 }
 
-func dialogNeedsStartupHistory(dialog sidecar.DialogRecord) bool {
+func historyRequestForDelivery(dialog sidecar.DialogRecord, checkpoint int64, limit uint32) sidecar.HistoryRequest {
+	request := sidecar.HistoryRequest{
+		ChatID: dialog.ChatID,
+		Limit:  &limit,
+	}
+	if checkpoint > 0 {
+		request.AfterMessageID = &checkpoint
+	}
+	return request
+}
+
+func (ic *InlineClient) needsHistoryDelivery(dialog sidecar.DialogRecord) bool {
 	if dialog.LastMessageID == nil {
 		return false
 	}
-	if dialog.SyncedThroughMessageID == nil {
-		return true
+	return *dialog.LastMessageID > ic.historyCheckpoint(dialog.ChatID)
+}
+
+func lastMessageIDValue(dialog sidecar.DialogRecord) int64 {
+	if dialog.LastMessageID == nil {
+		return 0
 	}
-	return *dialog.LastMessageID > *dialog.SyncedThroughMessageID
+	return *dialog.LastMessageID
+}
+
+func (ic *InlineClient) historyCheckpoint(chatID int64) int64 {
+	ic.mu.RLock()
+	defer ic.mu.RUnlock()
+	if ic.history == nil {
+		return 0
+	}
+	return ic.history[chatID]
+}
+
+func (ic *InlineClient) rememberHistoryDelivered(chatID, messageID int64) {
+	if messageID <= 0 {
+		return
+	}
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	if ic.history == nil {
+		ic.history = make(map[int64]int64)
+	}
+	if messageID > ic.history[chatID] {
+		ic.history[chatID] = messageID
+	}
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
@@ -1016,7 +1079,7 @@ func (ic *InlineClient) consumeSidecarEvents(ctx context.Context) {
 			if err := ic.waitBeforeEventReconnect(ctx, err); err != nil {
 				return
 			}
-			break
+			continue
 		}
 		for {
 			envelope, err := stream.Recv(ctx)
@@ -1071,6 +1134,8 @@ func (ic *InlineClient) handleSidecarEvent(ctx context.Context, envelope *sideca
 		ic.handleStatusChanged(envelope.Event.StatusChanged)
 	case envelope.Event.MessageStored != nil:
 		ic.queueInlineMessage(envelope.Event.MessageStored.Message)
+	case envelope.Event.MessageUpserted != nil:
+		ic.syncMessageUpsert(ctx, envelope.Event.MessageUpserted.ChatID, envelope.Event.MessageUpserted.MessageID)
 	case envelope.Event.ChatUpserted != nil:
 		ic.markDialogDetailsStale(envelope.Event.ChatUpserted.ChatID)
 		ic.queueChatResyncByID(ctx, envelope.Event.ChatUpserted.ChatID)
@@ -1080,6 +1145,30 @@ func (ic *InlineClient) handleSidecarEvent(ctx context.Context, envelope *sideca
 		ic.queueInlineReaction(envelope.Event.ReactionChanged)
 	case envelope.Event.Typing != nil:
 		ic.queueInlineTyping(envelope.Event.Typing)
+	}
+}
+
+func (ic *InlineClient) syncMessageUpsert(ctx context.Context, chatID, messageID int64) {
+	if messageID <= ic.historyCheckpoint(chatID) {
+		return
+	}
+	limit := uint32(1)
+	after := messageID - 1
+	page, err := ic.Sidecar.History(ctx, sidecar.HistoryRequest{
+		ChatID:         chatID,
+		Limit:          &limit,
+		AfterMessageID: &after,
+	})
+	if err != nil {
+		ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", chatID).Int64("message_id", messageID).Msg("Failed to fetch Inline message upsert")
+		return
+	}
+	ic.cacheUsers(page.Users)
+	for _, msg := range page.Messages {
+		if msg.MessageID == messageID {
+			ic.queueInlineMessage(msg)
+			return
+		}
 	}
 }
 
@@ -1433,7 +1522,10 @@ func (ic *InlineClient) userInfoForID(userID int64) *bridgev2.UserInfo {
 }
 
 func (ic *InlineClient) queueInlineMessage(msg sidecar.MessageRecord) {
-	ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, ic.remoteMessageEvent(msg))
+	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, ic.remoteMessageEvent(msg))
+	if result.Success && !result.Ignored {
+		ic.rememberHistoryDelivered(msg.ChatID, msg.MessageID)
+	}
 }
 
 func (ic *InlineClient) queueInlineMessageDelete(chatID, messageID int64) {

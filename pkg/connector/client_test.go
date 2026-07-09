@@ -566,24 +566,88 @@ func TestInlineUserDisplayNameFallbacks(t *testing.T) {
 	}
 }
 
-func TestDialogNeedsStartupHistoryUsesCheckpoint(t *testing.T) {
+func TestNeedsHistoryDeliveryUsesBridgeCheckpoint(t *testing.T) {
 	last := int64(20)
 	synced := int64(20)
-	if dialogNeedsStartupHistory(sidecar.DialogRecord{LastMessageID: &last, SyncedThroughMessageID: &synced}) {
-		t.Fatal("dialogNeedsStartupHistory = true for unchanged dialog")
+	dialog := sidecar.DialogRecord{ChatID: 7, LastMessageID: &last, SyncedThroughMessageID: &synced}
+
+	ic := &InlineClient{}
+	if !ic.needsHistoryDelivery(dialog) {
+		t.Fatal("needsHistoryDelivery = false before the bridge has delivered the sidecar-cached message")
+	}
+
+	ic.rememberHistoryDelivered(7, 20)
+	if ic.needsHistoryDelivery(dialog) {
+		t.Fatal("needsHistoryDelivery = true after the bridge delivered the latest message")
 	}
 
 	last = 21
-	if !dialogNeedsStartupHistory(sidecar.DialogRecord{LastMessageID: &last, SyncedThroughMessageID: &synced}) {
-		t.Fatal("dialogNeedsStartupHistory = false for newer dialog")
+	if !ic.needsHistoryDelivery(dialog) {
+		t.Fatal("needsHistoryDelivery = false for newer dialog message")
 	}
 
-	if !dialogNeedsStartupHistory(sidecar.DialogRecord{LastMessageID: &last}) {
-		t.Fatal("dialogNeedsStartupHistory = false for dialog without checkpoint")
+	if ic.needsHistoryDelivery(sidecar.DialogRecord{ChatID: 7}) {
+		t.Fatal("needsHistoryDelivery = true for dialog without last message")
 	}
+}
 
-	if dialogNeedsStartupHistory(sidecar.DialogRecord{}) {
-		t.Fatal("dialogNeedsStartupHistory = true for dialog without last message")
+func TestHistoryRequestForDeliveryUsesBridgeCheckpoint(t *testing.T) {
+	last := int64(20)
+	synced := int64(20)
+	request := historyRequestForDelivery(sidecar.DialogRecord{
+		ChatID:                 7,
+		LastMessageID:          &last,
+		SyncedThroughMessageID: &synced,
+	}, 11, 5)
+
+	if request.ChatID != 7 {
+		t.Fatalf("ChatID = %d, want 7", request.ChatID)
+	}
+	if request.Limit == nil || *request.Limit != 5 {
+		t.Fatalf("Limit = %#v, want 5", request.Limit)
+	}
+	if request.AfterMessageID == nil || *request.AfterMessageID != 11 {
+		t.Fatalf("AfterMessageID = %#v, want bridge checkpoint 11", request.AfterMessageID)
+	}
+}
+
+func TestRememberHistoryDeliveredDoesNotMoveBackward(t *testing.T) {
+	ic := &InlineClient{}
+	ic.rememberHistoryDelivered(7, 20)
+	ic.rememberHistoryDelivered(7, 19)
+	if got := ic.historyCheckpoint(7); got != 20 {
+		t.Fatalf("historyCheckpoint = %d, want 20", got)
+	}
+}
+
+func TestPrioritizedHistoryDialogsPrefersActiveDMsAndNewest(t *testing.T) {
+	peer100 := int64(100)
+	peer101 := int64(101)
+	last5 := int64(5)
+	last9 := int64(9)
+	last22 := int64(22)
+	last30 := int64(30)
+	last40 := int64(40)
+	ic := &InlineClient{}
+	ic.rememberHistoryDelivered(4, 20)
+	ic.rememberHistoryDelivered(5, 9)
+
+	got := ic.prioritizedHistoryDialogs([]sidecar.DialogRecord{
+		{ChatID: 2, LastMessageID: &last40},
+		{ChatID: 5, LastMessageID: &last9},
+		{ChatID: 1, PeerUserID: &peer100, LastMessageID: &last5},
+		{ChatID: 4, LastMessageID: &last22},
+		{ChatID: 3, PeerUserID: &peer101, LastMessageID: &last30},
+	})
+
+	want := []int64{4, 3, 1, 2}
+	if len(got) != len(want) {
+		t.Fatalf("prioritizedHistoryDialogs len = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i, dialog := range got {
+		if dialog.ChatID != want[i] {
+			t.Fatalf("prioritizedHistoryDialogs[%d] = %d, want %d", i, dialog.ChatID, want[i])
+		}
 	}
 }
 
