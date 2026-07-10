@@ -29,9 +29,11 @@ Adapter health:
 
 ```sh
 curl -fsS http://127.0.0.1:29342/health | jq .
-curl -fsS http://127.0.0.1:29342/status | jq .
-curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .
 ```
+
+Account-specific adapter endpoints require the bridge's private session
+namespace header. Use `inline-status` for routine account checks rather than
+copying that namespace into shell history.
 
 Bridge status from Matrix:
 
@@ -75,6 +77,12 @@ RUST_LOG=matrix_inline_adapter=debug,inline_client=debug,info
 
 Do not enable request body or token logging in production.
 
+At debug level, the adapter logs lossless event sequence assignment,
+replay, acknowledgement, and replay gaps; the bridge logs persisted cursors,
+dialog-sync summaries, and rate-limit retry delays. The adapter retains up to
+10,000 lossless events per account namespace and runs durable state
+reconciliation if a bridge cursor falls behind that window.
+
 ## Backups
 
 Stop the bridge before making filesystem-level backups.
@@ -86,6 +94,7 @@ data/config.yaml
 data/registration.yaml
 data/matrix-inline.db*
 data/inline-client/inline-client.sqlite3*
+data/inline-client/accounts/
 ```
 
 systemd paths:
@@ -95,10 +104,12 @@ systemd paths:
 /etc/matrix-inline/registration.yaml
 /var/lib/matrix-inline/*
 /var/lib/inline-client/inline-client.sqlite3*
+/var/lib/inline-client/accounts/
 ```
 
-The Inline client store contains session credentials. Store backups encrypted
-and restrict access to the bridge operator.
+Per-account Inline client stores contain session credentials, and the base
+store may retain a legacy credential after a non-destructive migration. Store
+backups encrypted and restrict access to the bridge operator.
 
 ## Upgrade
 
@@ -110,6 +121,17 @@ and restrict access to the bridge operator.
 6. Start the bridge.
 7. Run `inline-status`.
 8. Run the checklist in [smoke-test.md](smoke-test.md).
+
+When upgrading from the initial PoC release, do not remove
+`inline-client.sqlite3` or `matrix-inline.db`. The adapter non-destructively
+imports the legacy credential into the matching per-account store. Existing
+login metadata with an older recovery version automatically triggers one live
+dialog refresh followed by durable chat, message, deletion, reaction, read,
+membership, and previously unavailable media reconciliation. The recovery
+version is persisted only after mautrix accepts the reconciliation, so an
+interrupted upgrade retries safely.
+Look for `Completed one-time Inline bridge state recovery` before declaring the
+upgrade healthy.
 
 Docker image updates:
 

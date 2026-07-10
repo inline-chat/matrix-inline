@@ -2,6 +2,8 @@ package connector
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -19,6 +21,7 @@ const inlineLoginDeviceName = "matrix-inline bridge"
 type InlineCodeLogin struct {
 	User           *bridgev2.User
 	SidecarURL     string
+	StoreNamespace string
 	Kind           sidecar.AuthContactKind
 	contact        string
 	challengeToken string
@@ -42,7 +45,7 @@ func (login *InlineCodeLogin) submitContact(ctx context.Context, input map[strin
 	if contact == "" {
 		return login.contactStep(login.contactRequiredInstructions()), nil
 	}
-	sidecarClient := sidecar.NewClient(login.SidecarURL)
+	sidecarClient := sidecar.NewClient(login.SidecarURL).WithSessionNamespace(login.StoreNamespace)
 	start, err := sidecarClient.AuthStart(ctx, sidecar.AuthStartRequest{
 		Contact:    contact,
 		Kind:       login.Kind,
@@ -67,13 +70,14 @@ func (login *InlineCodeLogin) submitCode(ctx context.Context, input map[string]s
 	if code == "" {
 		return login.codeStep("Inline verification code is required."), nil
 	}
-	sidecarClient := sidecar.NewClient(login.SidecarURL)
+	sidecarClient := sidecar.NewClient(login.SidecarURL).WithSessionNamespace(login.StoreNamespace)
 	verify, err := sidecarClient.AuthVerify(ctx, sidecar.AuthVerifyRequest{
-		Contact:        login.contact,
-		Kind:           login.Kind,
-		Code:           code,
-		ChallengeToken: login.challengeToken,
-		DeviceName:     inlineLoginDeviceName,
+		Contact:          login.contact,
+		Kind:             login.Kind,
+		Code:             code,
+		ChallengeToken:   login.challengeToken,
+		DeviceName:       inlineLoginDeviceName,
+		AccountNamespace: login.StoreNamespace,
 	})
 	if err != nil {
 		return login.codeStep(fmt.Sprintf("Inline login failed: %v", err)), nil
@@ -85,10 +89,11 @@ func (login *InlineCodeLogin) submitCode(ctx context.Context, input map[string]s
 	}
 
 	meta := &UserLoginMetadata{
-		AccountID:      accountID,
-		RemoteName:     inlineRemoteDisplayName,
-		SidecarURL:     sidecarClient.BaseURL,
-		StoreNamespace: storeNamespace,
+		AccountID:          accountID,
+		RemoteName:         inlineRemoteDisplayName,
+		SidecarURL:         sidecarClient.BaseURL,
+		StoreNamespace:     storeNamespace,
+		BridgeStateVersion: currentBridgeStateVersion,
 	}
 
 	ul, err := login.User.NewLogin(ctx, &database.UserLogin{
@@ -116,6 +121,14 @@ func (login *InlineCodeLogin) submitCode(ctx context.Context, input map[string]s
 			UserLogin:   ul,
 		},
 	}, nil
+}
+
+func newLoginStoreNamespace() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", fmt.Errorf("generate Inline login namespace: %w", err)
+	}
+	return "login-" + hex.EncodeToString(bytes[:]), nil
 }
 
 func connectCompletedLogin(ctx context.Context, ul *bridgev2.UserLogin) {

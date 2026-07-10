@@ -96,5 +96,7 @@ has not been invited to or joined to those rooms.
 - DM creation currently requires a numeric Inline user ID.
 - Inline reply-thread chats are represented as Matrix rooms, not Matrix-native
   thread UI.
-- Room avatars and some rich chat metadata may be missing.
+- Room avatars and Matrix-to-Inline topic/description editing are not yet
+  supported.
+- Permanent room mute/unmute is supported; timed mute expiration is not.
 - Calls are not bridged.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -13,6 +14,20 @@ import (
 
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
 )
+
+func TestNewLoginStoreNamespaceIsSafeAndUnique(t *testing.T) {
+	first, err := newLoginStoreNamespace()
+	if err != nil {
+		t.Fatalf("newLoginStoreNamespace() error = %v", err)
+	}
+	second, err := newLoginStoreNamespace()
+	if err != nil {
+		t.Fatalf("newLoginStoreNamespace() second error = %v", err)
+	}
+	if first == second || !strings.HasPrefix(first, "login-") || len(first) != len("login-")+32 {
+		t.Fatalf("generated namespaces = %q and %q", first, second)
+	}
+}
 
 func TestInlineCodeLoginStartsEmailCodeFlow(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

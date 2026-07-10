@@ -13,6 +13,7 @@ The included units use these paths:
 /etc/matrix-inline/config.yaml
 /etc/matrix-inline/registration.yaml
 /var/lib/inline-client/inline-client.sqlite3
+/var/lib/inline-client/accounts/<session-namespace>.sqlite3
 /var/lib/matrix-inline/
 ```
 
@@ -26,8 +27,9 @@ sudo install -d -o inline-bridge -g inline-bridge -m 0700 /var/lib/inline-client
 sudo install -d -o inline-bridge -g inline-bridge -m 0750 /etc/matrix-inline
 ```
 
-The adapter store contains Inline session credentials and should only be
-readable by the service user.
+Per-account adapter stores contain Inline session credentials, and the base
+store may retain a legacy credential after migration. Both paths should only
+be readable by the service user.
 
 ## Install Binaries
 

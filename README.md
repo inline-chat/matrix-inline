@@ -17,7 +17,8 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Message edits
 - [x] Message deletes/redactions
 - [x] Reactions
-- [x] Read receipts from Matrix to Inline
+- [x] Read receipts and marked-unread state
+- [x] Permanent per-room mute/unmute
 - [x] Typing notifications
 - [x] Images, videos, files, audio, and voice/audio files
 - [x] Inline member list sync for bridged rooms
@@ -25,11 +26,19 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Configurable bridge bot and network profile metadata
 - [x] DM creation with a numeric Inline user ID
 - [x] Basic group/thread creation from Matrix
+- [x] Add/remove Inline thread participants from Matrix membership changes
+- [x] Rename Inline threads from Matrix
+- [x] Explicit Inline thread deletion from Beeper/Matrix
 - [x] Management commands for status and reconnect
 - [ ] New Inline account signup or invite-code onboarding
 - [ ] Matrix-native thread UI for Inline reply-thread chats
 - [ ] Contact search for DM creation
+- [ ] Formatted text, rich entities, and Matrix mention mapping
+- [ ] Pins and Inline link-preview projection
 - [ ] Room avatars
+- [ ] Room topic/description editing
+- [ ] Presence and richer workspace/space representation
+- [ ] Timed mute expiration (permanent mute is supported)
 - [ ] Calls
 
 ## Requirements
@@ -39,12 +48,12 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - Docker and Docker Compose, or Go 1.25 plus Rust 1.96 for native builds
 - A published container image from `ghcr.io/inline-chat/matrix-inline`
 
-Source builds require a local checkout of `inline-chat/inline` next to this repo
+Source builds require a local checkout of `inline-chat/inline-public` next to this repo
 because the bridge builds against the Rust Inline client crates:
 
 ```text
 inline-chat/
-  inline/
+  inline-public/
   matrix-inline/
 ```
 
@@ -177,6 +186,7 @@ The Docker entrypoint stores bridge state in `/data`:
 /data/registration.yaml
 /data/matrix-inline.db
 /data/inline-client/inline-client.sqlite3
+/data/inline-client/accounts/<session-namespace>.sqlite3
 ```
 
 Useful environment variables:
@@ -186,6 +196,7 @@ MATRIX_INLINE_IMAGE=ghcr.io/inline-chat/matrix-inline:latest
 INLINE_SIDECAR_BIND=127.0.0.1:29342
 INLINE_SIDECAR_URL=http://127.0.0.1:29342
 INLINE_CLIENT_STORE=/data/inline-client/inline-client.sqlite3
+INLINE_CLIENT_ACCOUNT_STORE_DIR=/data/inline-client/accounts
 MATRIX_INLINE_DB_URI=file:/data/matrix-inline.db?_txlock=immediate
 MATRIX_INLINE_HOMESERVER_ADDRESS=http://synapse:8008
 MATRIX_INLINE_HOMESERVER_DOMAIN=example.com
@@ -203,6 +214,12 @@ RUST_LOG=info
 
 The Inline client store contains session credentials. Keep it private and back
 it up with the bridge database.
+
+Upgrades from the initial bridge release are in-place. Keep both the bridge
+database and the existing Inline client store: the adapter imports the legacy
+session into the per-account store, starts the new durable bucket sync from a
+safe lookback, and the bridge runs a one-time full dialog/state reconciliation.
+Users should not need to log in again or delete old rooms to recover.
 
 ### Bridge Profile
 

@@ -41,6 +41,12 @@ type fixtureServer struct {
 	sent          []sentText
 	clients       map[*websocket.Conn]struct{}
 	sequence      uint64
+	events        []fixtureEvent
+}
+
+type fixtureEvent struct {
+	sequence uint64
+	payload  []byte
 }
 
 type storedState struct {
@@ -127,11 +133,19 @@ func (srv *fixtureServer) register(mux *http.ServeMux) {
 	mux.HandleFunc("/rpc/auth/start", srv.handleAuthStart)
 	mux.HandleFunc("/rpc/auth/verify", srv.handleAuthVerify)
 	mux.HandleFunc("/rpc/dialogs", srv.handleDialogs)
+	mux.HandleFunc("/rpc/state/dialogs", srv.handleDialogs)
 	mux.HandleFunc("/rpc/history", srv.handleHistory)
 	mux.HandleFunc("/rpc/chat/participants", srv.handleParticipants)
+	mux.HandleFunc("/rpc/chat/participants/add", srv.handleEmpty)
+	mux.HandleFunc("/rpc/chat/participants/remove", srv.handleEmpty)
+	mux.HandleFunc("/rpc/chat/info", srv.handleEmpty)
+	mux.HandleFunc("/rpc/chat/delete", srv.handleEmpty)
 	mux.HandleFunc("/rpc/send", srv.handleSend)
 	mux.HandleFunc("/rpc/read", srv.handleEmpty)
+	mux.HandleFunc("/rpc/marked-unread", srv.handleEmpty)
+	mux.HandleFunc("/rpc/dialog/notifications", srv.handleEmpty)
 	mux.HandleFunc("/rpc/typing", srv.handleEmpty)
+	mux.HandleFunc("/rpc/events/ack", srv.handleEventAck)
 	mux.HandleFunc("/ws/events", srv.handleEvents)
 	mux.HandleFunc("/fixture/sent", srv.handleFixtureSent)
 	mux.HandleFunc("/fixture/status", srv.handleFixtureStatus)
@@ -292,6 +306,7 @@ func (srv *fixtureServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	_ = srv.saveState()
 	srv.writeResult(w, "message", sidecar.MessageMutation{
 		MessageID: &messageID,
+		State:     sidecar.TransactionCompleted,
 		Transaction: sidecar.TransactionIdentity{
 			TransactionID:  fmt.Sprintf("fixture-%d", messageID),
 			ExternalID:     req.ExternalID,
@@ -313,7 +328,20 @@ func (srv *fixtureServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	afterSequence, _ := strconv.ParseUint(r.URL.Query().Get("after_sequence"), 10, 64)
 	srv.mu.Lock()
+	for _, event := range srv.events {
+		if event.sequence <= afterSequence {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		err := conn.Write(ctx, websocket.MessageText, event.payload)
+		cancel()
+		if err != nil {
+			srv.mu.Unlock()
+			return
+		}
+	}
 	srv.clients[conn] = struct{}{}
 	srv.mu.Unlock()
 	defer func() {
@@ -327,6 +355,15 @@ func (srv *fixtureServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func (srv *fixtureServer) handleEventAck(w http.ResponseWriter, r *http.Request) {
+	var request sidecar.EventAckRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		srv.writeError(w, err)
+		return
+	}
+	srv.writeJSON(w, sidecar.EventAckResponse{AcknowledgedSequence: request.Sequence})
 }
 
 func (srv *fixtureServer) handleFixtureSent(w http.ResponseWriter, r *http.Request) {
@@ -443,15 +480,19 @@ func (srv *fixtureServer) broadcast(event map[string]any) error {
 	}
 	srv.mu.Unlock()
 	envelope := map[string]any{
-		"protocol_version": sidecar.ProtocolVersion,
-		"sequence":         sequence,
-		"reliability":      sidecar.EventLossless,
-		"event":            event,
+		"protocol_version":  sidecar.ProtocolVersion,
+		"session_namespace": strconv.FormatInt(accountID, 10),
+		"sequence":          sequence,
+		"reliability":       sidecar.EventLossless,
+		"event":             event,
 	}
 	data, err := json.Marshal(envelope)
 	if err != nil {
 		return err
 	}
+	srv.mu.Lock()
+	srv.events = append(srv.events, fixtureEvent{sequence: sequence, payload: data})
+	srv.mu.Unlock()
 	for _, conn := range clients {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := conn.Write(ctx, websocket.MessageText, data)

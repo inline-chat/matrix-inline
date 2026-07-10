@@ -787,11 +787,12 @@ dependencies = [
 
 [[package]]
 name = "inline-client"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "futures-util",
  "inline-sdk",
  "log",
+ "prost",
  "rusqlite",
  "serde",
  "serde_json",
@@ -801,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "inline-protocol"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -810,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "inline-sdk"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "futures-util",
  "hostname",
@@ -937,12 +938,13 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "matrix-inline-adapter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "env_logger",
  "inline-client",
  "log",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

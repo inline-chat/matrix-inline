@@ -131,10 +131,15 @@ Important files:
 /data/inline-client/inline-client.sqlite3
 /data/inline-client/inline-client.sqlite3-shm
 /data/inline-client/inline-client.sqlite3-wal
+/data/inline-client/accounts/<session-namespace>.sqlite3
+/data/inline-client/accounts/<session-namespace>.sqlite3-shm
+/data/inline-client/accounts/<session-namespace>.sqlite3-wal
 ```
 
-The Inline client SQLite store contains session credentials. Keep the data
-directory private.
+The base Inline client SQLite file contains the durable adapter event log and
+may retain a legacy session during migration. Per-account files under
+`accounts/` contain active session credentials. The adapter creates account
+storage with private permissions; keep the full data directory private.
 
 ## Docker Environment
 
@@ -148,6 +153,7 @@ REGISTRATION_PATH=/data/registration.yaml
 INLINE_SIDECAR_BIND=127.0.0.1:29342
 INLINE_SIDECAR_URL=http://127.0.0.1:29342
 INLINE_CLIENT_STORE=/data/inline-client/inline-client.sqlite3
+INLINE_CLIENT_ACCOUNT_STORE_DIR=/data/inline-client/accounts
 MATRIX_INLINE_DB_URI=file:/data/matrix-inline.db?_txlock=immediate
 MATRIX_INLINE_HOMESERVER_ADDRESS=http://synapse:8008
 MATRIX_INLINE_HOMESERVER_DOMAIN=example.com

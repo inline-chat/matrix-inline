@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,8 +18,30 @@ import (
 )
 
 type Client struct {
-	BaseURL string
-	HTTP    *http.Client
+	BaseURL          string
+	HTTP             *http.Client
+	SessionNamespace string
+}
+
+// ErrEventReplayUnavailable means the adapter no longer retains the bridge's
+// requested lossless event history.
+var ErrEventReplayUnavailable = errors.New("Inline sidecar event replay is unavailable")
+
+type EventReplayUnavailableError struct {
+	RequestedAfterSequence *uint64 `json:"requested_after_sequence,omitempty"`
+	OldestRetainedSequence *uint64 `json:"oldest_retained_sequence,omitempty"`
+	LatestSequence         *uint64 `json:"latest_sequence,omitempty"`
+}
+
+func (err *EventReplayUnavailableError) Error() string {
+	if err == nil || err.LatestSequence == nil {
+		return ErrEventReplayUnavailable.Error()
+	}
+	return fmt.Sprintf("%s (latest sequence %d)", ErrEventReplayUnavailable, *err.LatestSequence)
+}
+
+func (err *EventReplayUnavailableError) Is(target error) bool {
+	return target == ErrEventReplayUnavailable
 }
 
 func NewClient(baseURL string) *Client {
@@ -28,6 +53,12 @@ func NewClient(baseURL string) *Client {
 		BaseURL: baseURL,
 		HTTP:    &http.Client{Timeout: 2 * time.Minute},
 	}
+}
+
+func (c *Client) WithSessionNamespace(namespace string) *Client {
+	copy := *c
+	copy.SessionNamespace = strings.TrimSpace(namespace)
+	return &copy
 }
 
 func (c *Client) Health(ctx context.Context) (*Health, error) {
@@ -97,9 +128,41 @@ func (c *Client) Dialogs(ctx context.Context, request DialogsRequest) (*DialogsP
 	return &page, nil
 }
 
+func (c *Client) CachedDialogs(ctx context.Context, request DialogsRequest) (*DialogsPage, error) {
+	var page DialogsPage
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/state/dialogs", request, "dialogs", &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+func (c *Client) AccountState(ctx context.Context) (*AccountStateSnapshot, error) {
+	var snapshot AccountStateSnapshot
+	if err := c.doRPC(ctx, http.MethodGet, "/rpc/state/account", nil, "account_state", &snapshot); err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
+func (c *Client) ChatState(ctx context.Context, request ChatStateRequest) (*ChatStateSnapshot, error) {
+	var snapshot ChatStateSnapshot
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/state/chat", request, "chat_state", &snapshot); err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
 func (c *Client) History(ctx context.Context, request HistoryRequest) (*HistoryPage, error) {
 	var page HistoryPage
 	if err := c.doRPC(ctx, http.MethodPost, "/rpc/history", request, "history", &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+func (c *Client) CachedHistory(ctx context.Context, request HistoryRequest) (*HistoryPage, error) {
+	var page HistoryPage
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/state/chat/history", request, "history", &page); err != nil {
 		return nil, err
 	}
 	return &page, nil
@@ -111,6 +174,22 @@ func (c *Client) ChatParticipants(ctx context.Context, request ChatParticipantsR
 		return nil, err
 	}
 	return &page, nil
+}
+
+func (c *Client) AddChatParticipant(ctx context.Context, request AddChatParticipantRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/chat/participants/add", request, "empty", nil)
+}
+
+func (c *Client) RemoveChatParticipant(ctx context.Context, request RemoveChatParticipantRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/chat/participants/remove", request, "empty", nil)
+}
+
+func (c *Client) UpdateChatInfo(ctx context.Context, request UpdateChatInfoRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/chat/info", request, "empty", nil)
+}
+
+func (c *Client) DeleteChat(ctx context.Context, request DeleteChatRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/chat/delete", request, "empty", nil)
 }
 
 func (c *Client) CreateDM(ctx context.Context, request CreateDMRequest) (*CreatedChat, error) {
@@ -197,17 +276,55 @@ func (c *Client) Read(ctx context.Context, request ReadRequest) error {
 	return c.doRPC(ctx, http.MethodPost, "/rpc/read", request, "empty", nil)
 }
 
+func (c *Client) SetMarkedUnread(ctx context.Context, request SetMarkedUnreadRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/marked-unread", request, "empty", nil)
+}
+
+func (c *Client) UpdateDialogNotifications(ctx context.Context, request UpdateDialogNotificationsRequest) error {
+	return c.doRPC(ctx, http.MethodPost, "/rpc/dialog/notifications", request, "empty", nil)
+}
+
 func (c *Client) Typing(ctx context.Context, request TypingRequest) error {
 	return c.doRPC(ctx, http.MethodPost, "/rpc/typing", request, "empty", nil)
 }
 
 func (c *Client) Events(ctx context.Context) (*EventStream, error) {
-	url := websocketURL(c.BaseURL, "/ws/events")
-	conn, _, err := websocket.Dial(ctx, url, nil)
+	return c.EventsAfter(ctx, "", 0)
+}
+
+// EventsAfter opens the event stream and requests durable replay after the
+// last contiguous sequence persisted by the bridge.
+func (c *Client) EventsAfter(ctx context.Context, namespace string, afterSequence uint64) (*EventStream, error) {
+	query := url.Values{}
+	query.Set("after_sequence", strconv.FormatUint(afterSequence, 10))
+	if strings.TrimSpace(namespace) != "" {
+		query.Set("session_namespace", namespace)
+	}
+	eventsURL := websocketURL(c.BaseURL, "/ws/events?"+query.Encode())
+	options := &websocket.DialOptions{}
+	if strings.TrimSpace(c.SessionNamespace) != "" {
+		options.HTTPHeader = http.Header{"X-Inline-Session-Namespace": []string{c.SessionNamespace}}
+	}
+	conn, response, err := websocket.Dial(ctx, eventsURL, options)
 	if err != nil {
+		if response != nil && response.StatusCode == http.StatusGone {
+			defer response.Body.Close()
+			var replayErr EventReplayUnavailableError
+			if decodeErr := json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&replayErr); decodeErr != nil {
+				return nil, ErrEventReplayUnavailable
+			}
+			return nil, &replayErr
+		}
 		return nil, err
 	}
 	return &EventStream{conn: conn}, nil
+}
+
+// AckEvents acknowledges durable processing through sequence.
+func (c *Client) AckEvents(ctx context.Context, namespace string, sequence uint64) error {
+	request := EventAckRequest{SessionNamespace: namespace, Sequence: sequence}
+	var response EventAckResponse
+	return c.do(ctx, http.MethodPost, "/rpc/events/ack", request, &response)
 }
 
 type EventStream struct {
@@ -323,6 +440,9 @@ func (c *Client) doRaw(ctx context.Context, method, path, contentType string, bo
 }
 
 func (c *Client) doRequest(req *http.Request, out any) error {
+	if strings.TrimSpace(c.SessionNamespace) != "" {
+		req.Header.Set("X-Inline-Session-Namespace", c.SessionNamespace)
+	}
 	httpClient := c.HTTP
 	if httpClient == nil {
 		httpClient = http.DefaultClient

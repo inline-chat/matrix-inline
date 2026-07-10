@@ -3,11 +3,14 @@ package sidecar
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/coder/websocket"
 )
 
 func TestClientStatusDecodesVersionedResponse(t *testing.T) {
@@ -247,6 +250,60 @@ func TestClientParticipantsAndChatCreation(t *testing.T) {
 			writeRPCResult(t, w, "chat_participants", ChatParticipantsPage{
 				Participants: []ChatParticipantRecord{{UserID: 42}},
 			})
+		case "/rpc/chat/participants/add":
+			var request AddChatParticipantRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode add participant request: %v", err)
+			}
+			if request.ChatID != 7 || request.UserID != 42 {
+				t.Fatalf("add participant request = %#v, want chat 7 user 42", request)
+			}
+			writeRPCResult(t, w, "empty", struct{}{})
+		case "/rpc/chat/participants/remove":
+			var request RemoveChatParticipantRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode remove participant request: %v", err)
+			}
+			if request.ChatID != 7 || request.UserID != 42 {
+				t.Fatalf("remove participant request = %#v, want chat 7 user 42", request)
+			}
+			writeRPCResult(t, w, "empty", struct{}{})
+		case "/rpc/chat/info":
+			var request UpdateChatInfoRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode update chat info request: %v", err)
+			}
+			if request.ChatID != 7 || request.Title == nil || *request.Title != "Renamed" {
+				t.Fatalf("update chat info request = %#v, want chat 7 Renamed", request)
+			}
+			writeRPCResult(t, w, "empty", struct{}{})
+		case "/rpc/chat/delete":
+			var request DeleteChatRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode delete chat request: %v", err)
+			}
+			if request.ChatID != 7 {
+				t.Fatalf("delete chat request = %#v, want chat 7", request)
+			}
+			writeRPCResult(t, w, "empty", struct{}{})
+		case "/rpc/marked-unread":
+			var request SetMarkedUnreadRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode marked unread request: %v", err)
+			}
+			if request.ChatID != 7 || !request.Unread {
+				t.Fatalf("marked unread request = %#v, want chat 7 unread", request)
+			}
+			writeRPCResult(t, w, "empty", struct{}{})
+		case "/rpc/dialog/notifications":
+			var request UpdateDialogNotificationsRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode dialog notifications request: %v", err)
+			}
+			if request.ChatID != 7 || request.Mode == nil || *request.Mode != DialogNotificationNone {
+				t.Fatalf("dialog notifications request = %#v, want chat 7 none", request)
+			}
+			writeRPCResult(t, w, "empty", struct{}{})
 		case "/rpc/chat/create-dm":
 			var request CreateDMRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -291,6 +348,26 @@ func TestClientParticipantsAndChatCreation(t *testing.T) {
 	}
 	if len(participants.Participants) != 1 || participants.Participants[0].UserID != 42 {
 		t.Fatalf("participants = %#v, want user 42", participants.Participants)
+	}
+	if err := client.AddChatParticipant(context.Background(), AddChatParticipantRequest{ChatID: 7, UserID: 42}); err != nil {
+		t.Fatalf("AddChatParticipant() error = %v", err)
+	}
+	if err := client.RemoveChatParticipant(context.Background(), RemoveChatParticipantRequest{ChatID: 7, UserID: 42}); err != nil {
+		t.Fatalf("RemoveChatParticipant() error = %v", err)
+	}
+	renamed := "Renamed"
+	if err := client.UpdateChatInfo(context.Background(), UpdateChatInfoRequest{ChatID: 7, Title: &renamed}); err != nil {
+		t.Fatalf("UpdateChatInfo() error = %v", err)
+	}
+	if err := client.SetMarkedUnread(context.Background(), SetMarkedUnreadRequest{ChatID: 7, Unread: true}); err != nil {
+		t.Fatalf("SetMarkedUnread() error = %v", err)
+	}
+	muted := DialogNotificationNone
+	if err := client.UpdateDialogNotifications(context.Background(), UpdateDialogNotificationsRequest{ChatID: 7, Mode: &muted}); err != nil {
+		t.Fatalf("UpdateDialogNotifications() error = %v", err)
+	}
+	if err := client.DeleteChat(context.Background(), DeleteChatRequest{ChatID: 7}); err != nil {
+		t.Fatalf("DeleteChat() error = %v", err)
 	}
 
 	dm, err := client.CreateDM(context.Background(), CreateDMRequest{UserID: 42})
@@ -355,6 +432,7 @@ func TestClientUploadSendsMultipartMetadataAndFile(t *testing.T) {
 		writeRPCResult(t, w, "message", MessageMutation{
 			Transaction: TransactionIdentity{TransactionID: "txn-1", RandomID: 9},
 			MessageID:   int64Ptr(11),
+			State:       TransactionCompleted,
 		})
 	}))
 	defer server.Close()
@@ -375,7 +453,8 @@ func TestClientUploadSendsMultipartMetadataAndFile(t *testing.T) {
 
 func TestEventEnvelopeDecodesMessageStored(t *testing.T) {
 	raw := []byte(`{
-		"protocol_version": 1,
+		"protocol_version": 3,
+		"session_namespace": "42",
 		"sequence": 4,
 		"reliability": "Lossless",
 		"event": {
@@ -404,6 +483,177 @@ func TestEventEnvelopeDecodesMessageStored(t *testing.T) {
 	}
 	if envelope.Event.MessageStored.Message.Content.Text != "hello" {
 		t.Fatalf("message text = %q, want hello", envelope.Event.MessageStored.Message.Content.Text)
+	}
+}
+
+func TestClientEventDecoderCoversEveryClientVariant(t *testing.T) {
+	variants := map[string]string{
+		"StatusChanged":           `{"status":"Connected"}`,
+		"TransactionChanged":      `{"identity":{"transaction_id":"txn","random_id":1},"state":"Sent"}`,
+		"ChatUpserted":            `{"chat_id":7}`,
+		"ChatDeleted":             `{"chat_id":7}`,
+		"ChatParticipantsChanged": `{"chat_id":7}`,
+		"UserUpserted":            `{"user_id":2}`,
+		"SpaceUpserted":           `{"space_id":3}`,
+		"SpaceMemberChanged":      `{"space_id":3,"user_id":2,"removed":false}`,
+		"UserSettingsChanged":     `{}`,
+		"MessageActionInvoked":    `{"interaction_id":1,"chat_id":7,"message_id":8,"actor_user_id":2,"action_id":"ok","data":""}`,
+		"MessageActionAnswered":   `{"interaction_id":1}`,
+		"MessageUpserted":         `{"chat_id":7,"message_id":8}`,
+		"MessageStored":           `{"message":{"chat_id":7,"message_id":8,"sender_id":2,"timestamp":1,"is_outgoing":false,"content":{"type":"text","text":"hello"}}}`,
+		"MessageDeleted":          `{"chat_id":7,"message_id":8}`,
+		"ChatHistoryCleared":      `{"chat_id":7}`,
+		"ReactionChanged":         `{"chat_id":7,"message_id":8,"user_id":2,"reaction":"👍","removed":false}`,
+		"ReadStateChanged":        `{"chat_id":7}`,
+		"Typing":                  `{"chat_id":7,"user_id":2,"is_typing":true}`,
+		"UserStatusChanged":       `{"user_id":2,"is_online":true}`,
+		"BotPresenceChanged":      `{"bot_user_id":2,"kind":"Typing","avatar_changed":false}`,
+		"NewMessageNotification":  `{"message":{"chat_id":7,"message_id":8,"sender_id":2,"timestamp":1,"is_outgoing":false,"content":{"type":"text","text":"hello"}},"reason":"Mention"}`,
+	}
+	for variant, payload := range variants {
+		t.Run(variant, func(t *testing.T) {
+			var event ClientEvent
+			if err := json.Unmarshal([]byte(`{"`+variant+`":`+payload+`}`), &event); err != nil {
+				t.Fatalf("Unmarshal() error = %v", err)
+			}
+			if event.Type != variant {
+				t.Fatalf("event type = %q, want %q", event.Type, variant)
+			}
+		})
+	}
+}
+
+func TestClientEventDecoderRejectsUnknownAndAmbiguousVariants(t *testing.T) {
+	for name, payload := range map[string]string{
+		"unknown":   `{"FutureLosslessEvent":{}}`,
+		"empty":     `{}`,
+		"ambiguous": `{"ChatUpserted":{"chat_id":7},"ChatDeleted":{"chat_id":7}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var event ClientEvent
+			if err := json.Unmarshal([]byte(payload), &event); err == nil {
+				t.Fatal("Unmarshal() error = nil, want rejection")
+			}
+		})
+	}
+}
+
+func TestEventEnvelopeDecodesChatHistoryCleared(t *testing.T) {
+	raw := []byte(`{
+		"protocol_version": 3,
+		"session_namespace": "42",
+		"sequence": 5,
+		"reliability": "Lossless",
+		"event": {"ChatHistoryCleared": {"chat_id": 7, "before_date": 123}}
+	}`)
+
+	var envelope EventEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("unmarshal event envelope: %v", err)
+	}
+	if envelope.Event.ChatHistoryCleared == nil || envelope.Event.ChatHistoryCleared.ChatID != 7 {
+		t.Fatalf("history cleared event = %#v", envelope.Event.ChatHistoryCleared)
+	}
+	if envelope.Event.ChatHistoryCleared.BeforeDate == nil || *envelope.Event.ChatHistoryCleared.BeforeDate != 123 {
+		t.Fatalf("before date = %#v, want 123", envelope.Event.ChatHistoryCleared.BeforeDate)
+	}
+}
+
+func TestEventEnvelopeDecodesSpaceMemberChanged(t *testing.T) {
+	raw := []byte(`{
+		"protocol_version": 3,
+		"session_namespace": "42",
+		"sequence": 6,
+		"reliability": "Lossless",
+		"event": {"SpaceMemberChanged": {"space_id": 5, "user_id": 3, "removed": true}}
+	}`)
+
+	var envelope EventEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("unmarshal event envelope: %v", err)
+	}
+	if envelope.Event.SpaceMemberChanged == nil || !envelope.Event.SpaceMemberChanged.Removed {
+		t.Fatalf("space member event = %#v", envelope.Event.SpaceMemberChanged)
+	}
+}
+
+func TestEventsAfterRequestsNamespaceAndCursor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws/events" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("session_namespace"); got != "team/42" {
+			t.Fatalf("session_namespace = %q, want team/42", got)
+		}
+		if got := r.URL.Query().Get("after_sequence"); got != "9" {
+			t.Fatalf("after_sequence = %q, want 9", got)
+		}
+		if got := r.Header.Get("X-Inline-Session-Namespace"); got != "team-42" {
+			t.Fatalf("session namespace header = %q, want team-42", got)
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept websocket: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+		payload := `{"protocol_version":3,"session_namespace":"team/42","sequence":10,"reliability":"Lossless","event":{"ChatUpserted":{"chat_id":7}}}`
+		if err := conn.Write(r.Context(), websocket.MessageText, []byte(payload)); err != nil {
+			t.Errorf("write event: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	stream, err := NewClient(server.URL).WithSessionNamespace("team-42").EventsAfter(context.Background(), "team/42", 9)
+	if err != nil {
+		t.Fatalf("EventsAfter() error = %v", err)
+	}
+	defer stream.Close(websocket.StatusNormalClosure, "done")
+	envelope, err := stream.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("Recv() error = %v", err)
+	}
+	if envelope.Sequence == nil || *envelope.Sequence != 10 || envelope.SessionNamespace != "team/42" {
+		t.Fatalf("event envelope = %#v, want namespace team/42 sequence 10", envelope)
+	}
+}
+
+func TestEventsAfterMapsGoneToReplayUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGone)
+		_, _ = w.Write([]byte(`{"error":"sidecar_event_replay_unavailable","requested_after_sequence":3,"oldest_retained_sequence":8,"latest_sequence":12}`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL).EventsAfter(context.Background(), "42", 3)
+	if !errors.Is(err, ErrEventReplayUnavailable) {
+		t.Fatalf("EventsAfter() error = %v, want ErrEventReplayUnavailable", err)
+	}
+	var replayErr *EventReplayUnavailableError
+	if !errors.As(err, &replayErr) || replayErr.LatestSequence == nil || *replayErr.LatestSequence != 12 {
+		t.Fatalf("EventsAfter() error = %#v, want structured latest sequence 12", err)
+	}
+}
+
+func TestAckEventsPostsDurableCursor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rpc/events/ack" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		var request EventAckRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode ack request: %v", err)
+		}
+		if request.SessionNamespace != "42" || request.Sequence != 11 {
+			t.Fatalf("ack request = %#v, want namespace 42 sequence 11", request)
+		}
+		writeJSON(t, w, EventAckResponse{AcknowledgedSequence: request.Sequence})
+	}))
+	defer server.Close()
+
+	if err := NewClient(server.URL).AckEvents(context.Background(), "42", 11); err != nil {
+		t.Fatalf("AckEvents() error = %v", err)
 	}
 }
 

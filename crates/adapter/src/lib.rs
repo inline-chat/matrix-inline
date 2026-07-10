@@ -11,12 +11,20 @@
 /// Localhost HTTP/WebSocket transport for the bridge adapter.
 pub mod http;
 
+/// Durable adapter-to-bridge event replay storage.
+pub mod event_store;
+
 /// Versioned sidecar protocol owned by the bridge adapter.
 pub mod protocol;
 
-pub use http::{AdapterHttpState, bind_adapter_http, serve_adapter_http, sidecar_router};
+pub use event_store::{AdapterEventStore, AdapterEventStoreError};
+pub use http::{
+    AdapterClientFactory, AdapterClientRegistration, AdapterHttpState, bind_adapter_http,
+    bind_adapter_http_state, serve_adapter_http, serve_adapter_http_state, sidecar_router,
+    sidecar_router_with_state,
+};
 pub use protocol::{
-    PROTOCOL_VERSION, ProtocolInfo, SidecarCommand, SidecarError, SidecarEventEnvelope,
-    SidecarHealth, SidecarOutcome, SidecarRequest, SidecarRequestId, SidecarResponse,
-    SidecarResult, SidecarStatus,
+    ChatStateRequest, PROTOCOL_VERSION, ProtocolInfo, SidecarCommand, SidecarError,
+    SidecarEventEnvelope, SidecarHealth, SidecarOutcome, SidecarRequest, SidecarRequestId,
+    SidecarResponse, SidecarResult, SidecarStatus,
 };

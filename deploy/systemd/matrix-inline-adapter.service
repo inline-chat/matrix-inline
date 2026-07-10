@@ -13,6 +13,7 @@ Environment=RUST_LOG=info
 ExecStart=/opt/inline/bin/matrix-inline-adapter \
   --bind 127.0.0.1:29342 \
   --store /var/lib/inline-client/inline-client.sqlite3 \
+  --account-store-dir /var/lib/inline-client/accounts \
   --api-base-url https://api.inline.chat/v1 \
   --realtime-url wss://api.inline.chat/realtime \
   --realtime-handshake

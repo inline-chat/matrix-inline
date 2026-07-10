@@ -3,6 +3,8 @@ package connector
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 
@@ -22,13 +24,14 @@ const (
 
 	inlineRemoteDisplayName = "Inline"
 
-	defaultDisplayName      = "Inline"
-	defaultNetworkURL       = "https://inline.chat"
-	defaultNetworkIcon      = "mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs"
-	defaultNetworkID        = "inline"
-	defaultBeeperBridgeType = "github.com/inline-chat/matrix-inline"
-	defaultPort             = 29343
-	defaultCommandPrefix    = "!inline"
+	defaultDisplayName               = "Inline"
+	defaultNetworkURL                = "https://inline.chat"
+	defaultNetworkIcon               = "mxc://matrix.org/ITxccqHQkLCnPQDouWfsPhqs"
+	defaultNetworkID                 = "inline"
+	defaultBeeperBridgeType          = "github.com/inline-chat/matrix-inline"
+	defaultPort                      = 29343
+	defaultCommandPrefix             = "!inline"
+	currentBridgeStateVersion uint32 = 2
 )
 
 type InlineConnector struct {
@@ -44,11 +47,29 @@ type Config struct {
 }
 
 type UserLoginMetadata struct {
-	AccountID          string `json:"account_id"`
-	RemoteName         string `json:"remote_name,omitempty"`
-	SidecarURL         string `json:"sidecar_url,omitempty"`
-	StoreNamespace     string `json:"store_namespace,omitempty"`
-	SessionInvalidated bool   `json:"session_invalidated,omitempty"`
+	AccountID           string `json:"account_id"`
+	RemoteName          string `json:"remote_name,omitempty"`
+	SidecarURL          string `json:"sidecar_url,omitempty"`
+	StoreNamespace      string `json:"store_namespace,omitempty"`
+	LastSidecarSequence uint64 `json:"last_sidecar_sequence,omitempty"`
+	BridgeStateVersion  uint32 `json:"bridge_state_version,omitempty"`
+	SessionInvalidated  bool   `json:"session_invalidated,omitempty"`
+}
+
+type MessageMetadata struct {
+	InlineFingerprint string `json:"inline_fingerprint,omitempty"`
+	MediaHandled      bool   `json:"media_handled,omitempty"`
+}
+
+func (meta *MessageMetadata) CopyFrom(other any) {
+	switch source := other.(type) {
+	case *MessageMetadata:
+		if source != nil {
+			*meta = *source
+		}
+	case MessageMetadata:
+		*meta = source
+	}
 }
 
 var _ bridgev2.NetworkConnector = (*InlineConnector)(nil)
@@ -65,7 +86,20 @@ func (ic *InlineConnector) Start(ctx context.Context) error {
 	if err := ic.validateConfig(); err != nil {
 		return err
 	}
+	if err := validatePortalEventDelivery(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validatePortalEventDelivery() error {
+	if bridgev2.PortalEventBuffer == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"MAUTRIX_PORTAL_EVENT_BUFFER must be 0 for durable Inline event delivery (got %d)",
+		bridgev2.PortalEventBuffer,
+	)
 }
 
 func (ic *InlineConnector) GetBridgeInfoVersion() (info, capabilities int) {
@@ -128,6 +162,9 @@ sidecar_url: http://127.0.0.1:29342
 
 func (ic *InlineConnector) GetDBMetaTypes() database.MetaTypes {
 	return database.MetaTypes{
+		Message: func() any {
+			return &MessageMetadata{}
+		},
 		UserLogin: func() any {
 			return &UserLoginMetadata{}
 		},
@@ -136,7 +173,11 @@ func (ic *InlineConnector) GetDBMetaTypes() database.MetaTypes {
 
 func (ic *InlineConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	meta := login.Metadata.(*UserLoginMetadata)
-	login.Client = newInlineClient(login, meta, ic.sidecarURL(meta.SidecarURL))
+	sidecarURL := ic.sidecarURL(meta.SidecarURL)
+	if err := validateSidecarURL(sidecarURL); err != nil {
+		return err
+	}
+	login.Client = newInlineClient(login, meta, sidecarURL)
 	return nil
 }
 
@@ -165,10 +206,19 @@ func (ic *InlineConnector) CreateLogin(ctx context.Context, user *bridgev2.User,
 	default:
 		return nil, fmt.Errorf("unsupported Inline login flow %q", flowID)
 	}
+	storeNamespace, err := newLoginStoreNamespace()
+	if err != nil {
+		return nil, err
+	}
+	sidecarURL := ic.sidecarURL("")
+	if err := validateSidecarURL(sidecarURL); err != nil {
+		return nil, err
+	}
 	return &InlineCodeLogin{
-		User:       user,
-		SidecarURL: ic.sidecarURL(""),
-		Kind:       kind,
+		User:           user,
+		SidecarURL:     sidecarURL,
+		StoreNamespace: storeNamespace,
+		Kind:           kind,
 	}, nil
 }
 
@@ -186,12 +236,36 @@ func (ic *InlineConnector) sidecarURL(override string) string {
 }
 
 func (ic *InlineConnector) validateConfig() error {
+	if err := validateSidecarURL(ic.sidecarURL("")); err != nil {
+		return err
+	}
 	icon := strings.TrimSpace(ic.Config.NetworkIcon)
 	if icon == "" {
 		return nil
 	}
 	if _, err := id.ParseContentURI(icon); err != nil {
 		return fmt.Errorf("invalid network_icon %q: %w", icon, err)
+	}
+	return nil
+}
+
+func validateSidecarURL(rawURL string) error {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return fmt.Errorf("invalid Inline sidecar URL: %w", err)
+	}
+	if parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil {
+		return fmt.Errorf("Inline sidecar URL must be an unauthenticated loopback http URL")
+	}
+	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("Inline sidecar URL must not include a path, query, or fragment")
+	}
+	host := strings.TrimSpace(parsed.Hostname())
+	if !strings.EqualFold(host, "localhost") {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("Inline sidecar URL must use a loopback host")
+		}
 	}
 	return nil
 }
@@ -204,15 +278,24 @@ func configString(value, fallback string) string {
 }
 
 func newInlineClient(login *bridgev2.UserLogin, meta *UserLoginMetadata, sidecarURL string) *InlineClient {
+	storeNamespace := strings.TrimSpace(meta.StoreNamespace)
+	if storeNamespace == "" {
+		storeNamespace = strings.TrimSpace(meta.AccountID)
+		meta.StoreNamespace = storeNamespace
+	}
 	return &InlineClient{
-		UserLogin: login,
-		AccountID: meta.AccountID,
-		Sidecar:   sidecar.NewClient(sidecarURL),
-		loggedIn:  !meta.SessionInvalidated,
-		users:     make(map[int64]sidecar.UserRecord),
-		dialogs:   make(map[int64]sidecar.DialogRecord),
-		details:   make(map[int64]struct{}),
-		history:   make(map[int64]int64),
+		UserLogin:           login,
+		AccountID:           meta.AccountID,
+		Sidecar:             sidecar.NewClient(sidecarURL).WithSessionNamespace(storeNamespace),
+		storeNamespace:      storeNamespace,
+		lastSidecarSequence: meta.LastSidecarSequence,
+		bridgeStateVersion:  meta.BridgeStateVersion,
+		loggedIn:            !meta.SessionInvalidated,
+		users:               make(map[int64]sidecar.UserRecord),
+		dialogs:             make(map[int64]sidecar.DialogRecord),
+		details:             make(map[int64]struct{}),
+		history:             make(map[int64]int64),
+		historyLoaded:       make(map[int64]struct{}),
 	}
 }
 

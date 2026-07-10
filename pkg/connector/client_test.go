@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -22,6 +23,86 @@ func TestMakeMessageIDIsChatScoped(t *testing.T) {
 	want := networkid.MessageID("7/11")
 	if got != want {
 		t.Fatalf("makeMessageID = %q, want %q", got, want)
+	}
+}
+
+func TestUpsertExistingInlineMessageSkipsUnchangedReplay(t *testing.T) {
+	message := sidecar.MessageRecord{
+		ChatID:     7,
+		MessageID:  11,
+		SenderID:   42,
+		IsOutgoing: false,
+		Content:    sidecar.MessageContent{Type: "text", Text: "hello"},
+	}
+	existing := []*database.Message{{
+		Metadata: &MessageMetadata{InlineFingerprint: inlineMessageFingerprint(message)},
+	}}
+
+	portal := testPortal("7")
+	result, err := upsertExistingInlineMessage(t.Context(), portal, nil, existing, message)
+	if err != nil {
+		t.Fatalf("upsertExistingInlineMessage() error = %v", err)
+	}
+	if result.ContinueMessageHandling || len(result.SubEvents) != 0 {
+		t.Fatalf("unchanged replay result = %#v, want no Matrix edit", result)
+	}
+
+	message.Content.Text = "edited"
+	result, err = upsertExistingInlineMessage(t.Context(), portal, nil, existing, message)
+	if err != nil {
+		t.Fatalf("edited upsert error = %v", err)
+	}
+	if len(result.SubEvents) != 1 {
+		t.Fatalf("edited upsert result = %#v, want one Matrix edit", result)
+	}
+}
+
+func TestUpsertExistingInlineMediaRetriesLegacyUnavailableProjection(t *testing.T) {
+	message := sidecar.MessageRecord{
+		ChatID:    7,
+		MessageID: 11,
+		SenderID:  42,
+		Content: sidecar.MessageContent{
+			Type: "media",
+			URL:  "https://cdn.inline.test/file",
+		},
+	}
+	fingerprint := inlineMessageFingerprint(message)
+	portal := testPortal("7")
+
+	legacy := []*database.Message{{
+		Metadata: &MessageMetadata{InlineFingerprint: fingerprint},
+	}}
+	result, err := upsertExistingInlineMessage(t.Context(), portal, nil, legacy, message)
+	if err != nil {
+		t.Fatalf("legacy media upsert error = %v", err)
+	}
+	if len(result.SubEvents) != 1 {
+		t.Fatalf("legacy media result = %#v, want retry edit", result)
+	}
+
+	handled := []*database.Message{{
+		Metadata: &MessageMetadata{InlineFingerprint: fingerprint, MediaHandled: true},
+	}}
+	result, err = upsertExistingInlineMessage(t.Context(), portal, nil, handled, message)
+	if err != nil {
+		t.Fatalf("handled media upsert error = %v", err)
+	}
+	if len(result.SubEvents) != 0 || result.ContinueMessageHandling {
+		t.Fatalf("handled media result = %#v, want no-op", result)
+	}
+}
+
+func TestMaxInlineMessageIDForChatUsesDurableBridgeRows(t *testing.T) {
+	messages := []*database.Message{
+		{ID: makeMessageID(7, 11)},
+		{ID: makeMessageID(8, 99)},
+		{ID: makeMessageID(7, 13)},
+		{ID: networkid.MessageID("invalid")},
+	}
+
+	if got := maxInlineMessageIDForChat(messages, 7); got != 13 {
+		t.Fatalf("maxInlineMessageIDForChat() = %d, want 13", got)
 	}
 }
 
@@ -401,6 +482,231 @@ func TestHandleMatrixViewingChatMarksInlineChatRead(t *testing.T) {
 		Portal: testPortal("7"),
 	}); err != nil {
 		t.Fatalf("HandleMatrixViewingChat() error = %v", err)
+	}
+}
+
+func TestChatManagementCapabilitiesAreScopedToInlineThreads(t *testing.T) {
+	ic := &InlineClient{}
+	group := testPortal("7")
+	features := ic.GetCapabilities(context.Background(), group)
+	if !features.MarkAsUnread || !features.DeleteChat || !features.DeleteChatForEveryone {
+		t.Fatalf("group capabilities = %#v, want marked unread and delete-chat support", features)
+	}
+	if name := features.State[event.StateRoomName.Type]; name == nil || name.Level != event.CapLevelFullySupported {
+		t.Fatalf("room-name capability = %#v, want fully supported", name)
+	}
+	for _, action := range []event.MemberAction{
+		event.MemberActionInvite,
+		event.MemberActionKick,
+		event.MemberActionRevokeInvite,
+	} {
+		if features.MemberActions[action] != event.CapLevelFullySupported {
+			t.Fatalf("member action %q = %v, want fully supported", action, features.MemberActions[action])
+		}
+	}
+
+	dm := testPortal("8")
+	dm.OtherUserID = makeUserID("42")
+	dmFeatures := ic.GetCapabilities(context.Background(), dm)
+	if !dmFeatures.MarkAsUnread {
+		t.Fatal("DM marked-unread capability = false, want true")
+	}
+	if dmFeatures.DeleteChat || len(dmFeatures.State) != 0 || len(dmFeatures.MemberActions) != 0 {
+		t.Fatalf("DM chat-management capabilities = %#v, want no thread-only operations", dmFeatures)
+	}
+}
+
+func TestDialogDisplayNameKeepsEmojiSeparateFromTitle(t *testing.T) {
+	title := "General"
+	emoji := "✨"
+	if got := dialogDisplayName(sidecar.DialogRecord{Title: &title, Emoji: &emoji}); got != "✨ General" {
+		t.Fatalf("dialogDisplayName() = %q, want %q", got, "✨ General")
+	}
+	if got := dialogDisplayName(sidecar.DialogRecord{Title: &title}); got != "General" {
+		t.Fatalf("dialogDisplayName() without emoji = %q, want General", got)
+	}
+}
+
+func TestDialogSyncUsesOneLiveSnapshotThenCachedPages(t *testing.T) {
+	liveCalls := 0
+	cachedCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/rpc/dialogs":
+			liveCalls++
+			writeConnectorSidecarResult(t, w, "dialogs", sidecar.DialogsPage{NextCursor: "page-2"})
+		case "/rpc/state/dialogs":
+			cachedCalls++
+			writeConnectorSidecarResult(t, w, "dialogs", sidecar.DialogsPage{})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	ic := &InlineClient{Sidecar: sidecar.NewClient(server.URL)}
+	if err := ic.syncDialogs(context.Background(), true); err != nil {
+		t.Fatalf("live syncDialogs() error = %v", err)
+	}
+	if liveCalls != 1 || cachedCalls != 1 {
+		t.Fatalf("live/cached calls = %d/%d, want 1/1", liveCalls, cachedCalls)
+	}
+	if err := ic.syncDialogs(context.Background(), false); err != nil {
+		t.Fatalf("cached syncDialogs() error = %v", err)
+	}
+	if liveCalls != 1 || cachedCalls != 2 {
+		t.Fatalf("live/cached calls after poll = %d/%d, want 1/2", liveCalls, cachedCalls)
+	}
+}
+
+func TestReplayReconciliationUsesOneLiveSnapshotThenCachedPages(t *testing.T) {
+	liveCalls := 0
+	cachedCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/rpc/dialogs":
+			liveCalls++
+			writeConnectorSidecarResult(t, w, "dialogs", sidecar.DialogsPage{NextCursor: "page-2"})
+		case "/rpc/state/dialogs":
+			cachedCalls++
+			writeConnectorSidecarResult(t, w, "dialogs", sidecar.DialogsPage{})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	ic := &InlineClient{Sidecar: sidecar.NewClient(server.URL)}
+	dialogs, err := ic.fetchAllDialogsForReconciliation(context.Background())
+	if err != nil {
+		t.Fatalf("fetchAllDialogsForReconciliation() error = %v", err)
+	}
+	if len(dialogs) != 0 {
+		t.Fatalf("dialogs = %#v, want empty", dialogs)
+	}
+	if liveCalls != 1 || cachedCalls != 1 {
+		t.Fatalf("live/cached calls = %d/%d, want 1/1", liveCalls, cachedCalls)
+	}
+}
+
+func TestRateLimitRetryDelayUsesTypedHint(t *testing.T) {
+	seconds := uint64(17)
+	err := &sidecar.Error{Category: "RateLimited", Message: "slow down", RetryAfterSeconds: &seconds}
+	if got := rateLimitRetryDelay(err, dialogRateLimitCooldown); got != 17*time.Second {
+		t.Fatalf("rateLimitRetryDelay() = %v, want 17s", got)
+	}
+
+	seconds = uint64(dialogRateLimitMaxDelay/time.Second) + 1
+	if got := rateLimitRetryDelay(err, dialogRateLimitCooldown); got != dialogRateLimitMaxDelay {
+		t.Fatalf("rateLimitRetryDelay() capped = %v, want %v", got, dialogRateLimitMaxDelay)
+	}
+}
+
+func TestMatrixChatManagementCallsSidecar(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/rpc/marked-unread":
+			var request sidecar.SetMarkedUnreadRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode marked unread request: %v", err)
+			}
+			if request.ChatID != 7 || !request.Unread {
+				t.Fatalf("marked unread request = %#v, want chat 7 unread", request)
+			}
+		case "/rpc/dialog/notifications":
+			var request sidecar.UpdateDialogNotificationsRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode notification request: %v", err)
+			}
+			if request.ChatID != 7 || request.Mode == nil || *request.Mode != sidecar.DialogNotificationNone {
+				t.Fatalf("notification request = %#v, want chat 7 none", request)
+			}
+		case "/rpc/chat/info":
+			var request sidecar.UpdateChatInfoRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode update chat request: %v", err)
+			}
+			if request.ChatID != 7 || request.Title == nil || *request.Title != "Renamed" {
+				t.Fatalf("update chat request = %#v, want chat 7 Renamed", request)
+			}
+		case "/rpc/chat/participants/add":
+			var request sidecar.AddChatParticipantRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode add participant request: %v", err)
+			}
+			if request.ChatID != 7 || request.UserID != 42 {
+				t.Fatalf("add participant request = %#v, want chat 7 user 42", request)
+			}
+		case "/rpc/chat/participants/remove":
+			var request sidecar.RemoveChatParticipantRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode remove participant request: %v", err)
+			}
+			if request.ChatID != 7 || request.UserID != 42 {
+				t.Fatalf("remove participant request = %#v, want chat 7 user 42", request)
+			}
+		case "/rpc/chat/delete":
+			var request sidecar.DeleteChatRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode delete chat request: %v", err)
+			}
+			if request.ChatID != 7 {
+				t.Fatalf("delete chat request = %#v, want chat 7", request)
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		writeConnectorSidecarResult(t, w, "empty", struct{}{})
+	}))
+	defer server.Close()
+
+	ic := &InlineClient{Sidecar: sidecar.NewClient(server.URL)}
+	portal := testPortal("7")
+	if err := ic.HandleMarkedUnread(context.Background(), &bridgev2.MatrixMarkedUnread{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.MarkedUnreadEventContent]{
+			Portal:  portal,
+			Content: &event.MarkedUnreadEventContent{Unread: true},
+		},
+	}); err != nil {
+		t.Fatalf("HandleMarkedUnread() error = %v", err)
+	}
+	if err := ic.HandleMute(context.Background(), &bridgev2.MatrixMute{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.BeeperMuteEventContent]{
+			Portal:  portal,
+			Content: &event.BeeperMuteEventContent{MutedUntil: -1},
+		},
+	}); err != nil {
+		t.Fatalf("HandleMute() error = %v", err)
+	}
+	changed, err := ic.HandleMatrixRoomName(context.Background(), &bridgev2.MatrixRoomName{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.RoomNameEventContent]{
+			Portal:  portal,
+			Content: &event.RoomNameEventContent{Name: " Renamed "},
+		},
+	})
+	if err != nil || !changed {
+		t.Fatalf("HandleMatrixRoomName() = %v, %v; want true, nil", changed, err)
+	}
+	if portal.Name != "Renamed" || !portal.NameSet {
+		t.Fatalf("portal name state = %q/%v, want Renamed/true", portal.Name, portal.NameSet)
+	}
+
+	ghost := &bridgev2.Ghost{Ghost: &database.Ghost{ID: makeUserID("42")}}
+	for _, change := range []bridgev2.MembershipChangeType{bridgev2.Invite, bridgev2.Kick} {
+		if _, err := ic.HandleMatrixMembership(context.Background(), &bridgev2.MatrixMembershipChange{
+			MatrixRoomMeta: bridgev2.MatrixRoomMeta[*event.MemberEventContent]{
+				MatrixEventBase: bridgev2.MatrixEventBase[*event.MemberEventContent]{Portal: portal},
+			},
+			Target: ghost,
+			Type:   change,
+		}); err != nil {
+			t.Fatalf("HandleMatrixMembership(%v) error = %v", change, err)
+		}
+	}
+	if err := ic.HandleMatrixDeleteChat(context.Background(), &bridgev2.MatrixDeleteChat{
+		Portal: portal,
+	}); err != nil {
+		t.Fatalf("HandleMatrixDeleteChat() error = %v", err)
 	}
 }
 
@@ -817,6 +1123,80 @@ func TestTransactionIDForMessage(t *testing.T) {
 	})
 	if got != networkid.TransactionID("txn-1") {
 		t.Fatalf("transactionIDForMessage = %q, want txn-1", got)
+	}
+}
+
+func TestMatrixSendResponseRejectsTerminalOrUnknownTransactionState(t *testing.T) {
+	ic := &InlineClient{}
+	for name, mutation := range map[string]*sidecar.MessageMutation{
+		"uncertain": {
+			Transaction: sidecar.TransactionIdentity{TransactionID: "txn-uncertain"},
+			State:       sidecar.TransactionAcked,
+		},
+		"failed": {
+			Transaction: sidecar.TransactionIdentity{TransactionID: "txn-failed"},
+			State:       sidecar.TransactionFailed,
+			Failure:     &sidecar.Failure{Category: "PermissionDenied", Message: "not allowed"},
+		},
+		"completed without id": {
+			Transaction: sidecar.TransactionIdentity{TransactionID: "txn-completed"},
+			State:       sidecar.TransactionCompleted,
+		},
+		"unknown": {
+			Transaction: sidecar.TransactionIdentity{TransactionID: "txn-unknown"},
+			State:       sidecar.TransactionState("FutureState"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ic.matrixSendResponse(nil, 7, mutation); err == nil {
+				t.Fatal("matrixSendResponse() error = nil, want explicit failure")
+			}
+		})
+	}
+}
+
+func TestSidecarErrorCertaintyOnlyMarksPermanentFailures(t *testing.T) {
+	if sidecarErrorIsCertain(&sidecar.Error{Category: "Timeout", Message: "timed out"}) {
+		t.Fatal("Timeout should be uncertain and retryable")
+	}
+	if !sidecarErrorIsCertain(&sidecar.Error{Category: "PermissionDenied", Message: "denied"}) {
+		t.Fatal("PermissionDenied should be certain")
+	}
+	if sidecarErrorIsCertain(errors.New("connection reset")) {
+		t.Fatal("transport error should be uncertain")
+	}
+}
+
+func TestDuplicateSidecarReplayOnlyReacknowledgesContiguousCursor(t *testing.T) {
+	acked := make(chan sidecar.EventAckRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request sidecar.EventAckRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode ack request: %v", err)
+		}
+		acked <- request
+		if err := json.NewEncoder(w).Encode(sidecar.EventAckResponse{AcknowledgedSequence: request.Sequence}); err != nil {
+			t.Fatalf("encode ack response: %v", err)
+		}
+	}))
+	defer server.Close()
+	sequence := uint64(9)
+	ic := &InlineClient{
+		Sidecar:             sidecar.NewClient(server.URL),
+		storeNamespace:      "team",
+		lastSidecarSequence: 10,
+	}
+
+	if err := ic.handleSequencedSidecarEvent(t.Context(), &sidecar.EventEnvelope{
+		SessionNamespace: "team",
+		Sequence:         &sequence,
+		Reliability:      sidecar.EventLossless,
+	}); err != nil {
+		t.Fatalf("handleSequencedSidecarEvent() error = %v", err)
+	}
+	request := <-acked
+	if request.SessionNamespace != "team" || request.Sequence != 10 {
+		t.Fatalf("ack = %#v, want team cursor 10", request)
 	}
 }
 

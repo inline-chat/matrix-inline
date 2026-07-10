@@ -3,17 +3,20 @@
 use std::{fmt, str::FromStr};
 
 use inline_client::{
-    AuthStartRequest, AuthStartResult, AuthVerifyRequest, ChatParticipantsPage,
-    ChatParticipantsRequest, ClientErrorCategory, ClientEvent, ClientFailure, ClientStatus,
+    AccountStateSnapshot, AddChatParticipantRequest, AuthStartRequest, AuthStartResult,
+    AuthVerifyRequest, BackendError, ChatParticipantsPage, ChatParticipantsRequest,
+    ChatStateSnapshot, ClientErrorCategory, ClientEvent, ClientFailure, ClientStatus,
     ConnectRequest, CreateDmRequest, CreateReplyThreadRequest, CreateThreadRequest, CreatedChat,
-    DeleteMessageRequest, DialogsPage, DialogsRequest, EditMessageRequest, EventReliability,
-    HistoryPage, HistoryRequest, InlineId, MessageMutation, ReactRequest, ReadRequest,
-    SendTextRequest, TypingRequest, UploadHandle, UploadRequest,
+    DeleteChatRequest, DeleteMessageRequest, DialogsPage, DialogsRequest, EditMessageRequest,
+    EventReliability, HistoryPage, HistoryRequest, InlineId, MessageMutation, ReactRequest,
+    ReadRequest, RemoveChatParticipantRequest, SendTextRequest, SetMarkedUnreadRequest,
+    TypingRequest, UpdateChatInfoRequest, UpdateDialogNotificationsRequest, UploadHandle,
+    UploadRequest,
 };
 use serde::{Deserialize, Serialize};
 
 /// Current bridge adapter command/event protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Version metadata returned by health/status endpoints.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,10 +188,26 @@ pub enum SidecarCommand {
     Status,
     /// Fetch dialogs.
     Dialogs(DialogsRequest),
+    /// Fetch only durable cached dialogs.
+    CachedDialogs(DialogsRequest),
+    /// Fetch account-level durable reconciliation state.
+    AccountState,
+    /// Fetch durable reconciliation state for one chat.
+    ChatState(ChatStateRequest),
     /// Fetch history for a chat.
     History(HistoryRequest),
+    /// Fetch only durable cached history for reconciliation.
+    CachedHistory(HistoryRequest),
     /// Fetch participants for a chat.
     ChatParticipants(ChatParticipantsRequest),
+    /// Add a participant to a chat.
+    AddChatParticipant(AddChatParticipantRequest),
+    /// Remove a participant from a chat.
+    RemoveChatParticipant(RemoveChatParticipantRequest),
+    /// Update mutable chat metadata.
+    UpdateChatInfo(UpdateChatInfoRequest),
+    /// Delete a chat when the authenticated user is allowed to.
+    DeleteChat(DeleteChatRequest),
     /// Create or open a direct message chat.
     CreateDm(CreateDmRequest),
     /// Create a regular Inline thread chat.
@@ -205,6 +224,10 @@ pub enum SidecarCommand {
     React(ReactRequest),
     /// Mark messages read.
     Read(ReadRequest),
+    /// Set explicit marked-unread state.
+    SetMarkedUnread(SetMarkedUnreadRequest),
+    /// Set or clear a per-dialog notification override.
+    UpdateDialogNotifications(UpdateDialogNotificationsRequest),
     /// Set typing state.
     Typing(TypingRequest),
     /// Upload and send media.
@@ -222,8 +245,16 @@ impl SidecarCommand {
             Self::Logout => "logout",
             Self::Status => "status",
             Self::Dialogs(_) => "dialogs",
+            Self::CachedDialogs(_) => "cached_dialogs",
+            Self::AccountState => "account_state",
+            Self::ChatState(_) => "chat_state",
             Self::History(_) => "history",
+            Self::CachedHistory(_) => "cached_history",
             Self::ChatParticipants(_) => "chat_participants",
+            Self::AddChatParticipant(_) => "add_chat_participant",
+            Self::RemoveChatParticipant(_) => "remove_chat_participant",
+            Self::UpdateChatInfo(_) => "update_chat_info",
+            Self::DeleteChat(_) => "delete_chat",
             Self::CreateDm(_) => "create_dm",
             Self::CreateThread(_) => "create_thread",
             Self::CreateReplyThread(_) => "create_reply_thread",
@@ -232,14 +263,23 @@ impl SidecarCommand {
             Self::DeleteMessage(_) => "delete_message",
             Self::React(_) => "react",
             Self::Read(_) => "read",
+            Self::SetMarkedUnread(_) => "set_marked_unread",
+            Self::UpdateDialogNotifications(_) => "update_dialog_notifications",
             Self::Typing(_) => "typing",
             Self::Upload(_) => "upload",
         }
     }
 }
 
+/// Adapter request for one durable chat reconciliation snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatStateRequest {
+    /// Inline chat ID to inspect.
+    pub chat_id: InlineId,
+}
+
 /// Adapter auth verify result.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthVerifySidecarResult {
     /// Verified Inline user ID.
     pub user_id: InlineId,
@@ -247,6 +287,17 @@ pub struct AuthVerifySidecarResult {
     pub account_namespace: String,
     /// Updated adapter status after persisting the session.
     pub status: SidecarStatus,
+}
+
+impl fmt::Debug for AuthVerifySidecarResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthVerifySidecarResult")
+            .field("user_id", &self.user_id)
+            .field("account_namespace", &"[redacted]")
+            .field("status", &self.status)
+            .finish()
+    }
 }
 
 impl From<inline_client::AuthVerifyResult> for AuthVerifySidecarResult {
@@ -276,6 +327,10 @@ pub enum SidecarResult {
     AuthVerify(AuthVerifySidecarResult),
     /// Dialog page.
     Dialogs(DialogsPage),
+    /// Account-level durable reconciliation state.
+    AccountState(AccountStateSnapshot),
+    /// Durable reconciliation state for one chat.
+    ChatState(Box<ChatStateSnapshot>),
     /// History page.
     History(HistoryPage),
     /// Chat participant snapshot.
@@ -313,6 +368,16 @@ impl SidecarError {
 impl From<ClientFailure> for SidecarError {
     fn from(failure: ClientFailure) -> Self {
         Self::new(failure.category, failure.message)
+    }
+}
+
+impl From<BackendError> for SidecarError {
+    fn from(error: BackendError) -> Self {
+        Self {
+            category: error.category,
+            message: error.message,
+            retry_after_seconds: error.retry_after_seconds,
+        }
     }
 }
 
@@ -358,10 +423,12 @@ impl SidecarResponse {
 }
 
 /// Versioned adapter event envelope.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarEventEnvelope {
     /// Adapter protocol version.
     pub protocol_version: u16,
+    /// Account/store namespace that owns this event sequence.
+    pub session_namespace: String,
     /// Optional monotonically increasing adapter-local sequence.
     pub sequence: Option<u64>,
     /// Event delivery reliability class.
@@ -370,11 +437,25 @@ pub struct SidecarEventEnvelope {
     pub event: ClientEvent,
 }
 
+impl fmt::Debug for SidecarEventEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SidecarEventEnvelope")
+            .field("protocol_version", &self.protocol_version)
+            .field("session_namespace", &"[redacted]")
+            .field("sequence", &self.sequence)
+            .field("reliability", &self.reliability)
+            .field("event", &self.event)
+            .finish()
+    }
+}
+
 impl SidecarEventEnvelope {
     /// Creates an event envelope using the current protocol version.
     pub fn current(event: ClientEvent) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            session_namespace: String::new(),
             sequence: None,
             reliability: event.reliability(),
             event,
@@ -384,6 +465,12 @@ impl SidecarEventEnvelope {
     /// Sets the adapter-local sequence.
     pub fn with_sequence(mut self, sequence: u64) -> Self {
         self.sequence = Some(sequence);
+        self
+    }
+
+    /// Sets the account/store namespace for replay isolation.
+    pub fn with_session_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.session_namespace = namespace.into();
         self
     }
 }
@@ -425,11 +512,16 @@ mod tests {
             is_typing: true,
         };
 
-        let envelope = SidecarEventEnvelope::current(event).with_sequence(10);
+        let envelope = SidecarEventEnvelope::current(event)
+            .with_session_namespace("secret-namespace")
+            .with_sequence(10);
 
         assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
         assert_eq!(envelope.sequence, Some(10));
         assert_eq!(envelope.reliability, EventReliability::BestEffort);
+        let rendered = format!("{envelope:?}");
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains("secret-namespace"));
     }
 
     #[test]
@@ -447,5 +539,16 @@ mod tests {
             }
             SidecarOutcome::Ok(_) => panic!("expected error outcome"),
         }
+    }
+
+    #[test]
+    fn backend_error_preserves_typed_retry_hint() {
+        let error = BackendError::new(ClientErrorCategory::RateLimited, "slow down")
+            .with_retry_after_seconds(42);
+
+        let sidecar = SidecarError::from(error);
+
+        assert_eq!(sidecar.category, ClientErrorCategory::RateLimited);
+        assert_eq!(sidecar.retry_after_seconds, Some(42));
     }
 }

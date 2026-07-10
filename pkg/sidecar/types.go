@@ -1,11 +1,14 @@
 package sidecar
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 const (
 	// ProtocolVersion is the sidecar command/event protocol version expected by
 	// this bridge.
-	ProtocolVersion = 1
+	ProtocolVersion = 3
 
 	// DefaultBaseURL is the loopback sidecar endpoint.
 	DefaultBaseURL = "http://127.0.0.1:29342"
@@ -135,15 +138,61 @@ type DialogRecord struct {
 	ChatID                 int64   `json:"chat_id"`
 	PeerUserID             *int64  `json:"peer_user_id,omitempty"`
 	Title                  *string `json:"title,omitempty"`
+	Emoji                  *string `json:"emoji,omitempty"`
 	LastMessageID          *int64  `json:"last_message_id,omitempty"`
 	SyncedThroughMessageID *int64  `json:"synced_through_message_id,omitempty"`
 	UnreadCount            *uint32 `json:"unread_count,omitempty"`
+	SpaceID                *int64  `json:"space_id,omitempty"`
+	IsPublic               *bool   `json:"is_public,omitempty"`
+	Archived               *bool   `json:"archived,omitempty"`
+	Pinned                 *bool   `json:"pinned,omitempty"`
+	Open                   *bool   `json:"open,omitempty"`
+	ChatListHidden         *bool   `json:"chat_list_hidden,omitempty"`
+	Order                  *string `json:"order,omitempty"`
+	PinnedOrder            *string `json:"pinned_order,omitempty"`
+	NotificationMode       *string `json:"notification_mode,omitempty"`
+	FollowMode             *string `json:"follow_mode,omitempty"`
+	PinnedMessageIDs       []int64 `json:"pinned_message_ids,omitempty"`
 }
 
 type DialogsPage struct {
 	Dialogs    []DialogRecord `json:"dialogs"`
 	Users      []UserRecord   `json:"users,omitempty"`
 	NextCursor string         `json:"next_cursor,omitempty"`
+}
+
+type AccountStateSnapshot struct {
+	DeletedChatIDs []int64 `json:"deleted_chat_ids"`
+}
+
+type ChatStateRequest struct {
+	ChatID int64 `json:"chat_id"`
+}
+
+type ReactionRecord struct {
+	ChatID    int64  `json:"chat_id"`
+	MessageID int64  `json:"message_id"`
+	UserID    int64  `json:"user_id"`
+	Reaction  string `json:"reaction"`
+}
+
+type ReadStateRecord struct {
+	ChatID       int64   `json:"chat_id"`
+	ReadMaxID    *int64  `json:"read_max_id,omitempty"`
+	UnreadCount  *uint32 `json:"unread_count,omitempty"`
+	MarkedUnread bool    `json:"marked_unread"`
+}
+
+type ChatStateSnapshot struct {
+	ChatID                     int64                   `json:"chat_id"`
+	Dialog                     *DialogRecord           `json:"dialog,omitempty"`
+	Deleted                    bool                    `json:"deleted"`
+	DeletedMessageIDs          []int64                 `json:"deleted_message_ids"`
+	Reactions                  []ReactionRecord        `json:"reactions"`
+	ReactionSnapshotMessageIDs []int64                 `json:"reaction_snapshot_message_ids"`
+	ReadState                  *ReadStateRecord        `json:"read_state,omitempty"`
+	Participants               []ChatParticipantRecord `json:"participants"`
+	ParticipantsComplete       bool                    `json:"participants_complete"`
 }
 
 type UserRecord struct {
@@ -171,6 +220,26 @@ type HistoryPage struct {
 }
 
 type ChatParticipantsRequest struct {
+	ChatID int64 `json:"chat_id"`
+}
+
+type AddChatParticipantRequest struct {
+	ChatID int64 `json:"chat_id"`
+	UserID int64 `json:"user_id"`
+}
+
+type RemoveChatParticipantRequest struct {
+	ChatID int64 `json:"chat_id"`
+	UserID int64 `json:"user_id"`
+}
+
+type UpdateChatInfoRequest struct {
+	ChatID int64   `json:"chat_id"`
+	Title  *string `json:"title,omitempty"`
+	Emoji  *string `json:"emoji,omitempty"`
+}
+
+type DeleteChatRequest struct {
 	ChatID int64 `json:"chat_id"`
 }
 
@@ -313,6 +382,24 @@ type ReadRequest struct {
 	MaxMessageID *int64 `json:"max_message_id,omitempty"`
 }
 
+type SetMarkedUnreadRequest struct {
+	ChatID int64 `json:"chat_id"`
+	Unread bool  `json:"unread"`
+}
+
+type DialogNotificationMode string
+
+const (
+	DialogNotificationAll      DialogNotificationMode = "all"
+	DialogNotificationMentions DialogNotificationMode = "mentions"
+	DialogNotificationNone     DialogNotificationMode = "none"
+)
+
+type UpdateDialogNotificationsRequest struct {
+	ChatID int64                   `json:"chat_id"`
+	Mode   *DialogNotificationMode `json:"mode,omitempty"`
+}
+
 type TypingRequest struct {
 	ChatID   int64 `json:"chat_id"`
 	IsTyping bool  `json:"is_typing"`
@@ -321,7 +408,20 @@ type TypingRequest struct {
 type MessageMutation struct {
 	Transaction TransactionIdentity `json:"transaction"`
 	MessageID   *int64              `json:"message_id,omitempty"`
+	State       TransactionState    `json:"state"`
+	Failure     *Failure            `json:"failure,omitempty"`
 }
+
+type TransactionState string
+
+const (
+	TransactionQueued    TransactionState = "Queued"
+	TransactionSent      TransactionState = "Sent"
+	TransactionAcked     TransactionState = "Acked"
+	TransactionCompleted TransactionState = "Completed"
+	TransactionFailed    TransactionState = "Failed"
+	TransactionCancelled TransactionState = "Cancelled"
+)
 
 type TransactionIdentity struct {
 	TransactionID      string      `json:"transaction_id"`
@@ -339,31 +439,55 @@ const (
 )
 
 type EventEnvelope struct {
-	ProtocolVersion int              `json:"protocol_version"`
-	Sequence        *uint64          `json:"sequence,omitempty"`
-	Reliability     EventReliability `json:"reliability"`
-	Event           ClientEvent      `json:"event"`
+	ProtocolVersion  int              `json:"protocol_version"`
+	SessionNamespace string           `json:"session_namespace"`
+	Sequence         *uint64          `json:"sequence,omitempty"`
+	Reliability      EventReliability `json:"reliability"`
+	Event            ClientEvent      `json:"event"`
+}
+
+type EventAckRequest struct {
+	SessionNamespace string `json:"session_namespace"`
+	Sequence         uint64 `json:"sequence"`
+}
+
+type EventAckResponse struct {
+	AcknowledgedSequence uint64 `json:"acknowledged_sequence"`
 }
 
 type ClientEvent struct {
 	Type string
 
-	StatusChanged      *StatusChangedEvent
-	TransactionChanged *TransactionEvent
-	ChatUpserted       *ChatIDEvent
-	UserUpserted       *UserIDEvent
-	MessageUpserted    *MessageIDEvent
-	MessageStored      *MessageStoredEvent
-	MessageDeleted     *MessageIDEvent
-	ReactionChanged    *ReactionChangedEvent
-	ReadStateChanged   *ChatIDEvent
-	Typing             *TypingEvent
+	StatusChanged           *StatusChangedEvent
+	TransactionChanged      *TransactionEvent
+	ChatUpserted            *ChatIDEvent
+	ChatDeleted             *ChatIDEvent
+	ChatParticipantsChanged *ChatIDEvent
+	UserUpserted            *UserIDEvent
+	SpaceUpserted           *SpaceIDEvent
+	SpaceMemberChanged      *SpaceMemberChangedEvent
+	UserSettingsChanged     *struct{}
+	MessageActionInvoked    *MessageActionInvokedEvent
+	MessageActionAnswered   *MessageActionAnsweredEvent
+	MessageUpserted         *MessageIDEvent
+	MessageStored           *MessageStoredEvent
+	MessageDeleted          *MessageIDEvent
+	ChatHistoryCleared      *ChatHistoryClearedEvent
+	ReactionChanged         *ReactionChangedEvent
+	ReadStateChanged        *ChatIDEvent
+	Typing                  *TypingEvent
+	UserStatusChanged       *UserStatusChangedEvent
+	BotPresenceChanged      *BotPresenceChangedEvent
+	NewMessageNotification  *NewMessageNotificationEvent
 }
 
 func (evt *ClientEvent) UnmarshalJSON(data []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
+	}
+	if len(raw) != 1 {
+		return fmt.Errorf("Inline sidecar event must contain exactly one variant, got %d", len(raw))
 	}
 	for typ, payload := range raw {
 		evt.Type = typ
@@ -386,12 +510,50 @@ func (evt *ClientEvent) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			evt.ChatUpserted = &value
+		case "ChatDeleted":
+			var value ChatIDEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.ChatDeleted = &value
+		case "ChatParticipantsChanged":
+			var value ChatIDEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.ChatParticipantsChanged = &value
 		case "UserUpserted":
 			var value UserIDEvent
 			if err := json.Unmarshal(payload, &value); err != nil {
 				return err
 			}
 			evt.UserUpserted = &value
+		case "SpaceUpserted":
+			var value SpaceIDEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.SpaceUpserted = &value
+		case "SpaceMemberChanged":
+			var value SpaceMemberChangedEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.SpaceMemberChanged = &value
+		case "UserSettingsChanged":
+			evt.UserSettingsChanged = &struct{}{}
+		case "MessageActionInvoked":
+			var value MessageActionInvokedEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.MessageActionInvoked = &value
+		case "MessageActionAnswered":
+			var value MessageActionAnsweredEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.MessageActionAnswered = &value
 		case "MessageUpserted":
 			var value MessageIDEvent
 			if err := json.Unmarshal(payload, &value); err != nil {
@@ -410,6 +572,12 @@ func (evt *ClientEvent) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			evt.MessageDeleted = &value
+		case "ChatHistoryCleared":
+			var value ChatHistoryClearedEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.ChatHistoryCleared = &value
 		case "ReactionChanged":
 			var value ReactionChangedEvent
 			if err := json.Unmarshal(payload, &value); err != nil {
@@ -428,10 +596,30 @@ func (evt *ClientEvent) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			evt.Typing = &value
+		case "UserStatusChanged":
+			var value UserStatusChangedEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.UserStatusChanged = &value
+		case "BotPresenceChanged":
+			var value BotPresenceChangedEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.BotPresenceChanged = &value
+		case "NewMessageNotification":
+			var value NewMessageNotificationEvent
+			if err := json.Unmarshal(payload, &value); err != nil {
+				return err
+			}
+			evt.NewMessageNotification = &value
+		default:
+			return fmt.Errorf("unsupported Inline sidecar event variant %q", typ)
 		}
 		return nil
 	}
-	return nil
+	return fmt.Errorf("Inline sidecar event did not contain a variant")
 }
 
 type StatusChangedEvent struct {
@@ -453,9 +641,38 @@ type UserIDEvent struct {
 	UserID int64 `json:"user_id"`
 }
 
+type SpaceIDEvent struct {
+	SpaceID int64 `json:"space_id"`
+}
+
+type SpaceMemberChangedEvent struct {
+	SpaceID int64 `json:"space_id"`
+	UserID  int64 `json:"user_id"`
+	Removed bool  `json:"removed"`
+}
+
+type MessageActionInvokedEvent struct {
+	InteractionID int64  `json:"interaction_id"`
+	ChatID        int64  `json:"chat_id"`
+	MessageID     int64  `json:"message_id"`
+	ActorUserID   int64  `json:"actor_user_id"`
+	ActionID      string `json:"action_id"`
+	Data          []byte `json:"data"`
+}
+
+type MessageActionAnsweredEvent struct {
+	InteractionID int64   `json:"interaction_id"`
+	Toast         *string `json:"toast,omitempty"`
+}
+
 type MessageIDEvent struct {
 	ChatID    int64 `json:"chat_id"`
 	MessageID int64 `json:"message_id"`
+}
+
+type ChatHistoryClearedEvent struct {
+	ChatID     int64  `json:"chat_id"`
+	BeforeDate *int64 `json:"before_date,omitempty"`
 }
 
 type MessageStoredEvent struct {
@@ -474,4 +691,23 @@ type TypingEvent struct {
 	ChatID   int64 `json:"chat_id"`
 	UserID   int64 `json:"user_id"`
 	IsTyping bool  `json:"is_typing"`
+}
+
+type UserStatusChangedEvent struct {
+	UserID     int64  `json:"user_id"`
+	IsOnline   *bool  `json:"is_online,omitempty"`
+	LastOnline *int64 `json:"last_online,omitempty"`
+}
+
+type BotPresenceChangedEvent struct {
+	BotUserID     int64   `json:"bot_user_id"`
+	ChatID        *int64  `json:"chat_id,omitempty"`
+	Kind          string  `json:"kind"`
+	Comment       *string `json:"comment,omitempty"`
+	AvatarChanged bool    `json:"avatar_changed"`
+}
+
+type NewMessageNotificationEvent struct {
+	Message MessageRecord `json:"message"`
+	Reason  string        `json:"reason"`
 }
