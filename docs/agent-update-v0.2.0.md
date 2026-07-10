@@ -1,8 +1,8 @@
 # Agent update: matrix-inline v0.2.0
 
 Update the existing Matrix Inline deployment to `v0.2.0`. This release embeds
-the Rust Inline client from public commit
-[`51ee50d4c9969f4031587ca4d2973fe6b04d4fd0`](https://github.com/inline-chat/inline/commit/51ee50d4c9969f4031587ca4d2973fe6b04d4fd0)
+the Rust Inline `0.6.1` crates from public commit
+[`33d49a39ac31688ed80a5a7e028e8199fc4477bc`](https://github.com/inline-chat/inline/commit/33d49a39ac31688ed80a5a7e028e8199fc4477bc)
 and coordinates the Go bridge and Rust adapter on protocol version 3.
 
 ## What changed
