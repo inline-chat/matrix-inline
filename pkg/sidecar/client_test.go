@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -588,6 +589,9 @@ func TestEventsAfterRequestsNamespaceAndCursor(t *testing.T) {
 		if got := r.URL.Query().Get("after_sequence"); got != "9" {
 			t.Fatalf("after_sequence = %q, want 9", got)
 		}
+		if got := r.URL.Query().Get("generation"); got != "generation-1" {
+			t.Fatalf("generation = %q, want generation-1", got)
+		}
 		if got := r.Header.Get("X-Inline-Session-Namespace"); got != "team-42" {
 			t.Fatalf("session namespace header = %q, want team-42", got)
 		}
@@ -597,14 +601,14 @@ func TestEventsAfterRequestsNamespaceAndCursor(t *testing.T) {
 			return
 		}
 		defer conn.CloseNow()
-		payload := `{"protocol_version":3,"session_namespace":"team/42","sequence":10,"reliability":"Lossless","event":{"ChatUpserted":{"chat_id":7}}}`
+		payload := fmt.Sprintf(`{"protocol_version":%d,"session_namespace":"team/42","generation":"generation-1","sequence":10,"reliability":"Lossless","event":{"ChatUpserted":{"chat_id":7}}}`, ProtocolVersion)
 		if err := conn.Write(r.Context(), websocket.MessageText, []byte(payload)); err != nil {
 			t.Errorf("write event: %v", err)
 		}
 	}))
 	defer server.Close()
 
-	stream, err := NewClient(server.URL).WithSessionNamespace("team-42").EventsAfter(context.Background(), "team/42", 9)
+	stream, err := NewClient(server.URL).WithSessionNamespace("team-42").EventsAfterGeneration(context.Background(), "team/42", "generation-1", 9)
 	if err != nil {
 		t.Fatalf("EventsAfter() error = %v", err)
 	}
@@ -622,7 +626,7 @@ func TestEventsAfterMapsGoneToReplayUnavailable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusGone)
-		_, _ = w.Write([]byte(`{"error":"sidecar_event_replay_unavailable","requested_after_sequence":3,"oldest_retained_sequence":8,"latest_sequence":12}`))
+		_, _ = w.Write([]byte(`{"error":"sidecar_event_replay_unavailable","requested_after_sequence":3,"oldest_retained_sequence":8,"latest_sequence":12,"event_generation":"generation-2"}`))
 	}))
 	defer server.Close()
 
@@ -645,14 +649,14 @@ func TestAckEventsPostsDurableCursor(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("decode ack request: %v", err)
 		}
-		if request.SessionNamespace != "42" || request.Sequence != 11 {
+		if request.SessionNamespace != "42" || request.Generation != "generation-1" || request.Sequence != 11 {
 			t.Fatalf("ack request = %#v, want namespace 42 sequence 11", request)
 		}
-		writeJSON(t, w, EventAckResponse{AcknowledgedSequence: request.Sequence})
+		writeJSON(t, w, EventAckResponse{Generation: request.Generation, AcknowledgedSequence: request.Sequence})
 	}))
 	defer server.Close()
 
-	if err := NewClient(server.URL).AckEvents(context.Background(), "42", 11); err != nil {
+	if err := NewClient(server.URL).AckEventsGeneration(context.Background(), "42", "generation-1", 11); err != nil {
 		t.Fatalf("AckEvents() error = %v", err)
 	}
 }

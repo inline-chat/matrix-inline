@@ -69,6 +69,25 @@ func TestValidateConfigAcceptsMXCNetworkIcon(t *testing.T) {
 	}
 }
 
+func TestHiddenDialogsPolicyDefaultsToExclude(t *testing.T) {
+	connector := &InlineConnector{}
+	if got := connector.hiddenDialogsPolicy(); got != hiddenDialogsExclude {
+		t.Fatalf("hidden dialogs policy = %q, want %q", got, hiddenDialogsExclude)
+	}
+
+	connector.Config.HiddenDialogs = "include"
+	if got := connector.hiddenDialogsPolicy(); got != hiddenDialogsInclude {
+		t.Fatalf("configured hidden dialogs policy = %q, want %q", got, hiddenDialogsInclude)
+	}
+}
+
+func TestValidateConfigRejectsInvalidHiddenDialogsPolicy(t *testing.T) {
+	connector := &InlineConnector{Config: Config{HiddenDialogs: "sometimes"}}
+	if err := connector.validateConfig(); err == nil || !strings.Contains(err.Error(), "hidden_dialogs") {
+		t.Fatalf("validateConfig() error = %v, want hidden_dialogs rejection", err)
+	}
+}
+
 func TestStartRequiresSynchronousPortalDelivery(t *testing.T) {
 	previous := bridgev2.PortalEventBuffer
 	bridgev2.PortalEventBuffer = 64
@@ -150,5 +169,55 @@ func TestLegacyLoginMetadataDefaultsToBridgeStateRecovery(t *testing.T) {
 	client = newInlineClient(nil, &meta, "http://127.0.0.1:29342")
 	if client.needsBridgeStateRecovery() {
 		t.Fatal("current bridge state version should not repeat recovery")
+	}
+}
+
+func TestNewInlineClientRestoresBridgeRecoveryCursor(t *testing.T) {
+	meta := &UserLoginMetadata{
+		AccountID:            "42",
+		BridgeStateVersion:   currentBridgeStateVersion - 1,
+		BridgeRecoveryCursor: 9001,
+	}
+	client := newInlineClient(nil, meta, "http://127.0.0.1:29342")
+	if client.bridgeRecoveryCursor != 9001 {
+		t.Fatalf("bridge recovery cursor = %d, want 9001", client.bridgeRecoveryCursor)
+	}
+	if !client.needsBridgeStateRecovery() {
+		t.Fatal("partially recovered prior version should resume recovery")
+	}
+}
+
+func TestNewInlineClientRestoresSidecarEventGeneration(t *testing.T) {
+	meta := &UserLoginMetadata{
+		AccountID:              "42",
+		LastSidecarSequence:    77,
+		SidecarEventGeneration: "generation-1",
+	}
+	client := newInlineClient(nil, meta, "http://127.0.0.1:29342")
+	if client.sidecarEventGeneration != "generation-1" || client.lastSidecarSequence != 77 {
+		t.Fatalf("event cursor = %q/%d, want generation-1/77", client.sidecarEventGeneration, client.lastSidecarSequence)
+	}
+}
+
+func TestNewInlineClientRestoresHiddenDialogsOverride(t *testing.T) {
+	meta := &UserLoginMetadata{
+		AccountID:     "42",
+		HiddenDialogs: "include",
+	}
+	client := newInlineClient(nil, meta, "http://127.0.0.1:29342")
+	defaults, override, effective := client.hiddenDialogsSettings()
+	if defaults != hiddenDialogsExclude || override != hiddenDialogsInclude || effective != hiddenDialogsInclude {
+		t.Fatalf("hidden dialog settings = %q/%q/%q, want exclude/include/include", defaults, override, effective)
+	}
+}
+
+func TestNewInlineClientUsesConfiguredHiddenDialogsDefault(t *testing.T) {
+	login := &bridgev2.UserLogin{Bridge: &bridgev2.Bridge{
+		Network: &InlineConnector{Config: Config{HiddenDialogs: "include"}},
+	}}
+	client := newInlineClient(login, &UserLoginMetadata{AccountID: "42"}, "http://127.0.0.1:29342")
+	defaults, override, effective := client.hiddenDialogsSettings()
+	if defaults != hiddenDialogsInclude || override != "" || effective != hiddenDialogsInclude {
+		t.Fatalf("hidden dialog settings = %q/%q/%q, want include/default/include", defaults, override, effective)
 	}
 }

@@ -8,21 +8,23 @@ import (
 const (
 	// ProtocolVersion is the sidecar command/event protocol version expected by
 	// this bridge.
-	ProtocolVersion = 3
+	ProtocolVersion = 4
 
 	// DefaultBaseURL is the loopback sidecar endpoint.
 	DefaultBaseURL = "http://127.0.0.1:29342"
 )
 
 type Health struct {
-	OK       bool         `json:"ok"`
-	Protocol ProtocolInfo `json:"protocol"`
-	Status   ClientStatus `json:"status"`
+	OK              bool         `json:"ok"`
+	Protocol        ProtocolInfo `json:"protocol"`
+	Status          ClientStatus `json:"status"`
+	EventGeneration string       `json:"event_generation"`
 }
 
 type ProtocolInfo struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	ClientVersion   string `json:"client_version"`
+	ProtocolVersion        int    `json:"protocol_version"`
+	ClientVersion          string `json:"client_version"`
+	CoreSyncSchemaRevision uint32 `json:"core_sync_schema_revision"`
 }
 
 type ClientStatus string
@@ -132,7 +134,10 @@ type Result struct {
 type DialogsRequest struct {
 	Limit  *uint32 `json:"limit,omitempty"`
 	Cursor string  `json:"cursor,omitempty"`
+	Order  string  `json:"order,omitempty"`
 }
+
+const DialogsOrderStableChatID = "stable_chat_id"
 
 type DialogRecord struct {
 	ChatID                 int64   `json:"chat_id"`
@@ -441,6 +446,7 @@ const (
 type EventEnvelope struct {
 	ProtocolVersion  int              `json:"protocol_version"`
 	SessionNamespace string           `json:"session_namespace"`
+	Generation       string           `json:"generation"`
 	Sequence         *uint64          `json:"sequence,omitempty"`
 	Reliability      EventReliability `json:"reliability"`
 	Event            ClientEvent      `json:"event"`
@@ -448,10 +454,12 @@ type EventEnvelope struct {
 
 type EventAckRequest struct {
 	SessionNamespace string `json:"session_namespace"`
+	Generation       string `json:"generation"`
 	Sequence         uint64 `json:"sequence"`
 }
 
 type EventAckResponse struct {
+	Generation           string `json:"generation"`
 	AcknowledgedSequence uint64 `json:"acknowledged_sequence"`
 }
 

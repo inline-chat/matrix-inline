@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: inline-chat/inline
-          ref: 33d49a39ac31688ed80a5a7e028e8199fc4477bc
+          ref: e5f153eae9b6a63f6e8fa39e5e4735d36d4244a6
           path: inline-public
 
       - name: Install system dependencies

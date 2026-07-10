@@ -31,7 +31,14 @@ const (
 	defaultBeeperBridgeType          = "github.com/inline-chat/matrix-inline"
 	defaultPort                      = 29343
 	defaultCommandPrefix             = "!inline"
-	currentBridgeStateVersion uint32 = 2
+	currentBridgeStateVersion uint32 = 4
+)
+
+type hiddenDialogsPolicy string
+
+const (
+	hiddenDialogsExclude hiddenDialogsPolicy = "exclude"
+	hiddenDialogsInclude hiddenDialogsPolicy = "include"
 )
 
 type InlineConnector struct {
@@ -40,25 +47,45 @@ type InlineConnector struct {
 }
 
 type Config struct {
-	DisplayName string `yaml:"displayname" json:"displayname"`
-	NetworkURL  string `yaml:"network_url" json:"network_url"`
-	NetworkIcon string `yaml:"network_icon" json:"network_icon"`
-	SidecarURL  string `yaml:"sidecar_url" json:"sidecar_url"`
+	DisplayName   string `yaml:"displayname" json:"displayname"`
+	NetworkURL    string `yaml:"network_url" json:"network_url"`
+	NetworkIcon   string `yaml:"network_icon" json:"network_icon"`
+	SidecarURL    string `yaml:"sidecar_url" json:"sidecar_url"`
+	HiddenDialogs string `yaml:"hidden_dialogs" json:"hidden_dialogs"`
 }
 
 type UserLoginMetadata struct {
-	AccountID           string `json:"account_id"`
-	RemoteName          string `json:"remote_name,omitempty"`
-	SidecarURL          string `json:"sidecar_url,omitempty"`
-	StoreNamespace      string `json:"store_namespace,omitempty"`
-	LastSidecarSequence uint64 `json:"last_sidecar_sequence,omitempty"`
-	BridgeStateVersion  uint32 `json:"bridge_state_version,omitempty"`
-	SessionInvalidated  bool   `json:"session_invalidated,omitempty"`
+	AccountID              string `json:"account_id"`
+	RemoteName             string `json:"remote_name,omitempty"`
+	SidecarURL             string `json:"sidecar_url,omitempty"`
+	StoreNamespace         string `json:"store_namespace,omitempty"`
+	LastSidecarSequence    uint64 `json:"last_sidecar_sequence,omitempty"`
+	SidecarEventGeneration string `json:"sidecar_event_generation,omitempty"`
+	BridgeStateVersion     uint32 `json:"bridge_state_version,omitempty"`
+	BridgeRecoveryCursor   int64  `json:"bridge_recovery_cursor,omitempty"`
+	DialogSyncCursor       string `json:"dialog_sync_cursor,omitempty"`
+	HiddenDialogs          string `json:"hidden_dialogs,omitempty"`
+	SessionInvalidated     bool   `json:"session_invalidated,omitempty"`
 }
 
 type MessageMetadata struct {
 	InlineFingerprint string `json:"inline_fingerprint,omitempty"`
 	MediaHandled      bool   `json:"media_handled,omitempty"`
+}
+
+type PortalMetadata struct {
+	HistoryCheckpoint int64 `json:"history_checkpoint,omitempty"`
+}
+
+func (meta *PortalMetadata) CopyFrom(other any) {
+	switch source := other.(type) {
+	case *PortalMetadata:
+		if source != nil {
+			*meta = *source
+		}
+	case PortalMetadata:
+		*meta = source
+	}
 }
 
 func (meta *MessageMetadata) CopyFrom(other any) {
@@ -157,11 +184,17 @@ network_url: https://inline.chat
 # Defaults to the official Inline bridge icon. Override with a Matrix Content URI (mxc://...).
 network_icon: ""
 sidecar_url: http://127.0.0.1:29342
+# Whether dialogs hidden from Inline's normal chat list should be projected to Matrix.
+# Per-account bridge bot settings can override this default.
+hidden_dialogs: exclude
 `, &ic.Config, nil
 }
 
 func (ic *InlineConnector) GetDBMetaTypes() database.MetaTypes {
 	return database.MetaTypes{
+		Portal: func() any {
+			return &PortalMetadata{}
+		},
 		Message: func() any {
 			return &MessageMetadata{}
 		},
@@ -239,6 +272,9 @@ func (ic *InlineConnector) validateConfig() error {
 	if err := validateSidecarURL(ic.sidecarURL("")); err != nil {
 		return err
 	}
+	if _, err := parseHiddenDialogsPolicy(ic.Config.HiddenDialogs); err != nil {
+		return fmt.Errorf("invalid hidden_dialogs setting: %w", err)
+	}
 	icon := strings.TrimSpace(ic.Config.NetworkIcon)
 	if icon == "" {
 		return nil
@@ -247,6 +283,27 @@ func (ic *InlineConnector) validateConfig() error {
 		return fmt.Errorf("invalid network_icon %q: %w", icon, err)
 	}
 	return nil
+}
+
+func parseHiddenDialogsPolicy(value string) (hiddenDialogsPolicy, error) {
+	switch normalized := strings.ToLower(strings.TrimSpace(value)); normalized {
+	case "":
+		return "", nil
+	case string(hiddenDialogsExclude):
+		return hiddenDialogsExclude, nil
+	case string(hiddenDialogsInclude):
+		return hiddenDialogsInclude, nil
+	default:
+		return "", fmt.Errorf("must be %q or %q", hiddenDialogsExclude, hiddenDialogsInclude)
+	}
+}
+
+func (ic *InlineConnector) hiddenDialogsPolicy() hiddenDialogsPolicy {
+	policy, err := parseHiddenDialogsPolicy(ic.Config.HiddenDialogs)
+	if err != nil || policy == "" {
+		return hiddenDialogsExclude
+	}
+	return policy
 }
 
 func validateSidecarURL(rawURL string) error {
@@ -284,19 +341,41 @@ func newInlineClient(login *bridgev2.UserLogin, meta *UserLoginMetadata, sidecar
 		meta.StoreNamespace = storeNamespace
 	}
 	return &InlineClient{
-		UserLogin:           login,
-		AccountID:           meta.AccountID,
-		Sidecar:             sidecar.NewClient(sidecarURL).WithSessionNamespace(storeNamespace),
-		storeNamespace:      storeNamespace,
-		lastSidecarSequence: meta.LastSidecarSequence,
-		bridgeStateVersion:  meta.BridgeStateVersion,
-		loggedIn:            !meta.SessionInvalidated,
-		users:               make(map[int64]sidecar.UserRecord),
-		dialogs:             make(map[int64]sidecar.DialogRecord),
-		details:             make(map[int64]struct{}),
-		history:             make(map[int64]int64),
-		historyLoaded:       make(map[int64]struct{}),
+		UserLogin:              login,
+		AccountID:              meta.AccountID,
+		Sidecar:                sidecar.NewClient(sidecarURL).WithSessionNamespace(storeNamespace),
+		storeNamespace:         storeNamespace,
+		lastSidecarSequence:    meta.LastSidecarSequence,
+		sidecarEventGeneration: meta.SidecarEventGeneration,
+		bridgeStateVersion:     meta.BridgeStateVersion,
+		bridgeRecoveryCursor:   meta.BridgeRecoveryCursor,
+		dialogSyncCursor:       meta.DialogSyncCursor,
+		hiddenDialogsDefault:   hiddenDialogsPolicyForLogin(login),
+		hiddenDialogsOverride:  hiddenDialogsPolicyFromMetadata(meta.HiddenDialogs),
+		loggedIn:               !meta.SessionInvalidated,
+		users:                  make(map[int64]sidecar.UserRecord),
+		dialogs:                make(map[int64]sidecar.DialogRecord),
+		details:                make(map[int64]struct{}),
+		history:                make(map[int64]int64),
+		historyLoaded:          make(map[int64]struct{}),
 	}
+}
+
+func hiddenDialogsPolicyForLogin(login *bridgev2.UserLogin) hiddenDialogsPolicy {
+	if login != nil && login.Bridge != nil {
+		if connector, ok := login.Bridge.Network.(*InlineConnector); ok {
+			return connector.hiddenDialogsPolicy()
+		}
+	}
+	return hiddenDialogsExclude
+}
+
+func hiddenDialogsPolicyFromMetadata(value string) hiddenDialogsPolicy {
+	policy, err := parseHiddenDialogsPolicy(value)
+	if err != nil {
+		return ""
+	}
+	return policy
 }
 
 func makeUserID(userID string) networkid.UserID {

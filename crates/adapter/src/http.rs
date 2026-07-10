@@ -153,14 +153,59 @@ impl AdapterHttpState {
         let collector_namespace = namespace.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let event = tokio::select! {
-                    lossless = lossless_events.recv() => {
-                        let Some(event) = lossless else { break };
-                        event
+                tokio::select! {
+                    lossless = lossless_events.recv_delivery() => {
+                        let Some(delivery) = lossless else { break };
+                        let envelope = loop {
+                            match event_store.append_for_namespace_delivery(
+                                &collector_namespace,
+                                delivery.delivery_id(),
+                                delivery.event().clone(),
+                            ) {
+                                Ok(envelope) => break envelope,
+                                Err(error) => {
+                                    log::error!(
+                                        "failed to persist lossless adapter event; retrying: {error}"
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                            }
+                        };
+                        loop {
+                            match delivery.ack().await {
+                                Ok(()) => break,
+                                Err(error) => {
+                                    log::error!(
+                                        "failed to acknowledge durable client event; retrying: {error}"
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                            }
+                        }
+                        if let Some(delivery_id) = delivery.delivery_id()
+                            && let Err(error) = event_store.finalize_client_delivery(
+                                &collector_namespace,
+                                delivery_id,
+                            )
+                        {
+                            log::warn!(
+                                "failed to prune acknowledged client delivery receipt: {error}"
+                            );
+                        }
+                        let _ = events.send(envelope);
                     }
                     best_effort = best_effort_events.recv() => {
                         match best_effort {
-                            Ok(event) if event.reliability() == inline_client::EventReliability::BestEffort => event,
+                            Ok(event) if event.reliability() == inline_client::EventReliability::BestEffort => {
+                                match event_store.append_for_namespace(&collector_namespace, event) {
+                                    Ok(envelope) => {
+                                        let _ = events.send(envelope);
+                                    }
+                                    Err(error) => {
+                                        log::debug!("dropping failed best-effort adapter event: {error}");
+                                    }
+                                }
+                            }
                             Ok(_) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -169,22 +214,6 @@ impl AdapterHttpState {
                                 );
                                 continue;
                             }
-                        }
-                    }
-                };
-                loop {
-                    let persisted =
-                        event_store.append_for_namespace(&collector_namespace, event.clone());
-                    match persisted {
-                        Ok(envelope) => {
-                            let _ = events.send(envelope);
-                            break;
-                        }
-                        Err(error) => {
-                            log::error!(
-                                "failed to persist lossless adapter event; retrying: {error}"
-                            );
-                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
@@ -484,10 +513,22 @@ async fn health(State(state): State<AdapterHttpState>, headers: HeaderMap) -> Re
             .or_else(|| clients.values().next().map(InlineClient::status))
             .unwrap_or(ClientStatus::Disconnected)
     };
+    let event_namespace = requested_namespace
+        .map(ToOwned::to_owned)
+        .or_else(|| state.event_store.active_namespace().ok())
+        .unwrap_or_else(|| "default".to_owned());
+    let event_generation = match state.event_store.generation(&event_namespace) {
+        Ok(generation) => generation,
+        Err(error) => {
+            log::error!("failed to load adapter event generation: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     Json(SidecarHealth {
         ok: true,
         protocol: ProtocolInfo::current(),
         status,
+        event_generation,
     })
     .into_response()
 }
@@ -1041,16 +1082,20 @@ struct EventsQuery {
     #[serde(default)]
     after_sequence: u64,
     session_namespace: Option<String>,
+    generation: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EventsAckRequest {
     session_namespace: String,
+    #[serde(default)]
+    generation: String,
     sequence: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct EventsAckResponse {
+    generation: String,
     acknowledged_sequence: u64,
 }
 
@@ -1064,6 +1109,10 @@ struct EventsReplayError {
     oldest_retained_sequence: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_generation: Option<String>,
+    #[serde(default)]
+    reset_required: bool,
 }
 
 async fn rpc_events_ack(
@@ -1078,8 +1127,13 @@ async fn rpc_events_ack(
         )
             .into_response();
     }
-    match state.event_store.acknowledge(&namespace, request.sequence) {
+    match state.event_store.acknowledge_for_generation(
+        &namespace,
+        Some(&request.generation),
+        request.sequence,
+    ) {
         Ok(()) => Json(EventsAckResponse {
+            generation: request.generation,
             acknowledged_sequence: request.sequence,
         })
         .into_response(),
@@ -1091,9 +1145,15 @@ async fn rpc_events_ack(
                 requested_after_sequence: None,
                 oldest_retained_sequence: None,
                 latest_sequence: None,
+                event_generation: None,
+                reset_required: false,
             }),
         )
             .into_response(),
+        Err(AdapterEventStoreError::GenerationChanged {
+            generation,
+            latest_sequence,
+        }) => event_reset_response(generation, latest_sequence),
         Err(error) => {
             log::error!("failed to acknowledge adapter events: {error}");
             (
@@ -1104,6 +1164,8 @@ async fn rpc_events_ack(
                     requested_after_sequence: None,
                     oldest_retained_sequence: None,
                     latest_sequence: None,
+                    event_generation: None,
+                    reset_required: false,
                 }),
             )
                 .into_response()
@@ -1131,13 +1193,34 @@ async fn events_ws(
             .into_response();
     }
     let live = state.subscribe_events();
-    let replay = match state.event_store.replay(&namespace, query.after_sequence) {
+    let replay = match state.event_store.replay_for_generation(
+        &namespace,
+        query.generation.as_deref(),
+        query.after_sequence,
+    ) {
         Ok(replay) => replay,
         Err(AdapterEventStoreError::ReplayGap {
             after_sequence,
             oldest_sequence,
             latest_sequence,
-        }) => return replay_gap_response(after_sequence, oldest_sequence, latest_sequence),
+        }) => {
+            let generation = state.event_store.generation(&namespace).ok();
+            return replay_gap_response(
+                after_sequence,
+                oldest_sequence,
+                latest_sequence,
+                generation,
+            );
+        }
+        Err(AdapterEventStoreError::GenerationChanged {
+            generation,
+            latest_sequence,
+        })
+        | Err(AdapterEventStoreError::CursorAheadReset {
+            generation,
+            latest_sequence,
+            ..
+        }) => return event_reset_response(generation, latest_sequence),
         Err(error) => {
             log::error!("failed to load adapter event replay: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -1153,6 +1236,7 @@ fn replay_gap_response(
     after_sequence: u64,
     oldest_sequence: Option<u64>,
     latest_sequence: u64,
+    generation: Option<String>,
 ) -> Response {
     (
         StatusCode::GONE,
@@ -1162,6 +1246,24 @@ fn replay_gap_response(
             requested_after_sequence: Some(after_sequence),
             oldest_retained_sequence: oldest_sequence,
             latest_sequence: Some(latest_sequence),
+            event_generation: generation,
+            reset_required: false,
+        }),
+    )
+        .into_response()
+}
+
+fn event_reset_response(generation: String, latest_sequence: u64) -> Response {
+    (
+        StatusCode::GONE,
+        Json(EventsReplayError {
+            error: "sidecar_event_generation_reset".to_owned(),
+            message: "adapter event log changed; bridge reconciliation is required".to_owned(),
+            requested_after_sequence: None,
+            oldest_retained_sequence: None,
+            latest_sequence: Some(latest_sequence),
+            event_generation: Some(generation),
+            reset_required: true,
         }),
     )
         .into_response()
@@ -1344,6 +1446,7 @@ mod tests {
         let app = sidecar_router_with_state(state.clone());
         let body = serde_json::to_vec(&EventsAckRequest {
             session_namespace: "test".to_owned(),
+            generation: String::new(),
             sequence: 1,
         })
         .unwrap();
@@ -1377,6 +1480,7 @@ mod tests {
         let app = sidecar_router_with_state(state.clone());
         let body = serde_json::to_vec(&EventsAckRequest {
             session_namespace: "other-account".to_owned(),
+            generation: String::new(),
             sequence: 1,
         })
         .unwrap();
@@ -1400,7 +1504,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_gap_response_includes_reconciliation_cursor() {
-        let response = replay_gap_response(0, Some(1), 7);
+        let response = replay_gap_response(0, Some(1), 7, Some("generation-1".to_owned()));
 
         assert_eq!(response.status(), StatusCode::GONE);
         let error: EventsReplayError = json_response(response).await;

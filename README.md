@@ -167,6 +167,8 @@ Bridge bot commands:
 login
 inline-status
 inline-reconnect
+inline-settings
+inline-hidden-chats <exclude|include|default>
 logout <login ID>
 ```
 
@@ -175,7 +177,22 @@ Aliases:
 ```text
 istatus
 ireconnect
+isettings
+ihidden
 ```
+
+Hidden Inline dialogs are excluded from Matrix by default. These are dialogs
+whose Inline state has `showInChatList: false`; excluding them prevents new
+portal creation, history fill, and inbound event projection. Users can change
+the behavior for their account with `inline-hidden-chats`, while operators can
+set the default in the network configuration:
+
+```yaml
+network:
+  hidden_dialogs: exclude # exclude or include
+```
+
+Changing the policy does not delete Matrix rooms that were already created.
 
 ## Configuration
 
@@ -218,8 +235,11 @@ it up with the bridge database.
 Upgrades from the initial bridge release are in-place. Keep both the bridge
 database and the existing Inline client store: the adapter imports the legacy
 session into the per-account store, starts the new durable bucket sync from a
-safe lookback, and the bridge runs a one-time full dialog/state reconciliation.
-Users should not need to log in again or delete old rooms to recover.
+safe lookback, and the bridge runs a checkpointed dialog/state reconciliation
+in bounded, rate-limited passes. Recent history is repaired first and older
+history continues from per-room Matrix delivery checkpoints. Users should not
+need to log in again or delete old rooms to recover, and an interrupted recovery
+continues from its last completed chat.
 
 ### Bridge Profile
 

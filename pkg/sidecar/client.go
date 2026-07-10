@@ -31,6 +31,8 @@ type EventReplayUnavailableError struct {
 	RequestedAfterSequence *uint64 `json:"requested_after_sequence,omitempty"`
 	OldestRetainedSequence *uint64 `json:"oldest_retained_sequence,omitempty"`
 	LatestSequence         *uint64 `json:"latest_sequence,omitempty"`
+	EventGeneration        string  `json:"event_generation,omitempty"`
+	ResetRequired          bool    `json:"reset_required,omitempty"`
 }
 
 func (err *EventReplayUnavailableError) Error() string {
@@ -289,16 +291,25 @@ func (c *Client) Typing(ctx context.Context, request TypingRequest) error {
 }
 
 func (c *Client) Events(ctx context.Context) (*EventStream, error) {
-	return c.EventsAfter(ctx, "", 0)
+	return c.EventsAfterGeneration(ctx, "", "", 0)
 }
 
 // EventsAfter opens the event stream and requests durable replay after the
 // last contiguous sequence persisted by the bridge.
 func (c *Client) EventsAfter(ctx context.Context, namespace string, afterSequence uint64) (*EventStream, error) {
+	return c.EventsAfterGeneration(ctx, namespace, "", afterSequence)
+}
+
+// EventsAfterGeneration opens the event stream within one durable adapter
+// event-log generation.
+func (c *Client) EventsAfterGeneration(ctx context.Context, namespace, generation string, afterSequence uint64) (*EventStream, error) {
 	query := url.Values{}
 	query.Set("after_sequence", strconv.FormatUint(afterSequence, 10))
 	if strings.TrimSpace(namespace) != "" {
 		query.Set("session_namespace", namespace)
+	}
+	if strings.TrimSpace(generation) != "" {
+		query.Set("generation", generation)
 	}
 	eventsURL := websocketURL(c.BaseURL, "/ws/events?"+query.Encode())
 	options := &websocket.DialOptions{}
@@ -322,7 +333,12 @@ func (c *Client) EventsAfter(ctx context.Context, namespace string, afterSequenc
 
 // AckEvents acknowledges durable processing through sequence.
 func (c *Client) AckEvents(ctx context.Context, namespace string, sequence uint64) error {
-	request := EventAckRequest{SessionNamespace: namespace, Sequence: sequence}
+	return c.AckEventsGeneration(ctx, namespace, "", sequence)
+}
+
+// AckEventsGeneration acknowledges durable processing within one event-log generation.
+func (c *Client) AckEventsGeneration(ctx context.Context, namespace, generation string, sequence uint64) error {
+	request := EventAckRequest{SessionNamespace: namespace, Generation: generation, Sequence: sequence}
 	var response EventAckResponse
 	return c.do(ctx, http.MethodPost, "/rpc/events/ack", request, &response)
 }

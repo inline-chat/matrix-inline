@@ -40,11 +40,33 @@ const (
 	sidecarEventReconnectLag  = 3 * time.Second
 	reconciliationPageLimit   = 500
 	reconciliationMaxPages    = 10_000
+	bridgeRecoveryRPCBudget   = 24
+	bridgeRecoveryPassDelay   = 3 * time.Second
 	maxInlineMediaDownload    = 100 << 20
 	maxInlineAvatarDownload   = 8 << 20
 )
 
 var errInlineRateLimited = errors.New("inline rate limited")
+var errBridgeRecoveryIncomplete = errors.New("Inline bridge recovery pass incomplete")
+
+type permanentMediaError struct {
+	err error
+}
+
+func (err *permanentMediaError) Error() string { return err.err.Error() }
+func (err *permanentMediaError) Unwrap() error { return err.err }
+
+func permanentMediaFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &permanentMediaError{err: err}
+}
+
+func isPermanentMediaFailure(err error) bool {
+	var permanent *permanentMediaError
+	return errors.As(err, &permanent)
+}
 
 var inlineMediaHTTPClient = &http.Client{Timeout: 2 * time.Minute}
 
@@ -53,16 +75,22 @@ type InlineClient struct {
 	AccountID string
 	Sidecar   *sidecar.Client
 
-	mu                  sync.RWMutex
-	loggedIn            bool
-	users               map[int64]sidecar.UserRecord
-	dialogs             map[int64]sidecar.DialogRecord
-	details             map[int64]struct{}
-	history             map[int64]int64
-	historyLoaded       map[int64]struct{}
-	storeNamespace      string
-	lastSidecarSequence uint64
-	bridgeStateVersion  uint32
+	mu                     sync.RWMutex
+	loggedIn               bool
+	users                  map[int64]sidecar.UserRecord
+	dialogs                map[int64]sidecar.DialogRecord
+	details                map[int64]struct{}
+	history                map[int64]int64
+	historyLoaded          map[int64]struct{}
+	storeNamespace         string
+	lastSidecarSequence    uint64
+	sidecarEventGeneration string
+	bridgeStateVersion     uint32
+	bridgeRecoveryCursor   int64
+	dialogSyncCursor       string
+	hiddenDialogsDefault   hiddenDialogsPolicy
+	hiddenDialogsOverride  hiddenDialogsPolicy
+	metadataSaveMu         sync.Mutex
 
 	runCancel context.CancelFunc
 	wg        sync.WaitGroup
@@ -837,10 +865,12 @@ func (ic *InlineClient) syncDialogLoop(ctx context.Context) {
 		}
 		rateLimited := isRateLimitedError(err)
 		delay := dialogPollInterval
-		if rateLimited {
+		if errors.Is(err, errBridgeRecoveryIncomplete) {
+			delay = bridgeRecoveryPassDelay
+		} else if rateLimited {
 			delay = rateLimitRetryDelay(err, dialogRateLimitCooldown)
 		}
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errBridgeRecoveryIncomplete) {
 			if rateLimited {
 				ic.UserLogin.Bridge.Log.Warn().Err(err).Dur("retry_after", delay).Msg("Inline dialog sync rate limited; backing off")
 			} else {
@@ -865,16 +895,18 @@ func (ic *InlineClient) needsBridgeStateRecovery() bool {
 func (ic *InlineClient) recoverBridgeState(ctx context.Context) error {
 	ic.mu.RLock()
 	fromVersion := ic.bridgeStateVersion
+	recoveryCursor := ic.bridgeRecoveryCursor
 	ic.mu.RUnlock()
 	ic.UserLogin.Bridge.Log.Info().
 		Uint32("from_version", fromVersion).
 		Uint32("to_version", currentBridgeStateVersion).
 		Msg("Starting one-time Inline bridge state recovery")
-	if err := ic.syncDialogs(ctx, true); err != nil {
-		return fmt.Errorf("refresh Inline dialogs for bridge state recovery: %w", err)
-	}
-	if err := ic.reconcileSidecarState(ctx); err != nil {
+	complete, err := ic.reconcileBridgeStateSlice(ctx, recoveryCursor, bridgeRecoveryRPCBudget)
+	if err != nil {
 		return fmt.Errorf("reconcile Inline bridge state during upgrade: %w", err)
+	}
+	if !complete {
+		return errBridgeRecoveryIncomplete
 	}
 	if err := ic.persistBridgeStateVersion(ctx, currentBridgeStateVersion); err != nil {
 		return err
@@ -886,16 +918,21 @@ func (ic *InlineClient) recoverBridgeState(ctx context.Context) error {
 }
 
 func (ic *InlineClient) persistBridgeStateVersion(ctx context.Context, version uint32) error {
+	ic.metadataSaveMu.Lock()
+	defer ic.metadataSaveMu.Unlock()
 	ic.mu.Lock()
 	previous := ic.bridgeStateVersion
+	previousCursor := ic.bridgeRecoveryCursor
 	if version <= previous {
 		ic.mu.Unlock()
 		return nil
 	}
 	ic.bridgeStateVersion = version
+	ic.bridgeRecoveryCursor = 0
 	meta, ok := ic.UserLogin.Metadata.(*UserLoginMetadata)
 	if ok {
 		meta.BridgeStateVersion = version
+		meta.BridgeRecoveryCursor = 0
 	}
 	ic.mu.Unlock()
 
@@ -905,16 +942,190 @@ func (ic *InlineClient) persistBridgeStateVersion(ctx context.Context, version u
 	if err := ic.UserLogin.Save(ctx); err != nil {
 		ic.mu.Lock()
 		ic.bridgeStateVersion = previous
+		ic.bridgeRecoveryCursor = previousCursor
 		meta.BridgeStateVersion = previous
+		meta.BridgeRecoveryCursor = previousCursor
 		ic.mu.Unlock()
 		return fmt.Errorf("save Inline bridge state recovery version: %w", err)
 	}
 	return nil
 }
 
+func (ic *InlineClient) persistBridgeRecoveryCursor(ctx context.Context, cursor int64) error {
+	if cursor <= 0 {
+		return nil
+	}
+	ic.metadataSaveMu.Lock()
+	defer ic.metadataSaveMu.Unlock()
+	ic.mu.Lock()
+	previous := ic.bridgeRecoveryCursor
+	if cursor <= previous {
+		ic.mu.Unlock()
+		return nil
+	}
+	ic.bridgeRecoveryCursor = cursor
+	meta, ok := ic.UserLogin.Metadata.(*UserLoginMetadata)
+	if ok {
+		meta.BridgeRecoveryCursor = cursor
+	}
+	ic.mu.Unlock()
+	if !ok {
+		return errors.New("Inline user login metadata is unavailable")
+	}
+	if err := ic.UserLogin.Save(ctx); err != nil {
+		ic.mu.Lock()
+		ic.bridgeRecoveryCursor = previous
+		meta.BridgeRecoveryCursor = previous
+		ic.mu.Unlock()
+		return fmt.Errorf("save Inline bridge recovery cursor: %w", err)
+	}
+	return nil
+}
+
+func (ic *InlineClient) persistDialogSyncCursor(ctx context.Context, cursor string) error {
+	if ic.UserLogin == nil {
+		ic.mu.Lock()
+		ic.dialogSyncCursor = cursor
+		ic.mu.Unlock()
+		return nil
+	}
+	ic.metadataSaveMu.Lock()
+	defer ic.metadataSaveMu.Unlock()
+	ic.mu.Lock()
+	previous := ic.dialogSyncCursor
+	if cursor == previous {
+		ic.mu.Unlock()
+		return nil
+	}
+	ic.dialogSyncCursor = cursor
+	meta, ok := ic.UserLogin.Metadata.(*UserLoginMetadata)
+	if ok {
+		meta.DialogSyncCursor = cursor
+	}
+	ic.mu.Unlock()
+	if !ok {
+		return errors.New("Inline user login metadata is unavailable")
+	}
+	if err := ic.UserLogin.Save(ctx); err != nil {
+		ic.mu.Lock()
+		ic.dialogSyncCursor = previous
+		meta.DialogSyncCursor = previous
+		ic.mu.Unlock()
+		return fmt.Errorf("save Inline dialog sync cursor: %w", err)
+	}
+	return nil
+}
+
+func (ic *InlineClient) effectiveHiddenDialogsPolicy() hiddenDialogsPolicy {
+	_, _, effective := ic.hiddenDialogsSettings()
+	return effective
+}
+
+func (ic *InlineClient) hiddenDialogsSettings() (defaults, override, effective hiddenDialogsPolicy) {
+	ic.mu.RLock()
+	defer ic.mu.RUnlock()
+	defaults = ic.hiddenDialogsDefault
+	if defaults == "" {
+		defaults = hiddenDialogsExclude
+	}
+	override = ic.hiddenDialogsOverride
+	if override != "" {
+		effective = override
+	} else {
+		effective = defaults
+	}
+	return
+}
+
+func (ic *InlineClient) shouldProjectDialog(dialog sidecar.DialogRecord) bool {
+	if ic.effectiveHiddenDialogsPolicy() == hiddenDialogsInclude {
+		return true
+	}
+	return dialog.ChatListHidden == nil || !*dialog.ChatListHidden
+}
+
+func (ic *InlineClient) shouldProjectChat(ctx context.Context, chatID int64, refresh bool) (bool, error) {
+	if ic.effectiveHiddenDialogsPolicy() == hiddenDialogsInclude {
+		return true, nil
+	}
+	if !refresh {
+		if dialog, ok := ic.cachedDialog(chatID); ok {
+			return ic.shouldProjectDialog(dialog), nil
+		}
+	}
+	state, err := ic.Sidecar.ChatState(ctx, sidecar.ChatStateRequest{ChatID: chatID})
+	if err != nil {
+		return false, fmt.Errorf("fetch Inline chat %d visibility: %w", chatID, err)
+	}
+	if state.Dialog == nil {
+		// Unknown/deleted chats may still need deletion or reconciliation events
+		// delivered to a portal that already exists.
+		return true, nil
+	}
+	ic.rememberDialog(*state.Dialog)
+	return ic.shouldProjectDialog(*state.Dialog), nil
+}
+
+func (ic *InlineClient) skipHiddenChatEvent(ctx context.Context, chatID int64, refresh bool, eventType string) (bool, error) {
+	project, err := ic.shouldProjectChat(ctx, chatID, refresh)
+	if err != nil {
+		return false, err
+	}
+	if project {
+		return false, nil
+	}
+	if ic.UserLogin != nil && ic.UserLogin.Bridge != nil {
+		ic.UserLogin.Bridge.Log.Debug().
+			Int64("chat_id", chatID).
+			Str("inline_event_type", eventType).
+			Msg("Skipped Matrix projection for hidden Inline dialog")
+	}
+	return true, nil
+}
+
+func (ic *InlineClient) persistHiddenDialogsOverride(ctx context.Context, policy hiddenDialogsPolicy) error {
+	if policy != "" && policy != hiddenDialogsExclude && policy != hiddenDialogsInclude {
+		return fmt.Errorf("unsupported hidden dialog policy %q", policy)
+	}
+	if ic.UserLogin == nil {
+		ic.mu.Lock()
+		ic.hiddenDialogsOverride = policy
+		ic.dialogSyncCursor = ""
+		ic.dialogs = make(map[int64]sidecar.DialogRecord)
+		ic.mu.Unlock()
+		return nil
+	}
+
+	ic.metadataSaveMu.Lock()
+	defer ic.metadataSaveMu.Unlock()
+	meta, ok := ic.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok || meta == nil {
+		return errors.New("Inline user login metadata is unavailable")
+	}
+	previousPolicy := meta.HiddenDialogs
+	previousCursor := meta.DialogSyncCursor
+	meta.HiddenDialogs = string(policy)
+	meta.DialogSyncCursor = ""
+	if err := ic.UserLogin.Save(ctx); err != nil {
+		meta.HiddenDialogs = previousPolicy
+		meta.DialogSyncCursor = previousCursor
+		return fmt.Errorf("save Inline hidden dialog setting: %w", err)
+	}
+
+	ic.mu.Lock()
+	ic.hiddenDialogsOverride = policy
+	ic.dialogSyncCursor = ""
+	// Force the next stable scan to treat every included dialog as newly seen.
+	ic.dialogs = make(map[int64]sidecar.DialogRecord)
+	ic.mu.Unlock()
+	return nil
+}
+
 func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error {
 	limit := uint32(startupDialogPageLimit)
-	cursor := ""
+	ic.mu.RLock()
+	cursor := ic.dialogSyncCursor
+	ic.mu.RUnlock()
 	seenCursors := make(map[string]struct{})
 	remainingRPCs := dialogSyncRPCBudget
 	deferredWork := make([]sidecar.DialogRecord, 0)
@@ -927,7 +1138,7 @@ func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error
 			ic.UserLogin.Bridge.Log.Debug().Msg("Inline dialog sync RPC budget exhausted; continuing on next pass")
 			break
 		}
-		request := sidecar.DialogsRequest{Limit: &limit, Cursor: cursor}
+		request := sidecar.DialogsRequest{Limit: &limit, Cursor: cursor, Order: sidecar.DialogsOrderStableChatID}
 		var page *sidecar.DialogsPage
 		var err error
 		if refreshLive && cursor == "" {
@@ -948,6 +1159,9 @@ func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error
 				return err
 			}
 			changed := ic.rememberDialog(dialog)
+			if !ic.shouldProjectDialog(dialog) {
+				continue
+			}
 			if changed {
 				ic.queueDialogResync(ctx, dialog)
 				resyncsQueued++
@@ -961,13 +1175,22 @@ func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error
 		}
 
 		if page.NextCursor == "" {
+			if err := ic.persistDialogSyncCursor(ctx, ""); err != nil {
+				return err
+			}
 			break
 		}
+		if page.NextCursor == cursor {
+			return fmt.Errorf("Inline stable dialog sync cursor did not advance: %q", cursor)
+		}
 		if _, ok := seenCursors[page.NextCursor]; ok {
-			break
+			return fmt.Errorf("Inline stable dialog sync cursor repeated: %q", page.NextCursor)
 		}
 		seenCursors[page.NextCursor] = struct{}{}
 		cursor = page.NextCursor
+		if err := ic.persistDialogSyncCursor(ctx, cursor); err != nil {
+			return err
+		}
 	}
 	err := ic.syncDeferredDialogWork(ctx, deferredWork, remainingRPCs)
 	if ic.UserLogin != nil && ic.UserLogin.Bridge != nil {
@@ -1058,6 +1281,9 @@ func (ic *InlineClient) prioritizedHistoryDialogs(dialogs []sidecar.DialogRecord
 }
 
 func (ic *InlineClient) syncDialogDetails(ctx context.Context, dialog sidecar.DialogRecord) error {
+	if !ic.shouldProjectDialog(dialog) {
+		return nil
+	}
 	name := dialogName(dialog)
 	info, err := ic.chatInfoForChat(ctx, dialog.ChatID, name)
 	if err != nil {
@@ -1076,7 +1302,7 @@ func (ic *InlineClient) syncDialogDetails(ctx context.Context, dialog sidecar.Di
 }
 
 func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.DialogRecord) error {
-	if !ic.needsHistoryDelivery(dialog) {
+	if !ic.shouldProjectDialog(dialog) || !ic.needsHistoryDelivery(dialog) {
 		return nil
 	}
 	request := historyRequestForDelivery(dialog, ic.historyCheckpoint(dialog.ChatID), startupHistoryLimit)
@@ -1098,7 +1324,9 @@ func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.Di
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		ic.queueInlineMessage(msg)
+		if err := eventHandlingResultError("Inline history message", ic.queueInlineMessage(ctx, msg)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1163,12 +1391,26 @@ func (ic *InlineClient) loadHistoryCheckpoint(ctx context.Context, chatID int64)
 	if loaded {
 		return checkpoint, nil
 	}
+	portal, err := ic.UserLogin.Bridge.GetPortalByKey(ctx, ic.portalKeyForChat(chatID))
+	if err != nil {
+		return 0, fmt.Errorf("load Inline portal history checkpoint: %w", err)
+	}
+	if metadata, ok := portal.Metadata.(*PortalMetadata); ok && metadata != nil && metadata.HistoryCheckpoint > 0 {
+		checkpoint = metadata.HistoryCheckpoint
+		ic.rememberHistoryDelivered(chatID, checkpoint)
+		return checkpoint, nil
+	}
 
 	messages, err := ic.UserLogin.Bridge.DB.Message.GetLastNInPortal(ctx, ic.portalKeyForChat(chatID), 16)
 	if err != nil {
 		return 0, err
 	}
 	checkpoint = maxInlineMessageIDForChat(messages, chatID)
+	if checkpoint > 0 {
+		if err := ic.persistHistoryCheckpoint(ctx, chatID, checkpoint); err != nil {
+			return 0, err
+		}
+	}
 
 	ic.mu.Lock()
 	if ic.history == nil {
@@ -1350,6 +1592,21 @@ func backfillLimit(count int) *uint32 {
 }
 
 func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal *bridgev2.Portal, records []sidecar.MessageRecord) ([]*bridgev2.BackfillMessage, networkid.PaginationCursor) {
+	var cursor networkid.PaginationCursor
+	var cursorChatID, minimumMessageID int64
+	for _, record := range records {
+		if record.ChatID <= 0 || record.MessageID <= 0 {
+			continue
+		}
+		if minimumMessageID == 0 || record.MessageID < minimumMessageID {
+			cursorChatID = record.ChatID
+			minimumMessageID = record.MessageID
+		}
+	}
+	if minimumMessageID > 0 {
+		cursor = networkid.PaginationCursor(makeMessageID(cursorChatID, minimumMessageID))
+	}
+
 	sort.SliceStable(records, func(i, j int) bool {
 		left, right := records[i], records[j]
 		if left.Timestamp != right.Timestamp {
@@ -1359,12 +1616,12 @@ func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal 
 	})
 
 	backfillMessages := make([]*bridgev2.BackfillMessage, 0, len(records))
-	var cursor networkid.PaginationCursor
 	for _, record := range records {
-		messageID := makeMessageID(record.ChatID, record.MessageID)
-		if cursor == "" {
-			cursor = networkid.PaginationCursor(messageID)
+		if record.ChatID <= 0 || record.MessageID <= 0 {
+			ic.logBackfillConversionError(errors.New("invalid Inline message identity"), record)
+			continue
 		}
+		messageID := makeMessageID(record.ChatID, record.MessageID)
 
 		sender := bridgev2.EventSender{
 			Sender:   makeUserID(strconv.FormatInt(record.SenderID, 10)),
@@ -1412,16 +1669,32 @@ func (ic *InlineClient) consumeSidecarEvents(ctx context.Context) {
 			return
 		}
 
-		namespace, afterSequence := ic.sidecarEventCursor()
-		if afterSequence > 0 {
-			if err := ic.Sidecar.AckEvents(ctx, namespace, afterSequence); err != nil {
+		health, err := ic.Sidecar.Health(ctx)
+		if err != nil {
+			if err := ic.waitBeforeEventReconnect(ctx, err); err != nil {
+				return
+			}
+			continue
+		}
+		namespace, generation, afterSequence := ic.sidecarEventCursor()
+		if generation == "" {
+			if err := ic.persistSidecarEventCursor(ctx, health.EventGeneration, afterSequence); err != nil {
 				if err := ic.waitBeforeEventReconnect(ctx, err); err != nil {
 					return
 				}
 				continue
 			}
+			generation = health.EventGeneration
+		} else if health.EventGeneration != generation {
+			if err := ic.recoverSidecarGenerationChange(ctx, health.EventGeneration); err != nil {
+				if err := ic.waitBeforeEventReconnect(ctx, err); err != nil {
+					return
+				}
+				continue
+			}
+			continue
 		}
-		stream, err := ic.Sidecar.EventsAfter(ctx, namespace, afterSequence)
+		stream, err := ic.Sidecar.EventsAfterGeneration(ctx, namespace, generation, afterSequence)
 		if err != nil {
 			if errors.Is(err, sidecar.ErrEventReplayUnavailable) {
 				if recoveryErr := ic.recoverSidecarReplayGap(ctx, err); recoveryErr == nil {
@@ -1504,7 +1777,7 @@ func (ic *InlineClient) waitBeforeEventReconnect(ctx context.Context, err error)
 
 func (ic *InlineClient) recoverSidecarReplayGap(ctx context.Context, eventErr error) error {
 	var replayErr *sidecar.EventReplayUnavailableError
-	if !errors.As(eventErr, &replayErr) || replayErr.LatestSequence == nil {
+	if !errors.As(eventErr, &replayErr) || replayErr.LatestSequence == nil || replayErr.EventGeneration == "" {
 		return fmt.Errorf("Inline sidecar replay gap did not include a recovery cursor: %w", eventErr)
 	}
 	latest := *replayErr.LatestSequence
@@ -1514,21 +1787,104 @@ func (ic *InlineClient) recoverSidecarReplayGap(ctx context.Context, eventErr er
 	if err := ic.reconcileSidecarState(ctx); err != nil {
 		return fmt.Errorf("reconcile Inline state after sidecar replay gap: %w", err)
 	}
-	if err := ic.persistSidecarSequence(ctx, latest); err != nil {
+	if err := ic.persistSidecarEventCursor(ctx, replayErr.EventGeneration, latest); err != nil {
 		return err
 	}
-	if err := ic.Sidecar.AckEvents(ctx, ic.storeNamespace, latest); err != nil {
+	if err := ic.Sidecar.AckEventsGeneration(ctx, ic.storeNamespace, replayErr.EventGeneration, latest); err != nil {
 		return fmt.Errorf("ack reconciled Inline sidecar cursor: %w", err)
 	}
 	ic.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 	return nil
 }
 
-func (ic *InlineClient) reconcileSidecarState(ctx context.Context) error {
-	dialogs, err := ic.fetchAllDialogsForReconciliation(ctx)
-	if err != nil {
-		return err
+func (ic *InlineClient) recoverSidecarGenerationChange(ctx context.Context, generation string) error {
+	if strings.TrimSpace(generation) == "" {
+		return errors.New("Inline sidecar health omitted its event generation")
 	}
+	ic.UserLogin.Bridge.Log.Warn().Str("event_generation", generation).Msg("Reconciling after Inline sidecar event-log generation changed")
+	if err := ic.reconcileSidecarState(ctx); err != nil {
+		return fmt.Errorf("reconcile Inline state after event-log generation change: %w", err)
+	}
+	return ic.persistSidecarEventCursor(ctx, generation, 0)
+}
+
+func (ic *InlineClient) reconcileBridgeStateSlice(ctx context.Context, afterChatID int64, rpcBudget int) (bool, error) {
+	if rpcBudget <= 0 {
+		return false, nil
+	}
+	limit := uint32(reconciliationPageLimit)
+	cursor := ""
+	if afterChatID > 0 {
+		cursor = strconv.FormatInt(afterChatID, 10)
+	}
+	page, err := ic.Sidecar.Dialogs(ctx, sidecar.DialogsRequest{
+		Limit:  &limit,
+		Cursor: cursor,
+		Order:  sidecar.DialogsOrderStableChatID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("fetch Inline stable dialog recovery page: %w", err)
+	}
+	ic.cacheUsers(page.Users)
+	if err := ic.reconcileAccountDeletes(ctx); err != nil {
+		return false, err
+	}
+
+	// The first reconciliation page is a live dialogs RPC. Later pages, account
+	// state, chat state and cached history are served from the sidecar store.
+	remainingRPCs := rpcBudget - 1
+	for _, dialog := range page.Dialogs {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		ic.rememberDialog(dialog)
+		if !ic.shouldProjectDialog(dialog) {
+			if err := ic.persistBridgeRecoveryCursor(ctx, dialog.ChatID); err != nil {
+				return false, err
+			}
+			continue
+		}
+		if _, err := ic.loadHistoryCheckpoint(ctx, dialog.ChatID); err != nil {
+			return false, fmt.Errorf("load Inline history checkpoint for chat %d: %w", dialog.ChatID, err)
+		}
+		for ic.needsHistoryDelivery(dialog) {
+			if remainingRPCs <= 0 {
+				return false, nil
+			}
+			before := ic.historyCheckpoint(dialog.ChatID)
+			if err := ic.syncRecentHistory(ctx, dialog); err != nil {
+				return false, fmt.Errorf("recover Inline history for chat %d: %w", dialog.ChatID, err)
+			}
+			remainingRPCs--
+			if ic.historyCheckpoint(dialog.ChatID) <= before {
+				return false, fmt.Errorf("Inline history recovery for chat %d did not advance", dialog.ChatID)
+			}
+			if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
+				return false, err
+			}
+		}
+		if !isDMDialog(dialog) {
+			if remainingRPCs <= 0 {
+				return false, nil
+			}
+			remainingRPCs--
+		}
+		if err := ic.reconcileDialogState(ctx, dialog); err != nil {
+			return false, err
+		}
+		if !isDMDialog(dialog) {
+			if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
+				return false, err
+			}
+		}
+		if err := ic.persistBridgeRecoveryCursor(ctx, dialog.ChatID); err != nil {
+			return false, err
+		}
+	}
+	return page.NextCursor == "", nil
+}
+
+func (ic *InlineClient) reconcileAccountDeletes(ctx context.Context) error {
 	accountState, err := ic.Sidecar.AccountState(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch Inline account reconciliation state: %w", err)
@@ -1538,70 +1894,93 @@ func (ic *InlineClient) reconcileSidecarState(ctx context.Context) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func (ic *InlineClient) reconcileSidecarState(ctx context.Context) error {
+	dialogs, err := ic.fetchAllDialogsForReconciliation(ctx, 0)
+	if err != nil {
+		return err
+	}
+	if err := ic.reconcileAccountDeletes(ctx); err != nil {
+		return err
+	}
 
 	for _, dialog := range dialogs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		ic.rememberDialog(dialog)
-		info, err := ic.chatInfoForChat(ctx, dialog.ChatID, dialogName(dialog))
-		if err != nil {
-			return fmt.Errorf("fetch Inline chat %d reconciliation info: %w", dialog.ChatID, err)
-		}
-		result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:         bridgev2.RemoteEventChatResync,
-				PortalKey:    ic.portalKeyForChat(dialog.ChatID),
-				Timestamp:    time.Now(),
-				CreatePortal: true,
-			},
-			ChatInfo: info,
-		})
-		if err := eventHandlingResultError("reconciled chat resync", result); err != nil {
+		if err := ic.reconcileDialogState(ctx, dialog); err != nil {
 			return err
 		}
-
-		state, err := ic.Sidecar.ChatState(ctx, sidecar.ChatStateRequest{ChatID: dialog.ChatID})
-		if err != nil {
-			return fmt.Errorf("fetch Inline chat %d durable state: %w", dialog.ChatID, err)
-		}
-		if state.Deleted {
-			if err := eventHandlingResultError("reconciled chat delete", ic.queueChatDelete(dialog.ChatID)); err != nil {
+		if !isDMDialog(dialog) {
+			if err := sleepWithContext(ctx, startupRPCThrottle); err != nil {
 				return err
 			}
-			continue
-		}
-		for _, messageID := range state.DeletedMessageIDs {
-			if err := eventHandlingResultError(
-				"reconciled message delete",
-				ic.queueInlineMessageDelete(dialog.ChatID, messageID),
-			); err != nil {
-				return err
-			}
-		}
-		if err := ic.reconcileCachedHistory(ctx, dialog.ChatID); err != nil {
-			return err
-		}
-		if err := ic.reconcileReactions(state); err != nil {
-			return err
-		}
-		if err := ic.queueReadState(state.ReadState); err != nil {
-			return err
 		}
 	}
 	return nil
 }
 
-func (ic *InlineClient) fetchAllDialogsForReconciliation(ctx context.Context) ([]sidecar.DialogRecord, error) {
+func (ic *InlineClient) reconcileDialogState(ctx context.Context, dialog sidecar.DialogRecord) error {
+	ic.rememberDialog(dialog)
+	if !ic.shouldProjectDialog(dialog) {
+		return nil
+	}
+	info, err := ic.chatInfoForChat(ctx, dialog.ChatID, dialogName(dialog))
+	if err != nil {
+		return fmt.Errorf("fetch Inline chat %d reconciliation info: %w", dialog.ChatID, err)
+	}
+	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:         bridgev2.RemoteEventChatResync,
+			PortalKey:    ic.portalKeyForChat(dialog.ChatID),
+			Timestamp:    time.Now(),
+			CreatePortal: true,
+		},
+		ChatInfo: info,
+	})
+	if err := eventHandlingResultError("reconciled chat resync", result); err != nil {
+		return err
+	}
+
+	state, err := ic.Sidecar.ChatState(ctx, sidecar.ChatStateRequest{ChatID: dialog.ChatID})
+	if err != nil {
+		return fmt.Errorf("fetch Inline chat %d durable state: %w", dialog.ChatID, err)
+	}
+	if state.Deleted {
+		return eventHandlingResultError("reconciled chat delete", ic.queueChatDelete(dialog.ChatID))
+	}
+	for _, messageID := range state.DeletedMessageIDs {
+		if err := eventHandlingResultError(
+			"reconciled message delete",
+			ic.queueInlineMessageDelete(dialog.ChatID, messageID),
+		); err != nil {
+			return err
+		}
+	}
+	if err := ic.reconcileCachedHistory(ctx, dialog.ChatID); err != nil {
+		return err
+	}
+	if err := ic.reconcileReactions(state); err != nil {
+		return err
+	}
+	return ic.queueReadState(state.ReadState)
+}
+
+func (ic *InlineClient) fetchAllDialogsForReconciliation(ctx context.Context, afterChatID int64) ([]sidecar.DialogRecord, error) {
 	limit := uint32(reconciliationPageLimit)
 	cursor := ""
+	if afterChatID > 0 {
+		cursor = strconv.FormatInt(afterChatID, 10)
+	}
 	seen := make(map[string]struct{})
 	dialogs := make([]sidecar.DialogRecord, 0)
 	for pageIndex := 0; pageIndex < reconciliationMaxPages; pageIndex++ {
-		request := sidecar.DialogsRequest{Limit: &limit, Cursor: cursor}
+		request := sidecar.DialogsRequest{Limit: &limit, Cursor: cursor, Order: sidecar.DialogsOrderStableChatID}
 		var page *sidecar.DialogsPage
 		var err error
-		if cursor == "" {
+		if pageIndex == 0 {
 			page, err = ic.Sidecar.Dialogs(ctx, request)
 		} else {
 			page, err = ic.Sidecar.CachedDialogs(ctx, request)
@@ -1642,25 +2021,46 @@ func (ic *InlineClient) reconcileCachedHistory(ctx context.Context, chatID int64
 			}
 			return nil
 		}
+		pageMax, err := cachedHistoryPageMax(page.Messages, after)
+		if err != nil {
+			return fmt.Errorf("validate cached Inline history for chat %d: %w", chatID, err)
+		}
 		for _, message := range page.Messages {
-			if message.MessageID <= after {
-				return fmt.Errorf(
-					"cached Inline history for chat %d moved backward from %d to %d",
-					chatID,
-					after,
-					message.MessageID,
-				)
-			}
-			if err := eventHandlingResultError("reconciled message upsert", ic.queueInlineMessage(message)); err != nil {
+			if err := eventHandlingResultError("reconciled message upsert", ic.queueInlineMessage(ctx, message)); err != nil {
 				return err
 			}
-			after = message.MessageID
 		}
+		after = pageMax
 		if !page.HasMore {
 			return nil
 		}
 	}
 	return fmt.Errorf("cached Inline history reconciliation for chat %d exceeded %d pages", chatID, reconciliationMaxPages)
+}
+
+func cachedHistoryPageMax(messages []sidecar.MessageRecord, previousAfter int64) (int64, error) {
+	pageMax := previousAfter
+	seen := make(map[int64]struct{}, len(messages))
+	for _, message := range messages {
+		if message.MessageID <= previousAfter {
+			return previousAfter, fmt.Errorf(
+				"message ID %d did not advance beyond page boundary %d",
+				message.MessageID,
+				previousAfter,
+			)
+		}
+		if _, duplicate := seen[message.MessageID]; duplicate {
+			return previousAfter, fmt.Errorf("duplicate message ID %d in cached history page", message.MessageID)
+		}
+		seen[message.MessageID] = struct{}{}
+		if message.MessageID > pageMax {
+			pageMax = message.MessageID
+		}
+	}
+	if len(messages) > 0 && pageMax <= previousAfter {
+		return previousAfter, errors.New("cached history page did not make progress")
+	}
+	return pageMax, nil
 }
 
 func (ic *InlineClient) reconcileReactions(state *sidecar.ChatStateSnapshot) error {
@@ -1768,13 +2168,16 @@ func (ic *InlineClient) handleSequencedSidecarEvent(ctx context.Context, envelop
 	if envelope.Sequence == nil {
 		return errors.New("lossless Inline sidecar event is missing a sequence")
 	}
-	namespace, current := ic.sidecarEventCursor()
+	namespace, generation, current := ic.sidecarEventCursor()
 	if envelope.SessionNamespace != namespace {
 		return fmt.Errorf("Inline sidecar event namespace %q does not match login namespace %q", envelope.SessionNamespace, namespace)
 	}
+	if envelope.Generation != generation {
+		return fmt.Errorf("Inline sidecar event generation %q does not match login generation %q", envelope.Generation, generation)
+	}
 	sequence := *envelope.Sequence
 	if sequence <= current {
-		return ic.Sidecar.AckEvents(ctx, namespace, current)
+		return ic.Sidecar.AckEventsGeneration(ctx, namespace, generation, current)
 	}
 	if sequence != current+1 {
 		return fmt.Errorf("Inline sidecar event gap: got %d after %d", sequence, current)
@@ -1786,25 +2189,37 @@ func (ic *InlineClient) handleSequencedSidecarEvent(ctx context.Context, envelop
 	if err := ic.persistSidecarSequence(ctx, sequence); err != nil {
 		return err
 	}
-	return ic.Sidecar.AckEvents(ctx, namespace, sequence)
+	return ic.Sidecar.AckEventsGeneration(ctx, namespace, generation, sequence)
 }
 
-func (ic *InlineClient) sidecarEventCursor() (string, uint64) {
+func (ic *InlineClient) sidecarEventCursor() (string, string, uint64) {
 	ic.mu.RLock()
 	defer ic.mu.RUnlock()
-	return ic.storeNamespace, ic.lastSidecarSequence
+	return ic.storeNamespace, ic.sidecarEventGeneration, ic.lastSidecarSequence
 }
 
 func (ic *InlineClient) persistSidecarSequence(ctx context.Context, sequence uint64) error {
+	ic.mu.RLock()
+	generation := ic.sidecarEventGeneration
+	ic.mu.RUnlock()
+	return ic.persistSidecarEventCursor(ctx, generation, sequence)
+}
+
+func (ic *InlineClient) persistSidecarEventCursor(ctx context.Context, generation string, sequence uint64) error {
+	ic.metadataSaveMu.Lock()
+	defer ic.metadataSaveMu.Unlock()
 	ic.mu.Lock()
-	previous := ic.lastSidecarSequence
-	if sequence <= previous {
+	previousSequence := ic.lastSidecarSequence
+	previousGeneration := ic.sidecarEventGeneration
+	if generation == previousGeneration && sequence <= previousSequence {
 		ic.mu.Unlock()
 		return nil
 	}
+	ic.sidecarEventGeneration = generation
 	ic.lastSidecarSequence = sequence
 	meta, ok := ic.UserLogin.Metadata.(*UserLoginMetadata)
 	if ok {
+		meta.SidecarEventGeneration = generation
 		meta.LastSidecarSequence = sequence
 	}
 	ic.mu.Unlock()
@@ -1814,8 +2229,10 @@ func (ic *InlineClient) persistSidecarSequence(ctx context.Context, sequence uin
 	}
 	if err := ic.UserLogin.Save(ctx); err != nil {
 		ic.mu.Lock()
-		ic.lastSidecarSequence = previous
-		meta.LastSidecarSequence = previous
+		ic.sidecarEventGeneration = previousGeneration
+		ic.lastSidecarSequence = previousSequence
+		meta.SidecarEventGeneration = previousGeneration
+		meta.LastSidecarSequence = previousSequence
 		ic.mu.Unlock()
 		return fmt.Errorf("save Inline sidecar event sequence: %w", err)
 	}
@@ -1852,6 +2269,11 @@ func (ic *InlineClient) handleSidecarEvent(ctx context.Context, envelope *sideca
 		if envelope.Event.ChatUpserted == nil {
 			return errors.New("malformed ChatUpserted sidecar event")
 		}
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.ChatUpserted.ChatID, true, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
+		}
 		ic.markDialogDetailsStale(envelope.Event.ChatUpserted.ChatID)
 		return eventHandlingResultError("chat resync", ic.queueChatResyncByID(ctx, envelope.Event.ChatUpserted.ChatID))
 	case "ChatDeleted":
@@ -1862,6 +2284,11 @@ func (ic *InlineClient) handleSidecarEvent(ctx context.Context, envelope *sideca
 	case "ChatParticipantsChanged":
 		if envelope.Event.ChatParticipantsChanged == nil {
 			return errors.New("malformed ChatParticipantsChanged sidecar event")
+		}
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.ChatParticipantsChanged.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
 		}
 		ic.markDialogDetailsStale(envelope.Event.ChatParticipantsChanged.ChatID)
 		return eventHandlingResultError("participant resync", ic.queueChatResyncByID(ctx, envelope.Event.ChatParticipantsChanged.ChatID))
@@ -1905,35 +2332,70 @@ func (ic *InlineClient) handleSidecarEvent(ctx context.Context, envelope *sideca
 		if envelope.Event.MessageUpserted == nil {
 			return errors.New("malformed MessageUpserted sidecar event")
 		}
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.MessageUpserted.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
+		}
 		return ic.syncMessageUpsert(ctx, envelope.Event.MessageUpserted.ChatID, envelope.Event.MessageUpserted.MessageID)
 	case "MessageStored":
 		if envelope.Event.MessageStored == nil {
 			return errors.New("malformed MessageStored sidecar event")
 		}
-		return eventHandlingResultError("message upsert", ic.queueInlineMessage(envelope.Event.MessageStored.Message))
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.MessageStored.Message.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
+		}
+		return eventHandlingResultError("message upsert", ic.queueInlineMessage(ctx, envelope.Event.MessageStored.Message))
 	case "MessageDeleted":
 		if envelope.Event.MessageDeleted == nil {
 			return errors.New("malformed MessageDeleted sidecar event")
+		}
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.MessageDeleted.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
 		}
 		return eventHandlingResultError("message delete", ic.queueInlineMessageDelete(envelope.Event.MessageDeleted.ChatID, envelope.Event.MessageDeleted.MessageID))
 	case "ChatHistoryCleared":
 		if envelope.Event.ChatHistoryCleared == nil {
 			return errors.New("malformed ChatHistoryCleared sidecar event")
 		}
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.ChatHistoryCleared.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
+		}
 		return ic.queueChatHistoryClear(ctx, envelope.Event.ChatHistoryCleared)
 	case "ReactionChanged":
 		if envelope.Event.ReactionChanged == nil {
 			return errors.New("malformed ReactionChanged sidecar event")
+		}
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.ReactionChanged.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
 		}
 		return eventHandlingResultError("reaction", ic.queueInlineReaction(envelope.Event.ReactionChanged))
 	case "ReadStateChanged":
 		if envelope.Event.ReadStateChanged == nil {
 			return errors.New("malformed ReadStateChanged sidecar event")
 		}
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.ReadStateChanged.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
+		}
 		return ic.syncReadState(ctx, envelope.Event.ReadStateChanged.ChatID)
 	case "Typing":
 		if envelope.Event.Typing == nil {
 			return errors.New("malformed Typing sidecar event")
+		}
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.Typing.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
 		}
 		return eventHandlingResultError("typing", ic.queueInlineTyping(envelope.Event.Typing))
 	case "UserStatusChanged":
@@ -1950,7 +2412,12 @@ func (ic *InlineClient) handleSidecarEvent(ctx context.Context, envelope *sideca
 		if envelope.Event.NewMessageNotification == nil {
 			return errors.New("malformed NewMessageNotification sidecar event")
 		}
-		return eventHandlingResultError("message notification", ic.queueInlineMessage(envelope.Event.NewMessageNotification.Message))
+		if skip, err := ic.skipHiddenChatEvent(ctx, envelope.Event.NewMessageNotification.Message.ChatID, false, envelope.Event.Type); err != nil {
+			return err
+		} else if skip {
+			return nil
+		}
+		return eventHandlingResultError("message notification", ic.queueInlineMessage(ctx, envelope.Event.NewMessageNotification.Message))
 	default:
 		return fmt.Errorf("unsupported Inline sidecar event variant %q", envelope.Event.Type)
 	}
@@ -1989,7 +2456,7 @@ func (ic *InlineClient) syncMessageUpsert(ctx context.Context, chatID, messageID
 	ic.cacheUsers(page.Users)
 	for _, msg := range page.Messages {
 		if msg.MessageID == messageID {
-			return eventHandlingResultError("message upsert", ic.queueInlineMessage(msg))
+			return eventHandlingResultError("message upsert", ic.queueInlineMessage(ctx, msg))
 		}
 	}
 	return fmt.Errorf("Inline message upsert %d/%d was not found in client history", chatID, messageID)
@@ -2030,6 +2497,9 @@ func (ic *InlineClient) handleStatusChanged(evt *sidecar.StatusChangedEvent) {
 }
 
 func (ic *InlineClient) queueDialogResync(ctx context.Context, dialog sidecar.DialogRecord) bridgev2.EventHandlingResult {
+	if !ic.shouldProjectDialog(dialog) {
+		return bridgev2.EventHandlingResultIgnored
+	}
 	chatInfo := ic.chatInfoForDialog(ctx, dialog, dialogName(dialog))
 	return ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
@@ -2082,6 +2552,9 @@ func (ic *InlineClient) queueSpaceDialogResync(ctx context.Context, spaceID int6
 	}
 	ic.mu.RUnlock()
 	for _, dialog := range dialogs {
+		if !ic.shouldProjectDialog(dialog) {
+			continue
+		}
 		ic.markDialogDetailsStale(dialog.ChatID)
 		if err := eventHandlingResultError("space dialog resync", ic.queueDialogResync(ctx, dialog)); err != nil {
 			return err
@@ -2149,7 +2622,12 @@ func sameDialogRecord(left, right sidecar.DialogRecord) bool {
 		stringPtrEqual(left.Title, right.Title) &&
 		int64PtrEqual(left.LastMessageID, right.LastMessageID) &&
 		int64PtrEqual(left.SyncedThroughMessageID, right.SyncedThroughMessageID) &&
+		boolPtrEqual(left.ChatListHidden, right.ChatListHidden) &&
 		uint32PtrEqual(left.UnreadCount, right.UnreadCount)
+}
+
+func boolPtrEqual(left, right *bool) bool {
+	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
 }
 
 func isDMDialog(dialog sidecar.DialogRecord) bool {
@@ -2409,12 +2887,45 @@ func eventHandlingResultError(kind string, result bridgev2.EventHandlingResult) 
 	return fmt.Errorf("mautrix rejected Inline %s event", kind)
 }
 
-func (ic *InlineClient) queueInlineMessage(msg sidecar.MessageRecord) bridgev2.EventHandlingResult {
+func (ic *InlineClient) queueInlineMessage(ctx context.Context, msg sidecar.MessageRecord) bridgev2.EventHandlingResult {
 	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, ic.remoteMessageEvent(msg))
-	if result.Success && !result.Ignored {
+	if historyDeliveryAccepted(result) {
+		if err := ic.persistHistoryCheckpoint(ctx, msg.ChatID, msg.MessageID); err != nil {
+			result.Success = false
+			result.Error = err
+			return result
+		}
 		ic.rememberHistoryDelivered(msg.ChatID, msg.MessageID)
 	}
 	return result
+}
+
+func (ic *InlineClient) persistHistoryCheckpoint(ctx context.Context, chatID, messageID int64) error {
+	if chatID <= 0 || messageID <= 0 {
+		return errors.New("invalid Inline history checkpoint")
+	}
+	portal, err := ic.UserLogin.Bridge.GetPortalByKey(ctx, ic.portalKeyForChat(chatID))
+	if err != nil {
+		return fmt.Errorf("load portal for Inline history checkpoint: %w", err)
+	}
+	metadata, ok := portal.Metadata.(*PortalMetadata)
+	if !ok || metadata == nil {
+		return errors.New("Inline portal metadata is unavailable")
+	}
+	if messageID <= metadata.HistoryCheckpoint {
+		return nil
+	}
+	previous := metadata.HistoryCheckpoint
+	metadata.HistoryCheckpoint = messageID
+	if err := portal.Save(ctx); err != nil {
+		metadata.HistoryCheckpoint = previous
+		return fmt.Errorf("save Inline history checkpoint: %w", err)
+	}
+	return nil
+}
+
+func historyDeliveryAccepted(result bridgev2.EventHandlingResult) bool {
+	return result.Success
 }
 
 func (ic *InlineClient) queueInlineMessageDelete(chatID, messageID int64) bridgev2.EventHandlingResult {
@@ -2663,6 +3174,9 @@ func convertedInlineMedia(ctx context.Context, portal *bridgev2.Portal, intent b
 
 	data, err := downloadInlineMedia(ctx, content.URL)
 	if err != nil {
+		if isPermanentMediaFailure(err) {
+			return convertedInlineMediaUnavailable(content), nil
+		}
 		return nil, fmt.Errorf("failed to download Inline media: %w", err)
 	}
 
@@ -2713,10 +3227,10 @@ func downloadInlineAvatar(ctx context.Context, rawURL string) ([]byte, error) {
 func downloadInlineURL(ctx context.Context, rawURL string, maxBytes int64, label string) ([]byte, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s URL: %w", label, err)
+		return nil, permanentMediaFailure(fmt.Errorf("parse %s URL: %w", label, err))
 	}
 	if parsed.Scheme != "https" && parsed.Scheme != "http" {
-		return nil, fmt.Errorf("unsupported %s URL scheme", label)
+		return nil, permanentMediaFailure(fmt.Errorf("unsupported %s URL scheme", label))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
@@ -2730,7 +3244,14 @@ func downloadInlineURL(ctx context.Context, rawURL string, maxBytes int64, label
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("download %s returned HTTP %d", label, resp.StatusCode)
+		err := fmt.Errorf("download %s returned HTTP %d", label, resp.StatusCode)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+			resp.StatusCode != http.StatusRequestTimeout &&
+			resp.StatusCode != http.StatusTooEarly &&
+			resp.StatusCode != http.StatusTooManyRequests {
+			return nil, permanentMediaFailure(err)
+		}
+		return nil, err
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
@@ -2738,7 +3259,7 @@ func downloadInlineURL(ctx context.Context, rawURL string, maxBytes int64, label
 		return nil, fmt.Errorf("read %s response: %w", label, err)
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%s exceeds %d byte bridge download limit", label, maxBytes)
+		return nil, permanentMediaFailure(fmt.Errorf("%s exceeds %d byte bridge download limit", label, maxBytes))
 	}
 	return data, nil
 }

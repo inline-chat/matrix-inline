@@ -204,6 +204,21 @@ func TestBackfillMessagesFromHistorySortsAndBuildsCursor(t *testing.T) {
 	}
 }
 
+func TestBackfillCursorUsesMinimumIDNotFirstChronologicalMessage(t *testing.T) {
+	records := []sidecar.MessageRecord{
+		{ChatID: 7, MessageID: 20, SenderID: 1, Timestamp: 100, Content: sidecar.MessageContent{Type: "text", Text: "earlier timestamp"}},
+		{ChatID: 7, MessageID: 10, SenderID: 1, Timestamp: 200, Content: sidecar.MessageContent{Type: "text", Text: "lower id"}},
+	}
+
+	messages, cursor := (&InlineClient{}).backfillMessagesFromHistory(context.Background(), nil, records)
+	if cursor != networkid.PaginationCursor("7/10") {
+		t.Fatalf("cursor = %q, want minimum ID 7/10", cursor)
+	}
+	if len(messages) != 2 || messages[0].ID != networkid.MessageID("7/20") {
+		t.Fatalf("presentation order changed: %#v", messages)
+	}
+}
+
 func TestFetchMessagesUsesSidecarHistory(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/history" {
@@ -577,7 +592,7 @@ func TestReplayReconciliationUsesOneLiveSnapshotThenCachedPages(t *testing.T) {
 	defer server.Close()
 
 	ic := &InlineClient{Sidecar: sidecar.NewClient(server.URL)}
-	dialogs, err := ic.fetchAllDialogsForReconciliation(context.Background())
+	dialogs, err := ic.fetchAllDialogsForReconciliation(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("fetchAllDialogsForReconciliation() error = %v", err)
 	}
@@ -926,6 +941,164 @@ func TestRememberHistoryDeliveredDoesNotMoveBackward(t *testing.T) {
 	}
 }
 
+func TestHiddenDialogsAreExcludedByDefault(t *testing.T) {
+	hidden := true
+	dialog := sidecar.DialogRecord{ChatID: 7, ChatListHidden: &hidden}
+	client := &InlineClient{}
+	if client.shouldProjectDialog(dialog) {
+		t.Fatal("default policy projected a hidden dialog")
+	}
+	client.hiddenDialogsOverride = hiddenDialogsInclude
+	if !client.shouldProjectDialog(dialog) {
+		t.Fatal("include override did not project a hidden dialog")
+	}
+}
+
+func TestDialogVisibilityChangeTriggersResyncComparison(t *testing.T) {
+	hidden := true
+	visible := false
+	left := sidecar.DialogRecord{ChatID: 7, ChatListHidden: &hidden}
+	right := sidecar.DialogRecord{ChatID: 7, ChatListHidden: &visible}
+	if sameDialogRecord(left, right) {
+		t.Fatal("dialog visibility change was treated as unchanged")
+	}
+}
+
+func TestShouldProjectChatLoadsUnknownHiddenDialogVisibility(t *testing.T) {
+	hidden := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rpc/state/chat" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		writeConnectorSidecarResult(t, w, "chat_state", sidecar.ChatStateSnapshot{
+			ChatID: 7,
+			Dialog: &sidecar.DialogRecord{ChatID: 7, ChatListHidden: &hidden},
+		})
+	}))
+	defer server.Close()
+
+	client := &InlineClient{
+		Sidecar: sidecar.NewClient(server.URL),
+		dialogs: make(map[int64]sidecar.DialogRecord),
+	}
+	project, err := client.shouldProjectChat(t.Context(), 7, false)
+	if err != nil {
+		t.Fatalf("shouldProjectChat() error = %v", err)
+	}
+	if project {
+		t.Fatal("unknown hidden dialog was projected")
+	}
+	if dialog, ok := client.cachedDialog(7); !ok || dialog.ChatListHidden == nil || !*dialog.ChatListHidden {
+		t.Fatalf("hidden dialog was not cached: %#v, %t", dialog, ok)
+	}
+}
+
+func TestChatUpsertRefreshesVisibleDialogToHiddenBeforeProjection(t *testing.T) {
+	hidden := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rpc/state/chat" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		writeConnectorSidecarResult(t, w, "chat_state", sidecar.ChatStateSnapshot{
+			ChatID: 7,
+			Dialog: &sidecar.DialogRecord{ChatID: 7, ChatListHidden: &hidden},
+		})
+	}))
+	defer server.Close()
+
+	client := &InlineClient{
+		Sidecar: sidecar.NewClient(server.URL),
+		dialogs: map[int64]sidecar.DialogRecord{7: {ChatID: 7}},
+	}
+	err := client.handleSidecarEvent(t.Context(), &sidecar.EventEnvelope{Event: sidecar.ClientEvent{
+		Type:         "ChatUpserted",
+		ChatUpserted: &sidecar.ChatIDEvent{ChatID: 7},
+	}})
+	if err != nil {
+		t.Fatalf("hidden chat upsert error = %v", err)
+	}
+	if dialog, ok := client.cachedDialog(7); !ok || dialog.ChatListHidden == nil || !*dialog.ChatListHidden {
+		t.Fatalf("refreshed hidden dialog was not cached: %#v, %t", dialog, ok)
+	}
+}
+
+func TestHiddenMessageEventIsAcknowledgedWithoutMatrixProjection(t *testing.T) {
+	hidden := true
+	client := &InlineClient{dialogs: map[int64]sidecar.DialogRecord{
+		7: {ChatID: 7, ChatListHidden: &hidden},
+	}}
+	err := client.handleSidecarEvent(t.Context(), &sidecar.EventEnvelope{Event: sidecar.ClientEvent{
+		Type: "MessageStored",
+		MessageStored: &sidecar.MessageStoredEvent{Message: sidecar.MessageRecord{
+			ChatID: 7, MessageID: 11,
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("hidden message event error = %v", err)
+	}
+}
+
+func TestPersistHiddenDialogOverrideResetsStableScan(t *testing.T) {
+	client := &InlineClient{
+		dialogSyncCursor:     "9001",
+		hiddenDialogsDefault: hiddenDialogsExclude,
+		dialogs: map[int64]sidecar.DialogRecord{
+			7: {ChatID: 7},
+		},
+	}
+	if err := client.persistHiddenDialogsOverride(t.Context(), hiddenDialogsInclude); err != nil {
+		t.Fatalf("persistHiddenDialogsOverride() error = %v", err)
+	}
+	if client.dialogSyncCursor != "" || len(client.dialogs) != 0 {
+		t.Fatalf("stable scan was not reset: cursor=%q dialogs=%d", client.dialogSyncCursor, len(client.dialogs))
+	}
+	if client.effectiveHiddenDialogsPolicy() != hiddenDialogsInclude {
+		t.Fatalf("effective policy = %q, want include", client.effectiveHiddenDialogsPolicy())
+	}
+}
+
+func TestIgnoredExistingMessageStillAdvancesHistoryRecovery(t *testing.T) {
+	if !historyDeliveryAccepted(bridgev2.EventHandlingResultIgnored) {
+		t.Fatal("ignored existing message should count as recovered history")
+	}
+	if historyDeliveryAccepted(bridgev2.EventHandlingResult{Error: errors.New("failed")}) {
+		t.Fatal("failed message projection should not advance history recovery")
+	}
+}
+
+func TestCachedHistoryPageMaxUsesWholePageBoundary(t *testing.T) {
+	messages := []sidecar.MessageRecord{{MessageID: 15390}, {MessageID: 15389}}
+	pageMax, err := cachedHistoryPageMax(messages, 15333)
+	if err != nil {
+		t.Fatalf("valid inverted page rejected: %v", err)
+	}
+	if pageMax != 15390 {
+		t.Fatalf("page max = %d, want 15390", pageMax)
+	}
+}
+
+func TestCachedHistoryPageMaxRejectsBoundaryAndDuplicates(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages []sidecar.MessageRecord
+	}{
+		{name: "prior boundary", messages: []sidecar.MessageRecord{{MessageID: 15390}, {MessageID: 15333}}},
+		{name: "duplicate", messages: []sidecar.MessageRecord{{MessageID: 15390}, {MessageID: 15390}}},
+		{name: "invalid", messages: []sidecar.MessageRecord{{MessageID: 0}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pageMax, err := cachedHistoryPageMax(test.messages, 15333)
+			if err == nil {
+				t.Fatalf("invalid page accepted with cursor %d", pageMax)
+			}
+			if pageMax != 15333 {
+				t.Fatalf("failed page cursor = %d, want unchanged 15333", pageMax)
+			}
+		})
+	}
+}
+
 func TestPrioritizedHistoryDialogsPrefersActiveDMsAndNewest(t *testing.T) {
 	peer100 := int64(100)
 	peer101 := int64(101)
@@ -1112,6 +1285,27 @@ func TestDownloadInlineMedia(t *testing.T) {
 func TestDownloadInlineMediaRejectsUnsupportedScheme(t *testing.T) {
 	if _, err := downloadInlineMedia(context.Background(), "file:///tmp/media.bin"); err == nil {
 		t.Fatal("downloadInlineMedia() error = nil, want unsupported scheme error")
+	} else if !isPermanentMediaFailure(err) {
+		t.Fatalf("downloadInlineMedia() error = %v, want permanent classification", err)
+	}
+}
+
+func TestDownloadInlineMediaClassifiesPermanentAndRetryableHTTPFailures(t *testing.T) {
+	status := http.StatusNotFound
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer server.Close()
+
+	_, err := downloadInlineMedia(context.Background(), server.URL+"/missing")
+	if !isPermanentMediaFailure(err) {
+		t.Fatalf("404 error = %v, want permanent classification", err)
+	}
+
+	status = http.StatusServiceUnavailable
+	_, err = downloadInlineMedia(context.Background(), server.URL+"/retry")
+	if err == nil || isPermanentMediaFailure(err) {
+		t.Fatalf("503 error = %v, want retryable classification", err)
 	}
 }
 
@@ -1175,28 +1369,48 @@ func TestDuplicateSidecarReplayOnlyReacknowledgesContiguousCursor(t *testing.T) 
 			t.Fatalf("decode ack request: %v", err)
 		}
 		acked <- request
-		if err := json.NewEncoder(w).Encode(sidecar.EventAckResponse{AcknowledgedSequence: request.Sequence}); err != nil {
+		if err := json.NewEncoder(w).Encode(sidecar.EventAckResponse{Generation: request.Generation, AcknowledgedSequence: request.Sequence}); err != nil {
 			t.Fatalf("encode ack response: %v", err)
 		}
 	}))
 	defer server.Close()
 	sequence := uint64(9)
 	ic := &InlineClient{
-		Sidecar:             sidecar.NewClient(server.URL),
-		storeNamespace:      "team",
-		lastSidecarSequence: 10,
+		Sidecar:                sidecar.NewClient(server.URL),
+		storeNamespace:         "team",
+		sidecarEventGeneration: "generation-1",
+		lastSidecarSequence:    10,
 	}
 
 	if err := ic.handleSequencedSidecarEvent(t.Context(), &sidecar.EventEnvelope{
 		SessionNamespace: "team",
+		Generation:       "generation-1",
 		Sequence:         &sequence,
 		Reliability:      sidecar.EventLossless,
 	}); err != nil {
 		t.Fatalf("handleSequencedSidecarEvent() error = %v", err)
 	}
 	request := <-acked
-	if request.SessionNamespace != "team" || request.Sequence != 10 {
+	if request.SessionNamespace != "team" || request.Generation != "generation-1" || request.Sequence != 10 {
 		t.Fatalf("ack = %#v, want team cursor 10", request)
+	}
+}
+
+func TestSidecarEventGenerationMismatchStopsBeforeSequenceReuse(t *testing.T) {
+	sequence := uint64(11)
+	ic := &InlineClient{
+		storeNamespace:         "team",
+		sidecarEventGeneration: "generation-1",
+		lastSidecarSequence:    10,
+	}
+	err := ic.handleSequencedSidecarEvent(t.Context(), &sidecar.EventEnvelope{
+		SessionNamespace: "team",
+		Generation:       "generation-2",
+		Sequence:         &sequence,
+		Reliability:      sidecar.EventLossless,
+	})
+	if err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("generation mismatch error = %v", err)
 	}
 }
 

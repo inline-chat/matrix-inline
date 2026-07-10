@@ -40,3 +40,41 @@ func TestInlineStatusSummaryReportsSidecarFailure(t *testing.T) {
 		t.Fatalf("summary = %q, want sidecar failure", got)
 	}
 }
+
+func TestParseHiddenDialogsCommand(t *testing.T) {
+	tests := []struct {
+		input []string
+		want  hiddenDialogsPolicy
+	}{
+		{input: []string{"exclude"}, want: hiddenDialogsExclude},
+		{input: []string{"show"}, want: hiddenDialogsInclude},
+		{input: []string{"default"}, want: ""},
+	}
+	for _, test := range tests {
+		got, err := parseHiddenDialogsCommand(test.input)
+		if err != nil || got != test.want {
+			t.Fatalf("parseHiddenDialogsCommand(%q) = %q, %v; want %q", test.input, got, err, test.want)
+		}
+	}
+	if _, err := parseHiddenDialogsCommand([]string{"sometimes"}); err == nil {
+		t.Fatal("unknown hidden dialog setting was accepted")
+	}
+}
+
+func TestInlineSettingsSummaryExplainsEffectivePolicy(t *testing.T) {
+	client := &InlineClient{
+		hiddenDialogsDefault:  hiddenDialogsExclude,
+		hiddenDialogsOverride: hiddenDialogsInclude,
+	}
+	got := inlineSettingsSummary(client)
+	for _, want := range []string{
+		"Hidden chats: `include`",
+		"Account override: `include`",
+		"Bridge default: `exclude`",
+		"Existing Matrix rooms are not deleted",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("settings summary missing %q:\n%s", want, got)
+		}
+	}
+}

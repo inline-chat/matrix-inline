@@ -44,6 +44,33 @@ pub enum AdapterEventStoreError {
         /// Latest assigned sequence.
         latest_sequence: u64,
     },
+    /// The bridge cursor belongs to a different event-log generation.
+    #[error("sidecar event generation changed; current generation is {generation}")]
+    GenerationChanged {
+        /// Current generation the bridge must adopt after reconciliation.
+        generation: String,
+        /// Latest sequence in the current generation.
+        latest_sequence: u64,
+    },
+    /// The bridge cursor is ahead of this database lineage. The store rotates
+    /// to a clean generation so recovery cannot remain permanently ack-ahead.
+    #[error("sidecar event cursor {after_sequence} is ahead; reset to generation {generation}")]
+    CursorAheadReset {
+        /// Cursor supplied by the bridge.
+        after_sequence: u64,
+        /// Newly rotated generation.
+        generation: String,
+        /// Latest sequence after reset (always zero).
+        latest_sequence: u64,
+    },
+    /// A public unsigned identifier cannot be represented by SQLite INTEGER.
+    #[error("{field} {value} exceeds the SQLite integer range")]
+    IntegerOutOfRange {
+        /// Name of the invalid identifier.
+        field: &'static str,
+        /// Rejected unsigned value.
+        value: u64,
+    },
 }
 
 /// SQLite-backed replay log shared by adapter HTTP connections.
@@ -131,36 +158,95 @@ impl AdapterEventStore {
         namespace: &str,
         event: ClientEvent,
     ) -> Result<SidecarEventEnvelope, AdapterEventStoreError> {
+        self.append_for_namespace_delivery(namespace, None, event)
+    }
+
+    /// Persists a lossless client delivery idempotently across the client and
+    /// adapter SQLite boundary.
+    pub fn append_for_namespace_delivery(
+        &self,
+        namespace: &str,
+        client_delivery_id: Option<u64>,
+        event: ClientEvent,
+    ) -> Result<SidecarEventEnvelope, AdapterEventStoreError> {
         let namespace = normalize_namespace(namespace);
         if event.reliability() == EventReliability::BestEffort {
-            return Ok(SidecarEventEnvelope::current(event).with_session_namespace(namespace));
+            let generation = self.generation(&namespace)?;
+            return Ok(SidecarEventEnvelope::current(event)
+                .with_session_namespace(namespace)
+                .with_generation(generation));
         }
+        let client_delivery_id = client_delivery_id
+            .map(|value| sqlite_integer("client delivery ID", value))
+            .transpose()?;
 
         let mut connection = self.connection.lock().expect("event store poisoned");
         let transaction = connection.transaction()?;
+        let generation = event_generation(&transaction, &namespace)?;
+        if let Some(client_delivery_id) = client_delivery_id {
+            let existing = transaction
+                .query_row(
+                    "SELECT payload_json FROM sidecar_client_delivery_receipts
+                     WHERE session_namespace = ?1 AND client_delivery_id = ?2",
+                    params![namespace, client_delivery_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(payload) = existing {
+                let mut envelope: SidecarEventEnvelope = serde_json::from_str(&payload)?;
+                if envelope.generation.is_empty() {
+                    envelope.generation = generation;
+                }
+                transaction.commit()?;
+                return Ok(envelope);
+            }
+        }
         let current = latest_sequence(&transaction, &namespace)?;
-        let sequence = current.saturating_add(1);
+        let sequence = current
+            .checked_add(1)
+            .ok_or(AdapterEventStoreError::IntegerOutOfRange {
+                field: "sidecar event sequence",
+                value: current,
+            })?;
+        let sequence_integer = sqlite_integer("sidecar event sequence", sequence)?;
         transaction.execute(
             "INSERT INTO sidecar_event_sequences (session_namespace, latest_sequence)
              VALUES (?1, ?2)
              ON CONFLICT(session_namespace) DO UPDATE SET
                latest_sequence = excluded.latest_sequence",
-            params![namespace, sequence as i64],
+            params![namespace, sequence_integer],
         )?;
         let envelope = SidecarEventEnvelope::current(event)
             .with_session_namespace(namespace.clone())
+            .with_generation(generation)
             .with_sequence(sequence);
         let payload = serde_json::to_string(&envelope)?;
+        if let Some(client_delivery_id) = client_delivery_id {
+            transaction.execute(
+                "INSERT INTO sidecar_client_delivery_receipts (
+                   session_namespace, client_delivery_id, sequence, payload_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    namespace,
+                    client_delivery_id,
+                    sequence_integer,
+                    payload,
+                    now_seconds(),
+                ],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO sidecar_events (
-               session_namespace, sequence, reliability, payload_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+               session_namespace, sequence, reliability, payload_json, created_at,
+               client_delivery_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 namespace,
-                sequence as i64,
+                sequence_integer,
                 "lossless",
                 payload,
-                now_seconds()
+                now_seconds(),
+                client_delivery_id,
             ],
         )?;
         let retention_floor = sequence.saturating_sub(MAX_RETAINED_EVENTS_PER_NAMESPACE);
@@ -168,12 +254,41 @@ impl AdapterEventStore {
             transaction.execute(
                 "DELETE FROM sidecar_events
                  WHERE session_namespace = ?1 AND sequence <= ?2",
-                params![namespace, retention_floor as i64],
+                params![
+                    namespace,
+                    sqlite_integer("sidecar retention floor", retention_floor)?
+                ],
             )?;
         }
         transaction.commit()?;
         log::debug!("persisted lossless adapter event sequence={sequence}");
         Ok(envelope)
+    }
+
+    /// Returns the durable event-log generation for one namespace, creating it
+    /// on first use.
+    pub fn generation(&self, namespace: &str) -> Result<String, AdapterEventStoreError> {
+        let namespace = normalize_namespace(namespace);
+        let connection = self.connection.lock().expect("event store poisoned");
+        Ok(event_generation(&connection, &namespace)?)
+    }
+
+    /// Removes the temporary cross-database deduplication receipt after the
+    /// client outbox acknowledgement succeeds.
+    pub fn finalize_client_delivery(
+        &self,
+        namespace: &str,
+        client_delivery_id: u64,
+    ) -> Result<(), AdapterEventStoreError> {
+        let namespace = normalize_namespace(namespace);
+        let client_delivery_id = sqlite_integer("client delivery ID", client_delivery_id)?;
+        let connection = self.connection.lock().expect("event store poisoned");
+        connection.execute(
+            "DELETE FROM sidecar_client_delivery_receipts
+             WHERE session_namespace = ?1 AND client_delivery_id = ?2",
+            params![namespace, client_delivery_id],
+        )?;
+        Ok(())
     }
 
     /// Loads all retained events after a bridge cursor, rejecting retention gaps.
@@ -182,9 +297,41 @@ impl AdapterEventStore {
         namespace: &str,
         after_sequence: u64,
     ) -> Result<Vec<SidecarEventEnvelope>, AdapterEventStoreError> {
+        self.replay_for_generation(namespace, None, after_sequence)
+    }
+
+    /// Loads retained events after validating the bridge's event generation.
+    pub fn replay_for_generation(
+        &self,
+        namespace: &str,
+        expected_generation: Option<&str>,
+        after_sequence: u64,
+    ) -> Result<Vec<SidecarEventEnvelope>, AdapterEventStoreError> {
         let namespace = normalize_namespace(namespace);
-        let connection = self.connection.lock().expect("event store poisoned");
+        let mut connection = self.connection.lock().expect("event store poisoned");
+        let generation = event_generation(&connection, &namespace)?;
         let latest = latest_sequence(&connection, &namespace)?;
+        if expected_generation
+            .map(str::trim)
+            .filter(|expected| !expected.is_empty())
+            .is_some_and(|expected| expected != generation)
+        {
+            return Err(AdapterEventStoreError::GenerationChanged {
+                generation,
+                latest_sequence: latest,
+            });
+        }
+        if after_sequence > latest {
+            let generation = rotate_generation(&mut connection, &namespace)?;
+            return Err(AdapterEventStoreError::CursorAheadReset {
+                after_sequence,
+                generation,
+                latest_sequence: 0,
+            });
+        }
+        if after_sequence == latest {
+            return Ok(Vec::new());
+        }
         let oldest = connection
             .query_row(
                 "SELECT MIN(sequence) FROM sidecar_events WHERE session_namespace = ?1",
@@ -215,10 +362,18 @@ impl AdapterEventStore {
                 row.get::<_, String>(0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        let replay = payloads
+        let mut replay = payloads
             .into_iter()
-            .map(|payload| serde_json::from_str(&payload).map_err(AdapterEventStoreError::from))
+            .map(|payload| {
+                serde_json::from_str::<SidecarEventEnvelope>(&payload)
+                    .map_err(AdapterEventStoreError::from)
+            })
             .collect::<Result<Vec<_>, _>>()?;
+        for envelope in &mut replay {
+            if envelope.generation.is_empty() {
+                envelope.generation.clone_from(&generation);
+            }
+        }
         if !replay.is_empty() {
             log::debug!(
                 "loaded adapter event replay after_sequence={after_sequence} count={}",
@@ -234,9 +389,30 @@ impl AdapterEventStore {
         namespace: &str,
         sequence: u64,
     ) -> Result<(), AdapterEventStoreError> {
+        self.acknowledge_for_generation(namespace, None, sequence)
+    }
+
+    /// Acknowledges progress only within the expected event generation.
+    pub fn acknowledge_for_generation(
+        &self,
+        namespace: &str,
+        expected_generation: Option<&str>,
+        sequence: u64,
+    ) -> Result<(), AdapterEventStoreError> {
         let namespace = normalize_namespace(namespace);
         let connection = self.connection.lock().expect("event store poisoned");
+        let generation = event_generation(&connection, &namespace)?;
         let latest = latest_sequence(&connection, &namespace)?;
+        if expected_generation
+            .map(str::trim)
+            .filter(|expected| !expected.is_empty())
+            .is_some_and(|expected| expected != generation)
+        {
+            return Err(AdapterEventStoreError::GenerationChanged {
+                generation,
+                latest_sequence: latest,
+            });
+        }
         if sequence > latest {
             return Err(AdapterEventStoreError::AckAhead {
                 sequence,
@@ -265,6 +441,14 @@ impl AdapterEventStore {
             "DELETE FROM sidecar_event_sequences WHERE session_namespace = ?1",
             params![namespace],
         )?;
+        transaction.execute(
+            "DELETE FROM sidecar_client_delivery_receipts WHERE session_namespace = ?1",
+            params![namespace],
+        )?;
+        transaction.execute(
+            "DELETE FROM sidecar_event_generations WHERE session_namespace = ?1",
+            params![namespace],
+        )?;
         transaction.commit()?;
         log::debug!("removed released adapter account replay state");
         Ok(())
@@ -279,19 +463,99 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             latest_sequence INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS sidecar_event_generations (
+            session_namespace TEXT PRIMARY KEY,
+            generation TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS sidecar_events (
             session_namespace TEXT NOT NULL,
             sequence INTEGER NOT NULL,
             reliability TEXT NOT NULL,
             payload_json TEXT NOT NULL,
             created_at INTEGER NOT NULL,
+            client_delivery_id INTEGER,
             PRIMARY KEY (session_namespace, sequence)
+        );
+
+        CREATE TABLE IF NOT EXISTS sidecar_client_delivery_receipts (
+            session_namespace TEXT NOT NULL,
+            client_delivery_id INTEGER NOT NULL,
+            sequence INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (session_namespace, client_delivery_id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_sidecar_events_replay
             ON sidecar_events (session_namespace, sequence);
         ",
+    )?;
+    let has_client_delivery_id = connection
+        .prepare("PRAGMA table_info(sidecar_events)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|column| column == "client_delivery_id");
+    if !has_client_delivery_id {
+        connection.execute(
+            "ALTER TABLE sidecar_events ADD COLUMN client_delivery_id INTEGER",
+            [],
+        )?;
+    }
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sidecar_events_client_delivery
+         ON sidecar_events (session_namespace, client_delivery_id)
+         WHERE client_delivery_id IS NOT NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+fn event_generation(connection: &Connection, namespace: &str) -> Result<String, rusqlite::Error> {
+    connection.execute(
+        "INSERT INTO sidecar_event_generations (session_namespace, generation)
+         VALUES (?1, lower(hex(randomblob(16))))
+         ON CONFLICT(session_namespace) DO NOTHING",
+        params![namespace],
+    )?;
+    connection.query_row(
+        "SELECT generation FROM sidecar_event_generations WHERE session_namespace = ?1",
+        params![namespace],
+        |row| row.get(0),
     )
+}
+
+fn rotate_generation(
+    connection: &mut Connection,
+    namespace: &str,
+) -> Result<String, rusqlite::Error> {
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "DELETE FROM sidecar_events WHERE session_namespace = ?1",
+        params![namespace],
+    )?;
+    transaction.execute(
+        "DELETE FROM sidecar_event_sequences WHERE session_namespace = ?1",
+        params![namespace],
+    )?;
+    transaction.execute(
+        "DELETE FROM sidecar_client_delivery_receipts WHERE session_namespace = ?1",
+        params![namespace],
+    )?;
+    transaction.execute(
+        "INSERT INTO sidecar_event_generations (session_namespace, generation)
+         VALUES (?1, lower(hex(randomblob(16))))
+         ON CONFLICT(session_namespace) DO UPDATE SET generation = excluded.generation",
+        params![namespace],
+    )?;
+    let generation = transaction.query_row(
+        "SELECT generation FROM sidecar_event_generations WHERE session_namespace = ?1",
+        params![namespace],
+        |row| row.get(0),
+    )?;
+    transaction.commit()?;
+    Ok(generation)
 }
 
 fn latest_sequence(connection: &Connection, namespace: &str) -> Result<u64, rusqlite::Error> {
@@ -317,6 +581,10 @@ fn normalize_namespace(namespace: &str) -> String {
     } else {
         namespace.to_owned()
     }
+}
+
+fn sqlite_integer(field: &'static str, value: u64) -> Result<i64, AdapterEventStoreError> {
+    i64::try_from(value).map_err(|_| AdapterEventStoreError::IntegerOutOfRange { field, value })
 }
 
 fn now_seconds() -> i64 {
@@ -359,6 +627,51 @@ mod tests {
         assert_eq!(store.replay("team", 1).unwrap(), vec![second]);
         store.acknowledge("team", 2).unwrap();
         assert!(store.replay("team", 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn repeated_client_delivery_reuses_the_same_adapter_sequence() {
+        let store = AdapterEventStore::open_in_memory("team").unwrap();
+        let event = ClientEvent::MessageDeleted {
+            chat_id: InlineId::new(7),
+            message_id: InlineId::new(11),
+        };
+
+        let first = store
+            .append_for_namespace_delivery("team", Some(42), event.clone())
+            .unwrap();
+        store.acknowledge("team", 1).unwrap();
+        let repeated = store
+            .append_for_namespace_delivery("team", Some(42), event)
+            .unwrap();
+
+        assert_eq!(first, repeated);
+        assert_eq!(first.sequence, Some(1));
+        assert!(store.replay("team", 1).unwrap().is_empty());
+        store.finalize_client_delivery("team", 42).unwrap();
+    }
+
+    #[test]
+    fn oversized_unsigned_cursors_do_not_wrap_into_sqlite_queries() {
+        let store = AdapterEventStore::open_in_memory("team").unwrap();
+        let event = ClientEvent::MessageDeleted {
+            chat_id: InlineId::new(7),
+            message_id: InlineId::new(11),
+        };
+
+        let error = store
+            .append_for_namespace_delivery("team", Some(u64::MAX), event.clone())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AdapterEventStoreError::IntegerOutOfRange { .. }
+        ));
+
+        store.append_for_namespace("team", event).unwrap();
+        assert!(matches!(
+            store.replay("team", u64::MAX),
+            Err(AdapterEventStoreError::CursorAheadReset { .. })
+        ));
     }
 
     #[test]
@@ -410,5 +723,41 @@ mod tests {
 
         assert!(store.replay("team", 0).unwrap().is_empty());
         store.acknowledge("team", 0).unwrap();
+    }
+
+    #[test]
+    fn cursor_ahead_rotates_generation_and_recovers_from_database_rollback() {
+        let store = AdapterEventStore::open_in_memory("team").unwrap();
+        let first = store
+            .append(ClientEvent::ChatUpserted {
+                chat_id: InlineId::new(7),
+            })
+            .unwrap();
+        let old_generation = first.generation.clone();
+
+        let reset_generation = match store.replay_for_generation("team", Some(&old_generation), 9) {
+            Err(AdapterEventStoreError::CursorAheadReset {
+                generation,
+                latest_sequence: 0,
+                ..
+            }) => generation,
+            other => panic!("expected cursor-ahead generation reset, got {other:?}"),
+        };
+        assert_ne!(reset_generation, old_generation);
+
+        let next = store
+            .append(ClientEvent::ChatUpserted {
+                chat_id: InlineId::new(8),
+            })
+            .unwrap();
+        assert_eq!(next.sequence, Some(1));
+        assert_eq!(next.generation, reset_generation);
+        assert!(matches!(
+            store.acknowledge_for_generation("team", Some(&old_generation), 1),
+            Err(AdapterEventStoreError::GenerationChanged { .. })
+        ));
+        store
+            .acknowledge_for_generation("team", Some(&reset_generation), 1)
+            .unwrap();
     }
 }

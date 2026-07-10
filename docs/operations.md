@@ -83,6 +83,52 @@ dialog-sync summaries, and rate-limit retry delays. The adapter retains up to
 10,000 lossless events per account namespace and runs durable state
 reconciliation if a bridge cursor falls behind that window.
 
+The Rust client also keeps committed lossless events in its SQLite outbox until
+the adapter has stored them. The adapter uses the client delivery ID to make
+that handoff idempotent, then acknowledges the client event. A crash before or
+after either write therefore replays the same logical event instead of silently
+advancing the Inline sync cursor or assigning duplicate adapter sequences.
+
+Adapter event cursors are `(generation, sequence)` pairs. If the adapter SQLite
+database is restored behind the Matrix database, the adapter rotates to a new
+generation and returns a structured reset. The Go bridge then performs
+authoritative reconciliation and atomically replaces its saved cursor before
+resuming replay. Protocol v4 requires the Go bridge and Rust sidecar to be
+upgraded together.
+
+Dialog reconciliation uses stable chat-ID keyset pagination and persists its
+next cursor in login metadata. Activity reordering cannot skip rows, and large
+accounts resume from the last completed page after restart or RPC-budget yield.
+Delivered message IDs are also persisted monotonically in portal metadata.
+
+Permanent media projection failures (invalid schemes, reviewed terminal 4xx,
+or the configured size ceiling) produce a stable Matrix unavailable notice and
+allow the lossless cursor to continue. Timeouts, 429, and 5xx remain retryable.
+
+### Hidden Inline dialogs
+
+The network config defaults `hidden_dialogs` to `exclude`. Dialogs whose Inline
+state has `showInChatList: false` remain in the durable Rust cache but do not
+create Matrix portals, fill history, or project inbound events. This reduces
+reply-thread and other hidden-dialog noise without putting bridge policy in the
+generic Inline client.
+
+Each login can override the operator default through the bridge bot:
+
+```text
+inline-settings
+inline-hidden-chats exclude
+inline-hidden-chats include
+inline-hidden-chats default
+```
+
+The override is stored in user-login metadata. Changing it resets the stable
+dialog scan and reconnects the Go event loops so newly included dialogs are
+reconciled. Excluding a dialog is non-destructive: an existing Matrix room is
+not left or deleted automatically, but new Inline events for the hidden dialog
+are no longer projected. If the Inline dialog later becomes visible, normal
+reconciliation resumes and fills its missing history from durable state.
+
 ## Backups
 
 Stop the bridge before making filesystem-level backups.
@@ -127,9 +173,13 @@ When upgrading from the initial PoC release, do not remove
 imports the legacy credential into the matching per-account store. Existing
 login metadata with an older recovery version automatically triggers one live
 dialog refresh followed by durable chat, message, deletion, reaction, read,
-membership, and previously unavailable media reconciliation. The recovery
-version is persisted only after mautrix accepts the reconciliation, so an
-interrupted upgrade retries safely.
+membership, and previously unavailable media reconciliation. Recovery is split
+into bounded RPC passes, throttles group-member requests, and persists the last
+completed chat ID. Chat cold repair owns the current snapshot and latest 50
+messages; older history is streamed separately from the Matrix delivery
+checkpoint instead of being downloaded in one unbounded account walk. The
+recovery version is persisted only after mautrix accepts the complete
+reconciliation, so an interrupted upgrade resumes safely.
 Look for `Completed one-time Inline bridge state recovery` before declaring the
 upgrade healthy.
 

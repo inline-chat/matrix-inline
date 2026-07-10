@@ -16,7 +16,7 @@ use inline_client::{
 use serde::{Deserialize, Serialize};
 
 /// Current bridge adapter command/event protocol version.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Version metadata returned by health/status endpoints.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,8 @@ pub struct ProtocolInfo {
     pub protocol_version: u16,
     /// Linked `inline-client` crate version.
     pub client_version: String,
+    /// Lossless server/client sync schema implemented by this build.
+    pub core_sync_schema_revision: u32,
 }
 
 impl ProtocolInfo {
@@ -33,6 +35,7 @@ impl ProtocolInfo {
         Self {
             protocol_version: PROTOCOL_VERSION,
             client_version: inline_client::VERSION.to_owned(),
+            core_sync_schema_revision: inline_client::CORE_SYNC_SCHEMA_REVISION,
         }
     }
 }
@@ -46,6 +49,8 @@ pub struct SidecarHealth {
     pub protocol: ProtocolInfo,
     /// Current observed Inline client status.
     pub status: ClientStatus,
+    /// Durable adapter event-log generation for the selected namespace.
+    pub event_generation: String,
 }
 
 /// Status snapshot exposed through the bridge adapter protocol.
@@ -429,6 +434,10 @@ pub struct SidecarEventEnvelope {
     pub protocol_version: u16,
     /// Account/store namespace that owns this event sequence.
     pub session_namespace: String,
+    /// Durable adapter event-log generation. Sequence numbers are meaningful
+    /// only within this generation.
+    #[serde(default)]
+    pub generation: String,
     /// Optional monotonically increasing adapter-local sequence.
     pub sequence: Option<u64>,
     /// Event delivery reliability class.
@@ -443,6 +452,7 @@ impl fmt::Debug for SidecarEventEnvelope {
             .debug_struct("SidecarEventEnvelope")
             .field("protocol_version", &self.protocol_version)
             .field("session_namespace", &"[redacted]")
+            .field("generation", &self.generation)
             .field("sequence", &self.sequence)
             .field("reliability", &self.reliability)
             .field("event", &self.event)
@@ -456,6 +466,7 @@ impl SidecarEventEnvelope {
         Self {
             protocol_version: PROTOCOL_VERSION,
             session_namespace: String::new(),
+            generation: String::new(),
             sequence: None,
             reliability: event.reliability(),
             event,
@@ -471,6 +482,12 @@ impl SidecarEventEnvelope {
     /// Sets the account/store namespace for replay isolation.
     pub fn with_session_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.session_namespace = namespace.into();
+        self
+    }
+
+    /// Sets the durable event-log generation.
+    pub fn with_generation(mut self, generation: impl Into<String>) -> Self {
+        self.generation = generation.into();
         self
     }
 }
