@@ -183,6 +183,11 @@ reconciliation, so an interrupted upgrade resumes safely.
 Look for `Completed one-time Inline bridge state recovery` before declaring the
 upgrade healthy.
 
+For the server sync-metadata transition, upgrade to `v0.2.2` or newer before
+deploying a server that omits `core_sync_schema_revision`. The sidecar continues
+to validate explicit sequence accounting and page structure; the health field
+with that name is informational and retained only for protocol-v4 compatibility.
+
 Docker image updates:
 
 ```sh
