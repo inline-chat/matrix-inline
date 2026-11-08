@@ -641,14 +641,6 @@ func TestMatrixChatManagementCallsSidecar(t *testing.T) {
 			if request.ChatID != 7 || request.UserID != 42 {
 				t.Fatalf("add participant request = %#v, want chat 7 user 42", request)
 			}
-		case "/rpc/chat/participants/remove":
-			var request sidecar.RemoveChatParticipantRequest
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Fatalf("decode remove participant request: %v", err)
-			}
-			if request.ChatID != 7 || request.UserID != 42 {
-				t.Fatalf("remove participant request = %#v, want chat 7 user 42", request)
-			}
 		case "/rpc/chat/delete":
 			var request sidecar.DeleteChatRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -696,7 +688,7 @@ func TestMatrixChatManagementCallsSidecar(t *testing.T) {
 	}
 
 	ghost := &bridgev2.Ghost{Ghost: &database.Ghost{ID: makeUserID("42")}}
-	for _, change := range []bridgev2.MembershipChangeType{bridgev2.Invite, bridgev2.Kick} {
+	for _, change := range []bridgev2.MembershipChangeType{bridgev2.Invite} {
 		if _, err := ic.HandleMatrixMembership(context.Background(), &bridgev2.MatrixMembershipChange{
 			MatrixRoomMeta: bridgev2.MatrixRoomMeta[*event.MemberEventContent]{
 				MatrixEventBase: bridgev2.MatrixEventBase[*event.MemberEventContent]{Portal: portal},
@@ -705,6 +697,18 @@ func TestMatrixChatManagementCallsSidecar(t *testing.T) {
 			Type:   change,
 		}); err != nil {
 			t.Fatalf("HandleMatrixMembership(%v) error = %v", change, err)
+		}
+	}
+	for _, change := range []bridgev2.MembershipChangeType{bridgev2.Kick, bridgev2.RevokeInvite} {
+		_, err := ic.HandleMatrixMembership(context.Background(), &bridgev2.MatrixMembershipChange{
+			MatrixRoomMeta: bridgev2.MatrixRoomMeta[*event.MemberEventContent]{
+				MatrixEventBase: bridgev2.MatrixEventBase[*event.MemberEventContent]{Portal: portal},
+			},
+			Target: ghost,
+			Type:   change,
+		})
+		if !errors.Is(err, bridgev2.ErrMembershipNotSupported) {
+			t.Fatalf("HandleMatrixMembership(%v) error = %v, want unsupported", change, err)
 		}
 	}
 	if err := ic.HandleMatrixDeleteChat(context.Background(), &bridgev2.MatrixDeleteChat{

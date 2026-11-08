@@ -786,10 +786,10 @@ func (ic *InlineClient) HandleMatrixMembership(ctx context.Context, msg *bridgev
 			UserID: userID,
 		})
 	case bridgev2.Kick, bridgev2.RevokeInvite:
-		err = ic.Sidecar.RemoveChatParticipant(ctx, sidecar.RemoveChatParticipantRequest{
-			ChatID: chatID,
-			UserID: userID,
-		})
+		// Removing a direct participant does not prove group or public-space
+		// access was removed. Do not report a Matrix kick as successful until
+		// the source can establish the target's effective access afterward.
+		return nil, fmt.Errorf("%w: Inline cannot verify that all access was removed", bridgev2.ErrMembershipNotSupported)
 	case bridgev2.AcceptInvite, bridgev2.ProfileChange:
 		return &bridgev2.MatrixMembershipResult{}, nil
 	default:

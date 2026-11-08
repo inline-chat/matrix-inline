@@ -120,6 +120,10 @@ Permanent media projection failures (invalid schemes, reviewed terminal 4xx,
 or the configured size ceiling) produce a stable Matrix unavailable notice and
 allow the lossless cursor to continue. Timeouts, 429, and 5xx remain retryable.
 
+Matrix kicks and invite revocations are unsupported because removing a direct
+participant may leave access through a group or public workspace. The bridge
+does not claim the user lost access when it cannot verify that result.
+
 ### Hidden Inline dialogs
 
 The network config defaults `hidden_dialogs` to `exclude`. Dialogs whose Inline
