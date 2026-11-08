@@ -81,8 +81,9 @@ type MessageMetadata struct {
 }
 
 type PortalMetadata struct {
-	HistoryCheckpoint    int64 `json:"history_checkpoint,omitempty"`
-	HistoricalCheckpoint int64 `json:"historical_checkpoint,omitempty"`
+	InlineTopic          *sourceTopicState `json:"inline_topic,omitempty"`
+	HistoryCheckpoint    int64             `json:"history_checkpoint,omitempty"`
+	HistoricalCheckpoint int64             `json:"historical_checkpoint,omitempty"`
 }
 
 func (meta *PortalMetadata) CopyFrom(other any) {

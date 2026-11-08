@@ -167,6 +167,31 @@ and no explicit participants. A true group DM is unsupported. Current Inline
 permission errors remain authoritative; cached membership or role information
 does not grant permission to create or manage a channel.
 
+### Separate reply-child context
+
+Eligible reply-child conversations keep their own room, message IDs, history
+and access boundaries. Their topics retain readable source parent context and,
+when the parent message already has a mapping for this login, a parent backlink.
+Missing or deleted roots keep the source chat/message reference. Context is
+written only inside the child; it does not publish private child details in the
+parent. The default hidden-dialog policy still excludes hidden children.
+
+Source channel descriptions can populate empty or connector-owned Matrix topics;
+later user topics are preserved. This read-side projection does not enable topic
+editing or generate DM topics. Temporary parent-mapping database errors retain
+existing child context; conclusive missing mappings retain readable native IDs.
+
+Generated topics use a durable pending-intent journal. An authoritative detach
+retracts only connector-owned context after Matrix state comparison/readback;
+unknown descriptors, later user edits and legacy unowned topics are preserved.
+Topic replacement requires a controlled window: Matrix state comparison is not
+an atomic compare-and-swap with concurrent user edits.
+
+Matrix thread routing and native child creation are unsupported. Thread history
+requests fail explicitly, and a parent chat's message ID cannot be sent as a
+child-local reply ID. No audience/history equivalence or thread flattening is
+assumed.
+
 ### Hidden Inline dialogs
 
 The network config defaults `hidden_dialogs` to `exclude`. Dialogs whose Inline

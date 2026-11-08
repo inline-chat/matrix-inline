@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"github.com/rs/zerolog"
 	"reflect"
 
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
@@ -71,6 +72,9 @@ func (ic *InlineClient) chatInfoForDialog(ctx context.Context, d sidecar.DialogR
 	// Parent correction uses the connector journal in the serialized portal lane.
 	// The framework's ParentID path retains cached parents on detach in v0.28.
 	info.ExtraUpdates = func(ctx context.Context, p *bridgev2.Portal) bool {
+		if err := ic.reconcileSourceTopic(ctx, p, d); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Source topic projection remains pending")
+		}
 		ic.projectDialogInLane(ctx, p, d)
 		return false
 	}

@@ -412,6 +412,9 @@ func (ic *InlineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.M
 			WithSendNotice(true).
 			WithErrorReason(event.MessageStatusUnsupported)
 	}
+	if err := validateInlineReplyTarget(msg, chatID); err != nil {
+		return nil, bridgev2.WrapErrorInStatus(err).WithErrorAsMessage().WithIsCertain(true).WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
+	}
 
 	switch effectiveMatrixMessageType(msg.Content) {
 	case event.MsgText:
@@ -1559,7 +1562,7 @@ func rateLimitRetryDelay(err error, fallback time.Duration) time.Duration {
 
 func (ic *InlineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	if params.ThreadRoot != "" {
-		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
+		return nil, fmt.Errorf("Inline Matrix thread history is unsupported; use the separate child conversation: %w", bridgev2.ErrUnsupportedMessageType)
 	}
 
 	chat, err := chatIDFromPortal(params.Portal)

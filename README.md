@@ -27,6 +27,7 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] DM creation using accessible Inline IDs or canonical usernames
 - [x] Bounded accessible-user search and explicit private/public channel creation
 - [x] Caption edits that retain existing media and reject file replacements
+- [x] Separate reply-child rooms with source parent context
 - [x] Add Inline thread participants from Matrix invitations
 - [ ] Remove Inline thread access from Matrix kicks or invite revocations
 - [x] Rename Inline threads from Matrix
@@ -52,7 +53,8 @@ genuine private user receipts are not forwarded by the pinned framework.
 See [operations](docs/operations.md#notification-and-read-state-limits) for these
 limits and the explicit preview/apply/rollback migration commands.
 The operations guide also describes [rich messages and media](docs/operations.md#rich-messages-and-media),
-[accessible-user lookup](docs/operations.md#accessible-people-and-channel-creation).
+[accessible-user lookup](docs/operations.md#accessible-people-and-channel-creation),
+and [separate child context](docs/operations.md#separate-reply-child-context).
 
 ## Requirements
 
