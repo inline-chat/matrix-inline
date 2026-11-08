@@ -22,11 +22,15 @@ type sourceTopicState struct {
 	UserOwned bool               `json:"user_owned,omitempty"`
 }
 
+func (ic *InlineClient) topicProjectionEligible(d sidecar.DialogRecord) bool {
+	return classifyDialog(d) != roomUnknown && ic.shouldProjectDialog(d)
+}
+
 // All writes run in the existing serialized portal lane. Intent is durable
 // before a topic write, and observed state is read back before ownership moves.
 // Matrix offers no atomic CAS: this retains the controlled-window limitation.
 func (ic *InlineClient) reconcileSourceTopic(ctx context.Context, p *bridgev2.Portal, d sidecar.DialogRecord) error {
-	if classifyDialog(d) == roomUnknown || !ic.shouldProjectDialog(d) {
+	if !ic.topicProjectionEligible(d) {
 		return nil
 	}
 	meta, ok := p.Metadata.(*PortalMetadata)
