@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -111,6 +112,32 @@ func TestMediaFidelityRealMatrixDownloadRejectsOversizeBeforeSpooling(t *testing
 	if err == nil || !isPermanentMediaFailure(err) {
 		t.Fatalf("oversize Matrix response was spooled or accepted instead of rejected at headers: %v", err)
 	}
+}
+
+func TestMediaFidelityMatrixDownloadAcceptsExactLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(maxInlineMediaDownload))
+		_, _ = io.CopyN(w, zeroMediaReader{}, int64(maxInlineMediaDownload))
+	}))
+	defer server.Close()
+	client, err := mautrix.NewClient(server.URL, "@fixture:test", "synthetic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := &matrix.ASIntent{Matrix: &appservice.IntentAPI{Client: client}}
+	data, err := downloadBoundedMatrixMedia(t.Context(), raw, &event.MessageEventContent{
+		URL: "mxc://fixture/file", Info: &event.FileInfo{Size: maxInlineMediaDownload},
+	})
+	if err != nil || len(data) != maxInlineMediaDownload {
+		t.Fatalf("exact-limit Matrix media: bytes=%d error=%v", len(data), err)
+	}
+}
+
+type zeroMediaReader struct{}
+
+func (zeroMediaReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }
 
 func TestMediaFidelityRealMatrixEncryptedDownloadVerifiesHash(t *testing.T) {
@@ -230,6 +257,44 @@ func TestMediaFidelityConflictingMimeUsesFileFallback(t *testing.T) {
 		if got := inlineMediaMessageType(c); got != event.MsgFile {
 			t.Fatalf("conflicting media %s/%s became %s", c.Kind, *c.MimeType, got)
 		}
+	}
+}
+
+func TestMediaFidelityPhotoWithConflictingMIMEAndExtension(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("synthetic media"))
+	}))
+	defer server.Close()
+	content := sidecar.MessageContent{
+		Type: "media", Kind: "photo", URL: server.URL,
+		FileName: stringPtr("image.png"), MimeType: stringPtr("video/mp4"),
+	}
+	intent := &richMediaIntent{}
+	converted, err := convertInlineMessage(t.Context(), testPortal("7"), intent, sidecar.MessageRecord{Content: content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgFile ||
+		converted.Parts[0].Content.FileName != "image.png" || converted.Parts[0].Content.Info.MimeType != "video/mp4" || intent.uploads != 1 {
+		t.Fatalf("conflicting photo MIME/extension was not preserved as a file: %+v", converted.Parts)
+	}
+}
+
+// Photo is the only source-backed image representation exposed to the bridge;
+// the client record does not distinguish photo-backed stickers from photos.
+func TestMediaFidelityPhotoBackedImageFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("synthetic image"))
+	}))
+	defer server.Close()
+	intent := &richMediaIntent{}
+	content := sidecar.MessageContent{Type: "media", Kind: "photo", URL: server.URL, MimeType: stringPtr("image/webp")}
+	converted, err := convertInlineMessage(t.Context(), testPortal("7"), intent, sidecar.MessageRecord{Content: content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgImage || intent.uploads != 1 {
+		t.Fatalf("photo-backed image did not project as an image: %+v", converted.Parts)
 	}
 }
 
