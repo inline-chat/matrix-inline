@@ -143,6 +143,30 @@ explicit unsupported error. Replacing a file through an edit is unsupported. Old
 saved media identity reject caption edits rather than silently ignoring a file
 replacement.
 
+### Accessible people and channel creation
+
+User lookup accepts exact positive IDs and canonical usernames from this
+login's accessible directory. Search returns a bounded subset, not a global
+directory. Cached users alone do not prove access. Bounded or ambiguous username
+results return an error rather than selecting an arbitrary person. Email and
+phone lookup are unsupported. A missed exact ID in a truncated refresh also
+returns an incomplete-result error; a known exact ID remains usable.
+
+Peers known only through hidden or deleted conversations are excluded from
+directory discovery. This is an eligibility limit, not a claim that a hidden
+peer is unreachable or that Inline denied permission. The hidden-dialog
+`include` setting changes room projection, not this directory policy. An
+independent accessible-workspace member or successful live participant read
+can still make the same peer discoverable. Restore source discovery before
+starting a DM from Matrix when no eligible entry exists.
+
+`thread` and `private_thread` create ordinary private Inline channels, with
+explicit accessible participants. An optional parent must identify an accessible
+workspace for the same login. `public_thread` requires that workspace parent
+and no explicit participants. A true group DM is unsupported. Current Inline
+permission errors remain authoritative; cached membership or role information
+does not grant permission to create or manage a channel.
+
 ### Hidden Inline dialogs
 
 The network config defaults `hidden_dialogs` to `exclude`. Dialogs whose Inline

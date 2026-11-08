@@ -143,14 +143,14 @@ func (ic *InlineConnector) GetBridgeInfoVersion() (info, capabilities int) {
 }
 
 func (ic *InlineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
-	return &bridgev2.NetworkGeneralCapabilities{
+	caps := &bridgev2.NetworkGeneralCapabilities{
 		AggressiveUpdateInfo: true,
 		ImplicitReadReceipts: false,
 		Provisioning: bridgev2.ProvisioningCapabilities{
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
-				LookupUsername: false,
-				Search:         false,
-				ContactList:    false,
+				LookupUsername: true,
+				Search:         true,
+				ContactList:    false, // Bounded discovery is not a complete contacts snapshot.
 				CreateDM:       true,
 			},
 			GroupCreation: map[string]bridgev2.GroupTypeCapabilities{
@@ -173,6 +173,21 @@ func (ic *InlineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilitie
 			},
 		},
 	}
+	private := caps.Provisioning.GroupCreation["thread"]
+	private.TypeDescription = "Private Inline channel (home or workspace)"
+	private.Name.Required = false
+	private.Topic.Allowed = true
+	private.Parent.Allowed = true
+	private.Participants.Required = true
+	private.Participants.MinLength = 1
+	caps.Provisioning.GroupCreation["thread"] = private
+	caps.Provisioning.GroupCreation["private_thread"] = private
+	public := private
+	public.TypeDescription = "Public Inline workspace channel"
+	public.Parent.Required = true
+	public.Participants = bridgev2.GroupFieldCapability{}
+	caps.Provisioning.GroupCreation["public_thread"] = public
+	return caps
 }
 
 func (ic *InlineConnector) GetName() bridgev2.BridgeName {

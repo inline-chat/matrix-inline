@@ -335,13 +335,19 @@ func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Po
 }
 
 func (ic *InlineClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
-	userID, err := parseInlineUserID(identifier)
+	directory, err := ic.loadDirectory(ctx)
 	if err != nil {
 		return nil, err
 	}
+	user, err := directory.resolve(identifier)
+	if err != nil {
+		return nil, err
+	}
+	userID := user.Record.UserID
+	ic.cacheUsers([]sidecar.UserRecord{user.Record})
 	resp := &bridgev2.ResolveIdentifierResponse{
 		UserID:   makeUserID(strconv.FormatInt(userID, 10)),
-		UserInfo: ic.userInfoForID(userID),
+		UserInfo: userInfoFromRecord(user.Record),
 	}
 	if createChat {
 		chat, err := ic.createDMWithUserID(ctx, userID)
@@ -357,45 +363,41 @@ func (ic *InlineClient) CreateChatWithGhost(ctx context.Context, ghost *bridgev2
 	if ghost == nil {
 		return nil, fmt.Errorf("missing Inline ghost")
 	}
-	userID, err := parseInlineUserID(string(ghost.ID))
+	resolved, err := ic.ResolveIdentifier(ctx, string(ghost.ID), true)
 	if err != nil {
 		return nil, err
 	}
-	return ic.createDMWithUserID(ctx, userID)
+	return resolved.Chat, nil
 }
 
 func (ic *InlineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCreateParams) (*bridgev2.CreateChatResponse, error) {
-	if params == nil {
-		return nil, fmt.Errorf("missing Inline group create params")
+	directory, err := ic.loadDirectory(ctx)
+	if err != nil {
+		return nil, err
 	}
-	var title *string
-	if params.Name != nil {
-		title = optionalString(params.Name.Name)
+	request, participantIDs, err := validateThreadCreation(params, ic.UserLogin.ID, directory)
+	if err != nil {
+		return nil, err
 	}
-	var description *string
-	if params.Topic != nil {
-		description = optionalString(params.Topic.Topic)
+	if ic.Sidecar.SessionNamespace != directory.namespace {
+		return nil, fmt.Errorf("Inline login changed during creation")
 	}
-	participants := make([]sidecar.ChatCreateParticipant, 0, len(params.Participants))
-	participantIDs := make([]networkid.UserID, 0, len(params.Participants)+1)
-	for _, participant := range params.Participants {
-		userID, err := parseInlineUserID(string(participant))
-		if err != nil {
-			return nil, fmt.Errorf("invalid Inline participant %q: %w", participant, err)
-		}
-		participants = append(participants, sidecar.ChatCreateParticipant{UserID: userID})
-		participantIDs = append(participantIDs, makeUserID(strconv.FormatInt(userID, 10)))
-	}
-	chat, err := ic.Sidecar.CreateThread(ctx, sidecar.CreateThreadRequest{
-		Title:        title,
-		Description:  description,
-		IsPublic:     false,
-		Participants: participants,
-	})
+	chat, err := ic.Sidecar.CreateThread(ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("Inline sidecar create thread failed: %w", err)
 	}
-	return ic.createChatResponse(ctx, chat, ic.chatInfoForCreatedChat(ctx, chat, participantIDs)), nil
+	for _, participant := range request.Participants {
+		ic.cacheUsers([]sidecar.UserRecord{directory.users[participant.UserID].Record})
+	}
+	info := ic.chatInfoForCreatedChat(ctx, chat, participantIDs)
+	kind := database.RoomTypeDefault
+	info.Type = &kind
+	info.Members.OtherUserID = ""
+	info.Members.IsFull = false
+	if chat != nil {
+		ic.rememberDialog(sidecar.DialogRecord{ChatID: chat.ChatID, Title: chat.Title, SpaceID: request.SpaceID, Structure: &sidecar.DialogStructure{Kind: "channel", SpaceID: request.SpaceID}})
+	}
+	return ic.createChatResponse(ctx, chat, info), nil
 }
 
 func (ic *InlineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {

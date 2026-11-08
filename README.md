@@ -24,8 +24,8 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Inline member list sync for bridged rooms
 - [x] Matrix ghosts with Inline display names and avatars when available
 - [x] Configurable bridge bot and network profile metadata
-- [x] DM creation with a numeric Inline user ID
-- [x] Basic group/thread creation from Matrix
+- [x] DM creation using accessible Inline IDs or canonical usernames
+- [x] Bounded accessible-user search and explicit private/public channel creation
 - [x] Caption edits that retain existing media and reject file replacements
 - [x] Add Inline thread participants from Matrix invitations
 - [ ] Remove Inline thread access from Matrix kicks or invite revocations
@@ -33,7 +33,6 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Explicit Inline thread deletion from Beeper/Matrix
 - [x] Account-scoped workspace Spaces and in-place presentation migration
 - [x] Management commands for status, settings, and reconnect
-- [ ] Contact search for DM creation
 - [ ] New Inline account signup or invite-code onboarding
 - [ ] Matrix-native thread UI for Inline reply-thread chats
 - [ ] Pins and Inline link-preview projection
@@ -52,7 +51,8 @@ verified private receipt/fully-read prefix and never crosses an unmapped event;
 genuine private user receipts are not forwarded by the pinned framework.
 See [operations](docs/operations.md#notification-and-read-state-limits) for these
 limits and the explicit preview/apply/rollback migration commands.
-The operations guide also describes [rich messages and media](docs/operations.md#rich-messages-and-media).
+The operations guide also describes [rich messages and media](docs/operations.md#rich-messages-and-media),
+[accessible-user lookup](docs/operations.md#accessible-people-and-channel-creation).
 
 ## Requirements
 

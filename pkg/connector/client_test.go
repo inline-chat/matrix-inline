@@ -437,7 +437,16 @@ func TestChatInfoForDialogIncludesSelfForGroupWithoutParticipantFetch(t *testing
 }
 
 func TestResolveIdentifierCreatesDM(t *testing.T) {
+	peerID := int64(42)
 	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rpc/dialogs" {
+			writeConnectorSidecarResult(t, w, "dialogs", sidecar.DialogsPage{Dialogs: []sidecar.DialogRecord{{ChatID: 7, Structure: &sidecar.DialogStructure{Kind: "direct", PeerUserID: &peerID}}}, Users: []sidecar.UserRecord{{UserID: 42, DisplayName: stringPtr("Ada Lovelace")}}})
+			return
+		}
+		if r.URL.Path == "/rpc/state/account" {
+			writeConnectorSidecarResult(t, w, "account_state", sidecar.AccountStateSnapshot{})
+			return
+		}
 		if r.URL.Path != "/rpc/chat/create-dm" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -458,7 +467,7 @@ func TestResolveIdentifierCreatesDM(t *testing.T) {
 	ic := &InlineClient{
 		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: networkid.UserLoginID("1")}},
 		AccountID: "1",
-		Sidecar:   sidecar.NewClient(server.URL),
+		Sidecar:   sidecar.NewClient(server.URL).WithSessionNamespace("fixture"),
 		users:     make(map[int64]sidecar.UserRecord),
 	}
 	ic.cacheUsers([]sidecar.UserRecord{{
