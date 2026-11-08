@@ -365,6 +365,9 @@ func (ic *InlineClient) CreateChatWithGhost(ctx context.Context, ghost *bridgev2
 	}
 	resolved, err := ic.ResolveIdentifier(ctx, string(ghost.ID), true)
 	if err != nil {
+		if _, valid := directoryPositiveID(string(ghost.ID)); valid && (errors.Is(err, errDirectoryNotFound) || errors.Is(err, errDirectoryIncomplete)) {
+			return nil, fmt.Errorf("%w: %w", bridgev2.ErrResolveIdentifierTryNext, err)
+		}
 		return nil, err
 	}
 	return resolved.Chat, nil

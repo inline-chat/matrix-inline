@@ -29,6 +29,39 @@ func TestDirectoryIntegratedLookupRejectsUnrelatedCachedUsers(t *testing.T) {
 	}
 }
 
+func TestDirectoryGhostInviteTriesAnotherLoginAfterMiss(t *testing.T) {
+	var creates []string
+	s := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ns := r.Header.Get("X-Inline-Session-Namespace")
+		switch r.URL.Path {
+		case "/rpc/dialogs":
+			page := sidecar.DialogsPage{}
+			if ns == "b" {
+				page = sidecar.DialogsPage{Dialogs: []sidecar.DialogRecord{{ChatID: 7, Structure: &sidecar.DialogStructure{Kind: "direct", PeerUserID: dirPtr(int64(42))}}}, Users: []sidecar.UserRecord{dirUser(42, "ada")}}
+			}
+			writeConnectorSidecarResult(t, w, "dialogs", page)
+		case "/rpc/state/account":
+			writeConnectorSidecarResult(t, w, "account_state", sidecar.AccountStateSnapshot{})
+		case "/rpc/chat/create-dm":
+			creates = append(creates, ns)
+			writeConnectorSidecarResult(t, w, "created_chat", sidecar.CreatedChat{ChatID: 7})
+		default:
+			t.Errorf("unexpected RPC %s", r.URL.Path)
+			http.Error(w, "unexpected", 500)
+		}
+	}))
+	defer s.Close()
+	ghost := &bridgev2.Ghost{Ghost: &database.Ghost{ID: "42"}}
+	_, err := directoryClient(s.URL, "a").CreateChatWithGhost(t.Context(), ghost)
+	if !errors.Is(err, bridgev2.ErrResolveIdentifierTryNext) || !errors.Is(err, errDirectoryNotFound) {
+		t.Fatalf("first login should allow retry with directory diagnostic: %v", err)
+	}
+	chat, err := directoryClient(s.URL, "b").CreateChatWithGhost(t.Context(), ghost)
+	if err != nil || chat == nil || len(creates) != 1 || creates[0] != "b" {
+		t.Fatalf("second login did not create the DM: chat=%+v err=%v creates=%v", chat, err, creates)
+	}
+}
+
 func TestDirectoryIntegratedCreatePreflightAndCurrentPermission(t *testing.T) {
 	mutations := 0
 	var last sidecar.CreateThreadRequest
