@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: inline-chat/inline
-          ref: f8425fb828a78b84079ab14134a772b96e7517f2
+          ref: 9ef08fff242d92db9a9a92c78620ff749ef7117b
           path: inline-public
 
       - name: Set build time
