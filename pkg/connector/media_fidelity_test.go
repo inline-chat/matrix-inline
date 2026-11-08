@@ -114,6 +114,37 @@ func TestMediaFidelityRealMatrixDownloadRejectsOversizeBeforeSpooling(t *testing
 	}
 }
 
+func TestMediaFidelityMatrixDownloadClassifiesHTTPFailures(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		permanent bool
+	}{
+		{http.StatusNotFound, true},
+		{http.StatusRequestTimeout, false},
+		{http.StatusTooEarly, false},
+		{http.StatusTooManyRequests, false},
+		{http.StatusServiceUnavailable, false},
+	} {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"errcode":"M_UNKNOWN","error":"synthetic failure"}`))
+			}))
+			defer server.Close()
+			client, err := mautrix.NewClient(server.URL, "@fixture:test", "synthetic")
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw := &matrix.ASIntent{Matrix: &appservice.IntentAPI{Client: client}}
+			_, err = downloadBoundedMatrixMedia(t.Context(), raw, &event.MessageEventContent{URL: "mxc://fixture/file"})
+			if err == nil || isPermanentMediaFailure(err) != tc.permanent {
+				t.Fatalf("HTTP %d: error=%v, want permanent=%t", tc.status, err, tc.permanent)
+			}
+		})
+	}
+}
+
 func TestMediaFidelityMatrixDownloadAcceptsExactLimit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(maxInlineMediaDownload))
