@@ -136,7 +136,8 @@ func TestRichMessageReplyFallbackPreservesReplyTarget(t *testing.T) {
 	ic := richClient()
 	ic.Sidecar = sidecar.NewClient(s.URL)
 	content := &event.MessageEventContent{MsgType: event.MsgText, Body: "> quoted\n\nreply 😀", Format: event.FormatHTML, FormattedBody: "<mx-reply><blockquote>quoted</blockquote></mx-reply>reply <b>😀</b>"}
-	msg := &bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{Portal: testPortal("7"), Content: content}, ReplyTo: &database.Message{ID: "7/10"}}
+	portal := testPortal("7")
+	msg := &bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{Portal: portal, Content: content}, ReplyTo: &database.Message{ID: "7/10", Room: portal.PortalKey}}
 	if _, err := ic.HandleMatrixMessage(t.Context(), msg); err != nil {
 		t.Fatal(err)
 	}
