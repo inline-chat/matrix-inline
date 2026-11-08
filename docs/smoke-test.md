@@ -21,9 +21,9 @@ catch-up and realtime delivery after reconnecting an existing login.
 For an installed bridge:
 
 ```sh
-curl -fsS http://127.0.0.1:29342/health | jq .
-curl -fsS http://127.0.0.1:29342/status | jq .
-curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" http://127.0.0.1:29342/health | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" http://127.0.0.1:29342/status | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST http://127.0.0.1:29342/rpc/resume | jq .
 ```
 
 Expected adapter states:

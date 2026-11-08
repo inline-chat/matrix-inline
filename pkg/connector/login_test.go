@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -30,7 +29,7 @@ func TestNewLoginStoreNamespaceIsSafeAndUnique(t *testing.T) {
 }
 
 func TestInlineCodeLoginStartsEmailCodeFlow(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/auth/start" {
 			t.Fatalf("path = %s, want /rpc/auth/start", r.URL.Path)
 		}
@@ -82,7 +81,7 @@ func TestInlineCodeLoginStartsEmailCodeFlow(t *testing.T) {
 }
 
 func TestInlineCodeLoginDefersInviteSignup(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeLoginRPCResult(t, w, "auth_start", sidecar.AuthStartResult{
 			NeedsInviteCode: true,
 		})

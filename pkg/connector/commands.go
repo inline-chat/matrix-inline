@@ -62,7 +62,7 @@ func registerInlineCommands(bridge *bridgev2.Bridge) {
 		bridge.Log.Warn().Msg("Bridge command processor does not support custom Inline commands")
 		return
 	}
-	processor.AddHandlers(commandInlineStatus, commandInlineReconnect, commandInlineSettings, commandInlineHiddenChats)
+	processor.AddHandlers(commandInlineStatus, commandInlineReconnect, commandInlineSettings, commandInlineHiddenChats, commandInlineMigrate, commandInlineChannelDefault)
 }
 
 func fnInlineStatus(ce *commands.Event) {
@@ -152,12 +152,13 @@ func inlineSettingsSummary(client *InlineClient) string {
 	if overrideLabel == "" {
 		overrideLabel = "default"
 	}
+	muteDefault, muteOverride, muteEffective := client.channelMuteSettings()
 	return fmt.Sprintf(
 		"Inline settings\n\n- Hidden chats: `%s`\n- Account override: `%s`\n- Bridge default: `%s`\n\nHidden chats are Inline dialogs with `showInChatList: false`. Excluding them prevents new Matrix portal creation, history fill, and inbound event projection. Existing Matrix rooms are not deleted.",
 		effective,
 		overrideLabel,
 		defaults,
-	)
+	) + fmt.Sprintf("\n\nDesired channel mute default: `%s` (bridge `%s`, account `%s`); automatic writes disabled. ", muteEffective, muteDefault, muteOverride) + notificationPolicyDegraded + ". Set Beeper Settings → Accounts → Inline → Show in All Inbox to DMs only; mute and Low Priority are separate user choices. Presentation version: 1. Manual unread projection remains pending until origin-safe transport is proven."
 }
 
 func inlineCommandLogin(ce *commands.Event) (*bridgev2.UserLogin, *InlineClient) {
@@ -195,6 +196,8 @@ func inlineStatusSummary(login *bridgev2.UserLogin, client *InlineClient, curren
 	if client != nil {
 		fmt.Fprintf(&out, "- Account ID: `%s`\n", client.AccountID)
 		fmt.Fprintf(&out, "- Go client logged in: `%t`\n", client.IsLoggedIn())
+		fmt.Fprintf(&out, "- Notification policy: %s\n", notificationPolicyDegraded)
+		out.WriteString(client.projectionStatus(context.Background()))
 	}
 	if err != nil {
 		fmt.Fprintf(&out, "- Sidecar: check failed: `%v`\n", err)
@@ -212,4 +215,23 @@ func inlineStatusSummary(login *bridgev2.UserLogin, client *InlineClient, curren
 		fmt.Fprintf(&out, "- Last failure: `%s`: %s\n", current.Failure.Category, current.Failure.Message)
 	}
 	return out.String()
+}
+
+var commandInlineMigrate = &commands.FullHandler{
+	Func: fnInlineMigrate, Name: "inline-migrate", RequiresLogin: true,
+	Help: commands.HelpMeta{Section: commands.HelpSectionMisc, Description: "Preview or repair selected existing Inline rooms in place", Args: "[preview|apply|rollback] <chat-id...>"},
+}
+
+func fnInlineMigrate(ce *commands.Event) {
+	_, client := inlineCommandLogin(ce)
+	if client == nil {
+		ce.Reply("Your default login is not an Inline login.")
+		return
+	}
+	mode, ids, err := parseMigrationCommand(ce.Args)
+	if err != nil {
+		ce.Reply("Usage: `$cmdprefix inline-migrate [preview|apply|rollback] <chat-id...>`\n\n%s", err)
+		return
+	}
+	ce.Reply(client.migrateSelected(ce.Ctx, mode, ids))
 }

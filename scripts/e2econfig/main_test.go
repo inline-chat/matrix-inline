@@ -41,6 +41,7 @@ func TestPatchBridgeConfigSetsLocalE2EFields(t *testing.T) {
 	assertPath(t, doc, "appservice.bot.avatar", "")
 	assertPath(t, doc, "bridge.permissions.localhost", "user")
 	assertPath(t, doc, "bridge.permissions.@alice:localhost", "admin")
+	assertPath(t, doc, "backfill.enabled", "true")
 }
 
 func TestPatchSynapseConfigSetsRegistrationAndLocalRegistration(t *testing.T) {
@@ -58,6 +59,8 @@ func TestPatchSynapseConfigSetsRegistrationAndLocalRegistration(t *testing.T) {
 	assertPath(t, doc, "registration_shared_secret", "local-secret")
 	assertPath(t, doc, "report_stats", "false")
 	assertPath(t, doc, "suppress_key_server_warning", "true")
+	assertPath(t, doc, "rc_login.address.burst_count", "100")
+	assertPath(t, doc, "rc_login.account.per_second", "10")
 
 	files, ok := doc["app_service_config_files"].([]any)
 	if !ok || len(files) != 1 || files[0] != "/data/matrix-inline-registration.yaml" {

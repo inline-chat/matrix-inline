@@ -8,7 +8,10 @@ import (
 const (
 	// ProtocolVersion is the sidecar command/event protocol version expected by
 	// this bridge.
-	ProtocolVersion = 4
+	ProtocolVersion = 5
+
+	// ProtocolVersionHeader is checked before any account factory or handler.
+	ProtocolVersionHeader = "X-Inline-Protocol-Version"
 
 	// DefaultBaseURL is the loopback sidecar endpoint.
 	DefaultBaseURL = "http://127.0.0.1:29342"
@@ -139,25 +142,66 @@ type DialogsRequest struct {
 
 const DialogsOrderStableChatID = "stable_chat_id"
 
+// DialogStructure is a complete source-backed structural observation only.
+// A nil descriptor is unknown; nullable fields here explicitly clear old values.
+type DialogStructure struct {
+	Kind            string `json:"kind"`
+	PeerUserID      *int64 `json:"peer_user_id"`
+	SpaceID         *int64 `json:"space_id"`
+	ParentChatID    *int64 `json:"parent_chat_id"`
+	ParentMessageID *int64 `json:"parent_message_id"`
+}
+
+// UnmarshalJSON requires explicit nullable members: absent keys are patches,
+// not evidence that an observed workspace or parent was detached.
+func (structure *DialogStructure) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, key := range []string{"kind", "peer_user_id", "space_id", "parent_chat_id", "parent_message_id"} {
+		if _, ok := fields[key]; !ok {
+			return fmt.Errorf("incomplete Inline structural descriptor: missing %s", key)
+		}
+	}
+	type wireStructure DialogStructure
+	var decoded wireStructure
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	switch decoded.Kind {
+	case "direct", "channel", "reply_child":
+	default:
+		return fmt.Errorf("unsupported Inline structural kind %q", decoded.Kind)
+	}
+	*structure = DialogStructure(decoded)
+	return nil
+}
+
 type DialogRecord struct {
-	ChatID                 int64   `json:"chat_id"`
-	PeerUserID             *int64  `json:"peer_user_id,omitempty"`
-	Title                  *string `json:"title,omitempty"`
-	Emoji                  *string `json:"emoji,omitempty"`
-	LastMessageID          *int64  `json:"last_message_id,omitempty"`
-	SyncedThroughMessageID *int64  `json:"synced_through_message_id,omitempty"`
-	UnreadCount            *uint32 `json:"unread_count,omitempty"`
-	SpaceID                *int64  `json:"space_id,omitempty"`
-	IsPublic               *bool   `json:"is_public,omitempty"`
-	Archived               *bool   `json:"archived,omitempty"`
-	Pinned                 *bool   `json:"pinned,omitempty"`
-	Open                   *bool   `json:"open,omitempty"`
-	ChatListHidden         *bool   `json:"chat_list_hidden,omitempty"`
-	Order                  *string `json:"order,omitempty"`
-	PinnedOrder            *string `json:"pinned_order,omitempty"`
-	NotificationMode       *string `json:"notification_mode,omitempty"`
-	FollowMode             *string `json:"follow_mode,omitempty"`
-	PinnedMessageIDs       []int64 `json:"pinned_message_ids,omitempty"`
+	Description            *string          `json:"description,omitempty"`
+	CreatedBy              *int64           `json:"created_by,omitempty"`
+	Structure              *DialogStructure `json:"structure,omitempty"`
+	ParentChatID           *int64           `json:"parent_chat_id,omitempty"`
+	ParentMessageID        *int64           `json:"parent_message_id,omitempty"`
+	ChatID                 int64            `json:"chat_id"`
+	PeerUserID             *int64           `json:"peer_user_id,omitempty"`
+	Title                  *string          `json:"title,omitempty"`
+	Emoji                  *string          `json:"emoji,omitempty"`
+	LastMessageID          *int64           `json:"last_message_id,omitempty"`
+	SyncedThroughMessageID *int64           `json:"synced_through_message_id,omitempty"`
+	UnreadCount            *uint32          `json:"unread_count,omitempty"`
+	SpaceID                *int64           `json:"space_id,omitempty"`
+	IsPublic               *bool            `json:"is_public,omitempty"`
+	Archived               *bool            `json:"archived,omitempty"`
+	Pinned                 *bool            `json:"pinned,omitempty"`
+	Open                   *bool            `json:"open,omitempty"`
+	ChatListHidden         *bool            `json:"chat_list_hidden,omitempty"`
+	Order                  *string          `json:"order,omitempty"`
+	PinnedOrder            *string          `json:"pinned_order,omitempty"`
+	NotificationMode       *string          `json:"notification_mode,omitempty"`
+	FollowMode             *string          `json:"follow_mode,omitempty"`
+	PinnedMessageIDs       []int64          `json:"pinned_message_ids,omitempty"`
 }
 
 type DialogsPage struct {
@@ -166,8 +210,36 @@ type DialogsPage struct {
 	NextCursor string         `json:"next_cursor,omitempty"`
 }
 
+type SpaceRecord struct {
+	SpaceID     int64  `json:"space_id"`
+	Name        string `json:"name"`
+	Creator     bool   `json:"creator"`
+	Date        int64  `json:"date"`
+	IsPublic    *bool  `json:"is_public"`
+	Seq         *int32 `json:"seq,omitempty"`
+	GridEnabled *bool  `json:"grid_enabled,omitempty"`
+}
+
+type SpaceMemberRecord struct {
+	SpaceID              int64   `json:"space_id"`
+	UserID               int64   `json:"user_id"`
+	Role                 *string `json:"role"`
+	Date                 int64   `json:"date"`
+	CanAccessPublicChats bool    `json:"can_access_public_chats"`
+}
+
+type SpaceAccessRecord struct {
+	SpaceID int64  `json:"space_id"`
+	Status  string `json:"status"`
+}
+
 type AccountStateSnapshot struct {
-	DeletedChatIDs []int64 `json:"deleted_chat_ids"`
+	Spaces              []SpaceRecord       `json:"spaces"`
+	SpaceMembers        []SpaceMemberRecord `json:"space_members"`
+	Users               []UserRecord        `json:"users"`
+	SpaceAccess         []SpaceAccessRecord `json:"space_access"`
+	SpaceAccessComplete bool                `json:"space_access_complete"`
+	DeletedChatIDs      []int64             `json:"deleted_chat_ids"`
 }
 
 type ChatStateRequest struct {
@@ -291,7 +363,52 @@ type CreatedChat struct {
 	ParentMessageID *int64  `json:"parent_message_id,omitempty"`
 }
 
+type MessageEntityRecord struct {
+	Kind    string  `json:"kind"`
+	Offset  int64   `json:"offset"`
+	Length  int64   `json:"length"`
+	UserID  *int64  `json:"user_id"`
+	AgentID *int64  `json:"agent_id"`
+	GroupID *int64  `json:"group_id"`
+	ChatID  *int64  `json:"chat_id"`
+	Value   *string `json:"value"`
+}
+
+type MessageAttachmentRecord struct {
+	AttachmentID int64   `json:"attachment_id"`
+	Kind         string  `json:"kind"`
+	Title        *string `json:"title"`
+	URL          *string `json:"url"`
+	Provider     *string `json:"provider"`
+}
+
+type MessageActionRecord struct {
+	ActionID string `json:"action_id"`
+	Label    string `json:"label"`
+	Kind     string `json:"kind"`
+}
+
+type AgentSessionMessageMetadata struct {
+	AgentSessionID int64 `json:"agent_session_id"`
+	Provider       int32 `json:"provider"`
+	Role           int32 `json:"role"`
+	Relation       int32 `json:"relation"`
+}
+
+type MessageMetadata struct {
+	Mentioned     *bool                        `json:"mentioned"`
+	EditTimestamp *int64                       `json:"edit_timestamp"`
+	Revision      *int64                       `json:"revision"`
+	SenderIsBot   *bool                        `json:"sender_is_bot"`
+	IsService     bool                         `json:"is_service"`
+	Entities      []MessageEntityRecord        `json:"entities"`
+	Attachments   []MessageAttachmentRecord    `json:"attachments"`
+	Actions       []MessageActionRecord        `json:"actions"`
+	AgentSession  *AgentSessionMessageMetadata `json:"agent_session"`
+}
+
 type MessageRecord struct {
+	Metadata         MessageMetadata      `json:"metadata"`
 	ChatID           int64                `json:"chat_id"`
 	MessageID        int64                `json:"message_id"`
 	SenderID         int64                `json:"sender_id"`
@@ -339,33 +456,39 @@ type ExternalID struct {
 }
 
 type SendTextRequest struct {
-	Peer             Peer        `json:"peer"`
-	Text             string      `json:"text"`
-	ExternalID       *ExternalID `json:"external_id,omitempty"`
-	RandomID         *int64      `json:"random_id,omitempty"`
-	ReplyToMessageID *int64      `json:"reply_to_message_id,omitempty"`
+	ParseMarkdown    bool                  `json:"parse_markdown,omitempty"`
+	NotificationMode string                `json:"notification_mode,omitempty"`
+	Entities         []MessageEntityRecord `json:"entities,omitempty"`
+	Peer             Peer                  `json:"peer"`
+	Text             string                `json:"text"`
+	ExternalID       *ExternalID           `json:"external_id,omitempty"`
+	RandomID         *int64                `json:"random_id,omitempty"`
+	ReplyToMessageID *int64                `json:"reply_to_message_id,omitempty"`
 }
 
 type UploadRequest struct {
-	Peer             Peer        `json:"peer"`
-	Kind             string      `json:"kind"`
-	FileName         *string     `json:"file_name,omitempty"`
-	MimeType         *string     `json:"mime_type,omitempty"`
-	SizeBytes        *uint64     `json:"size_bytes,omitempty"`
-	Caption          *string     `json:"caption,omitempty"`
-	Width            *uint32     `json:"width,omitempty"`
-	Height           *uint32     `json:"height,omitempty"`
-	DurationMS       *uint64     `json:"duration_ms,omitempty"`
-	ExternalID       *ExternalID `json:"external_id,omitempty"`
-	RandomID         *int64      `json:"random_id,omitempty"`
-	ReplyToMessageID *int64      `json:"reply_to_message_id,omitempty"`
+	Entities         []MessageEntityRecord `json:"entities,omitempty"`
+	Peer             Peer                  `json:"peer"`
+	Kind             string                `json:"kind"`
+	FileName         *string               `json:"file_name,omitempty"`
+	MimeType         *string               `json:"mime_type,omitempty"`
+	SizeBytes        *uint64               `json:"size_bytes,omitempty"`
+	Caption          *string               `json:"caption,omitempty"`
+	Width            *uint32               `json:"width,omitempty"`
+	Height           *uint32               `json:"height,omitempty"`
+	DurationMS       *uint64               `json:"duration_ms,omitempty"`
+	ExternalID       *ExternalID           `json:"external_id,omitempty"`
+	RandomID         *int64                `json:"random_id,omitempty"`
+	ReplyToMessageID *int64                `json:"reply_to_message_id,omitempty"`
 }
 
 type EditMessageRequest struct {
-	ChatID     int64       `json:"chat_id"`
-	MessageID  int64       `json:"message_id"`
-	Text       string      `json:"text"`
-	ExternalID *ExternalID `json:"external_id,omitempty"`
+	ParseMarkdown bool                  `json:"parse_markdown,omitempty"`
+	Entities      []MessageEntityRecord `json:"entities,omitempty"`
+	ChatID        int64                 `json:"chat_id"`
+	MessageID     int64                 `json:"message_id"`
+	Text          string                `json:"text"`
+	ExternalID    *ExternalID           `json:"external_id,omitempty"`
 }
 
 type DeleteMessageRequest struct {

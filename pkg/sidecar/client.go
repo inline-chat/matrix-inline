@@ -27,6 +27,9 @@ type Client struct {
 // requested lossless event history.
 var ErrEventReplayUnavailable = errors.New("Inline sidecar event replay is unavailable")
 
+// ErrEventGenerationRequired prevents acknowledging a cursor without its lineage.
+var ErrEventGenerationRequired = errors.New("Inline sidecar acknowledgement requires an event generation")
+
 type EventReplayUnavailableError struct {
 	RequestedAfterSequence *uint64 `json:"requested_after_sequence,omitempty"`
 	OldestRetainedSequence *uint64 `json:"oldest_retained_sequence,omitempty"`
@@ -55,6 +58,22 @@ func NewClient(baseURL string) *Client {
 		BaseURL: baseURL,
 		HTTP:    &http.Client{Timeout: 2 * time.Minute},
 	}
+}
+
+// Compatibility probes protocol metadata without selecting or constructing an account.
+func (c *Client) Compatibility(ctx context.Context) (*ProtocolInfo, error) {
+	var info ProtocolInfo
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/compatibility", nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.doRequest(req, &info, false); err != nil {
+		return nil, err
+	}
+	if info.ProtocolVersion != ProtocolVersion {
+		return nil, fmt.Errorf("unsupported Inline sidecar protocol %d, expected %d", info.ProtocolVersion, ProtocolVersion)
+	}
+	return &info, nil
 }
 
 func (c *Client) WithSessionNamespace(namespace string) *Client {
@@ -303,6 +322,9 @@ func (c *Client) EventsAfter(ctx context.Context, namespace string, afterSequenc
 // EventsAfterGeneration opens the event stream within one durable adapter
 // event-log generation.
 func (c *Client) EventsAfterGeneration(ctx context.Context, namespace, generation string, afterSequence uint64) (*EventStream, error) {
+	if _, err := c.Compatibility(ctx); err != nil {
+		return nil, err
+	}
 	query := url.Values{}
 	query.Set("after_sequence", strconv.FormatUint(afterSequence, 10))
 	if strings.TrimSpace(namespace) != "" {
@@ -312,9 +334,9 @@ func (c *Client) EventsAfterGeneration(ctx context.Context, namespace, generatio
 		query.Set("generation", generation)
 	}
 	eventsURL := websocketURL(c.BaseURL, "/ws/events?"+query.Encode())
-	options := &websocket.DialOptions{}
+	options := &websocket.DialOptions{HTTPHeader: http.Header{ProtocolVersionHeader: []string{strconv.Itoa(ProtocolVersion)}}, HTTPClient: c.HTTP}
 	if strings.TrimSpace(c.SessionNamespace) != "" {
-		options.HTTPHeader = http.Header{"X-Inline-Session-Namespace": []string{c.SessionNamespace}}
+		options.HTTPHeader.Set("X-Inline-Session-Namespace", c.SessionNamespace)
 	}
 	conn, response, err := websocket.Dial(ctx, eventsURL, options)
 	if err != nil {
@@ -331,16 +353,32 @@ func (c *Client) EventsAfterGeneration(ctx context.Context, namespace, generatio
 	return &EventStream{conn: conn}, nil
 }
 
-// AckEvents acknowledges durable processing through sequence.
+// AckEvents cannot safely acknowledge a cursor without its event-log generation.
+// Deprecated: use AckEventsGeneration with the generation persisted with the cursor.
 func (c *Client) AckEvents(ctx context.Context, namespace string, sequence uint64) error {
 	return c.AckEventsGeneration(ctx, namespace, "", sequence)
 }
 
 // AckEventsGeneration acknowledges durable processing within one event-log generation.
 func (c *Client) AckEventsGeneration(ctx context.Context, namespace, generation string, sequence uint64) error {
+	if strings.TrimSpace(generation) == "" {
+		return ErrEventGenerationRequired
+	}
 	request := EventAckRequest{SessionNamespace: namespace, Generation: generation, Sequence: sequence}
-	var response EventAckResponse
-	return c.do(ctx, http.MethodPost, "/rpc/events/ack", request, &response)
+	// Pointers distinguish a missing/null confirmation from an explicit sequence
+	// zero. Keep the public response DTO convenient for server-side producers.
+	var response struct {
+		Generation           *string `json:"generation"`
+		AcknowledgedSequence *uint64 `json:"acknowledged_sequence"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/rpc/events/ack", request, &response); err != nil {
+		return err
+	}
+	if response.Generation == nil || *response.Generation != generation ||
+		response.AcknowledgedSequence == nil || *response.AcknowledgedSequence != sequence {
+		return errors.New("Inline sidecar acknowledgement did not confirm the requested generation and sequence")
+	}
+	return nil
 }
 
 type EventStream struct {
@@ -441,7 +479,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	return c.doRequest(req, out)
+	return c.doRequest(req, out, true)
 }
 
 func (c *Client) doRaw(ctx context.Context, method, path, contentType string, body io.Reader, out any) error {
@@ -452,11 +490,19 @@ func (c *Client) doRaw(ctx context.Context, method, path, contentType string, bo
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	return c.doRequest(req, out)
+	return c.doRequest(req, out, true)
 }
 
-func (c *Client) doRequest(req *http.Request, out any) error {
-	if strings.TrimSpace(c.SessionNamespace) != "" {
+func (c *Client) doRequest(req *http.Request, out any, accountScoped bool) error {
+	// Do not cache the probe: even a direct call after an adapter downgrade must
+	// reject before the old adapter's account extractors can execute a mutation.
+	if accountScoped {
+		if _, err := c.Compatibility(req.Context()); err != nil {
+			return err
+		}
+	}
+	req.Header.Set(ProtocolVersionHeader, strconv.Itoa(ProtocolVersion))
+	if accountScoped && strings.TrimSpace(c.SessionNamespace) != "" {
 		req.Header.Set("X-Inline-Session-Namespace", c.SessionNamespace)
 	}
 	httpClient := c.HTTP
@@ -470,6 +516,16 @@ func (c *Client) doRequest(req *http.Request, out any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusGone {
+			var replayErr struct {
+				EventReplayUnavailableError
+				Code string `json:"error"`
+			}
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&replayErr); err == nil &&
+				(replayErr.Code == "sidecar_event_generation_reset" || replayErr.Code == "sidecar_event_replay_unavailable") {
+				return &replayErr.EventReplayUnavailableError
+			}
+		}
 		return fmt.Errorf("Inline sidecar %s %s returned HTTP %d", req.Method, req.URL.Path, resp.StatusCode)
 	}
 	if out == nil {

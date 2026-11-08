@@ -21,6 +21,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+hegel = { package = "hegeltest", version = "0.52" }
 tower.workspace = true
 
 [[bin]]

@@ -15,10 +15,11 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, FromRequestParts, Multipart, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        DefaultBodyLimit, FromRequestParts, Multipart, Query, Request, State,
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, request::Parts},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -44,6 +45,7 @@ use crate::protocol::{
 };
 
 const SIDECAR_UPLOAD_BODY_LIMIT_BYTES: usize = 101 * 1024 * 1024;
+const PROTOCOL_VERSION_HEADER: &str = "x-inline-protocol-version";
 const SESSION_NAMESPACE_HEADER: &str = "x-inline-session-namespace";
 
 /// Async factory used by production adapters to lazily create one native
@@ -345,9 +347,11 @@ struct AdapterRequestClient(InlineClient);
 #[derive(Clone, Debug)]
 struct AdapterRequestNamespace(String);
 
-async fn request_namespace(parts: &Parts, state: &AdapterHttpState) -> Result<String, Response> {
-    let namespace = parts
-        .headers
+async fn request_namespace(
+    headers: &HeaderMap,
+    state: &AdapterHttpState,
+) -> Result<String, Response> {
+    let namespace = headers
         .get(SESSION_NAMESPACE_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
@@ -373,7 +377,7 @@ impl FromRequestParts<AdapterHttpState> for AdapterRequestClient {
         parts: &mut Parts,
         state: &AdapterHttpState,
     ) -> Result<Self, Self::Rejection> {
-        let namespace = request_namespace(parts, state).await?;
+        let namespace = request_namespace(&parts.headers, state).await?;
         state
             .client_for_namespace(&namespace)
             .await
@@ -389,13 +393,38 @@ impl FromRequestParts<AdapterHttpState> for AdapterRequestNamespace {
         parts: &mut Parts,
         state: &AdapterHttpState,
     ) -> Result<Self, Self::Rejection> {
-        let namespace = request_namespace(parts, state).await?;
+        let namespace = request_namespace(&parts.headers, state).await?;
         state
             .client_for_namespace(&namespace)
             .await
             .map_err(|error| (StatusCode::BAD_REQUEST, error).into_response())?;
         Ok(Self(namespace))
     }
+}
+
+// This gate runs before extractors: even health can lazily construct a client.
+// Reject duplicate headers instead of accepting an ambiguous negotiated version.
+fn compatible_protocol(headers: &HeaderMap) -> bool {
+    let mut versions = headers.get_all(PROTOCOL_VERSION_HEADER).iter();
+    matches!((versions.next(), versions.next()), (Some(value), None)
+        if value.as_bytes() == PROTOCOL_VERSION.to_string().as_bytes())
+}
+
+async fn require_protocol(request: Request, next: Next) -> Response {
+    if !compatible_protocol(request.headers()) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "ProtocolMismatch", "expected_protocol_version": PROTOCOL_VERSION
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn compatibility() -> Json<ProtocolInfo> {
+    Json(ProtocolInfo::current())
 }
 
 /// Builds the localhost sidecar router consumed by the Go bridge.
@@ -449,6 +478,8 @@ pub fn sidecar_router_with_state(state: AdapterHttpState) -> Router {
         .route("/rpc/typing", post(rpc_typing))
         .route("/rpc/events/ack", post(rpc_events_ack))
         .route("/rpc/upload", post(rpc_upload))
+        .route_layer(middleware::from_fn(require_protocol))
+        .route("/compatibility", get(compatibility))
         .layer(DefaultBodyLimit::max(SIDECAR_UPLOAD_BODY_LIMIT_BYTES))
         .with_state(state)
 }
@@ -541,10 +572,23 @@ async fn status(
 }
 
 async fn rpc(
-    AdapterRequestClient(client): AdapterRequestClient,
     State(state): State<AdapterHttpState>,
+    headers: HeaderMap,
     Json(request): Json<SidecarRequest>,
 ) -> Response {
+    // The generic envelope has its own version. Validate it before resolving
+    // the namespace, just as the router validates headers before extraction.
+    if request.protocol_version != PROTOCOL_VERSION {
+        return protocol_mismatch_response(request.id, request.protocol_version);
+    }
+    let namespace = match request_namespace(&headers, &state).await {
+        Ok(namespace) => namespace,
+        Err(response) => return response,
+    };
+    let client = match state.client_for_namespace(&namespace).await {
+        Ok(client) => client,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     dispatch_request(state, client, request).await
 }
 
@@ -871,6 +915,17 @@ async fn dispatch_command(
     dispatch_request(state, client, request).await
 }
 
+fn protocol_mismatch_response(request_id: SidecarRequestId, received: u16) -> Response {
+    Json(SidecarResponse::error(
+        request_id,
+        SidecarError::new(
+            ClientErrorCategory::ProtocolMismatch,
+            format!("unsupported adapter protocol version {received}; expected {PROTOCOL_VERSION}"),
+        ),
+    ))
+    .into_response()
+}
+
 async fn dispatch_request(
     _state: AdapterHttpState,
     client: InlineClient,
@@ -878,22 +933,7 @@ async fn dispatch_request(
 ) -> Response {
     let request_id = request.id.clone();
     if request.protocol_version != PROTOCOL_VERSION {
-        log::warn!(
-            "adapter protocol mismatch: got {}, expected {}",
-            request.protocol_version,
-            PROTOCOL_VERSION
-        );
-        return Json(SidecarResponse::error(
-            request_id,
-            SidecarError::new(
-                ClientErrorCategory::ProtocolMismatch,
-                format!(
-                    "unsupported adapter protocol version {}; expected {}",
-                    request.protocol_version, PROTOCOL_VERSION
-                ),
-            ),
-        ))
-        .into_response();
+        return protocol_mismatch_response(request_id, request.protocol_version);
     }
 
     log::debug!("handling adapter command: {}", request.command.kind());
@@ -1088,7 +1128,6 @@ struct EventsQuery {
 #[derive(Debug, Deserialize, Serialize)]
 struct EventsAckRequest {
     session_namespace: String,
-    #[serde(default)]
     generation: String,
     sequence: u64,
 }
@@ -1124,6 +1163,13 @@ async fn rpc_events_ack(
         return (
             StatusCode::BAD_REQUEST,
             "event acknowledgement namespace does not match session header",
+        )
+            .into_response();
+    }
+    if request.generation.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "event acknowledgement requires a generation",
         )
             .into_response();
     }
@@ -1193,9 +1239,24 @@ async fn events_ws(
             .into_response();
     }
     let live = state.subscribe_events();
+    // Capture identity even when replay is empty. Passing this identity to
+    // replay also rejects a reset between capture and the replay read.
+    let generation = match state.event_store.generation(&namespace) {
+        Ok(generation) => generation,
+        Err(error) => {
+            log::error!("failed to load adapter event generation: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let expected_generation = query
+        .generation
+        .as_deref()
+        .map(str::trim)
+        .filter(|expected| !expected.is_empty())
+        .unwrap_or(&generation);
     let replay = match state.event_store.replay_for_generation(
         &namespace,
-        query.generation.as_deref(),
+        Some(expected_generation),
         query.after_sequence,
     ) {
         Ok(replay) => replay,
@@ -1227,7 +1288,15 @@ async fn events_ws(
         }
     };
     ws.on_upgrade(move |socket| {
-        event_socket(state, socket, namespace, query.after_sequence, replay, live)
+        event_socket(
+            state,
+            socket,
+            namespace,
+            generation,
+            query.after_sequence,
+            replay,
+            live,
+        )
     })
     .into_response()
 }
@@ -1273,11 +1342,16 @@ async fn event_socket(
     state: AdapterHttpState,
     mut socket: WebSocket,
     namespace: String,
+    generation: String,
     mut last_sent: u64,
     replay: Vec<SidecarEventEnvelope>,
     mut events: broadcast::Receiver<SidecarEventEnvelope>,
 ) {
     for envelope in replay {
+        if envelope.generation != generation {
+            close_event_socket_for_reset(&mut socket).await;
+            return;
+        }
         if send_event_envelope(&mut socket, &envelope).await.is_err() {
             return;
         }
@@ -1294,10 +1368,15 @@ async fn event_socket(
                 log::warn!(
                     "adapter websocket lagged by {skipped} live events; replaying after {last_sent}"
                 );
-                let replay = match state.event_store.replay(&namespace, last_sent) {
+                let replay = match state.event_store.replay_for_generation(
+                    &namespace,
+                    Some(&generation),
+                    last_sent,
+                ) {
                     Ok(replay) => replay,
                     Err(error) => {
                         log::error!("adapter websocket replay failed after lag: {error}");
+                        close_event_socket_for_reset(&mut socket).await;
                         break;
                     }
                 };
@@ -1315,6 +1394,12 @@ async fn event_socket(
         if envelope.session_namespace != namespace {
             continue;
         }
+        // Compare identity before its sequence: low sequences in a new
+        // generation are a reset, never duplicates of this socket's cursor.
+        if envelope.generation != generation {
+            close_event_socket_for_reset(&mut socket).await;
+            break;
+        }
         if envelope
             .sequence
             .is_some_and(|sequence| sequence <= last_sent)
@@ -1328,6 +1413,15 @@ async fn event_socket(
             last_sent = sequence;
         }
     }
+}
+
+async fn close_event_socket_for_reset(socket: &mut WebSocket) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 1012,
+            reason: "event replay changed; reconnect and reconcile".into(),
+        })))
+        .await;
 }
 
 async fn send_event_envelope(
@@ -1345,6 +1439,8 @@ async fn send_event_envelope(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use axum::{
@@ -1367,6 +1463,410 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    // A small wire fixture reads server frames only; it does not implement or
+    // reproduce Axum's upgrade machinery. No client account/network is needed.
+    fn fixture_socket(addr: SocketAddr, uri: &str) -> TcpStream {
+        let mut socket = TcpStream::connect(addr).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(socket, "GET {uri} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nX-Inline-Protocol-Version: 5\r\nX-Inline-Session-Namespace: fixture\r\n\r\n").unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+            assert!(headers.len() < 8192);
+        }
+        assert!(
+            headers.starts_with(b"HTTP/1.1 101"),
+            "{}",
+            String::from_utf8_lossy(&headers)
+        );
+        socket
+    }
+
+    fn fixture_frame(socket: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut header = [0; 2];
+        socket
+            .read_exact(&mut header)
+            .expect("expected an event or reset close, not silence/EOF");
+        assert_eq!(header[1] & 0x80, 0, "server frames are unmasked");
+        let size = match header[1] & 0x7f {
+            126 => {
+                let mut bytes = [0; 2];
+                socket.read_exact(&mut bytes).unwrap();
+                u16::from_be_bytes(bytes) as usize
+            }
+            127 => {
+                let mut bytes = [0; 8];
+                socket.read_exact(&mut bytes).unwrap();
+                usize::try_from(u64::from_be_bytes(bytes)).unwrap()
+            }
+            size => size as usize,
+        };
+        assert!(size < 64 * 1024, "fixture frame unexpectedly large");
+        let mut payload = vec![0; size];
+        socket.read_exact(&mut payload).unwrap();
+        (header[0] & 0x0f, payload)
+    }
+
+    fn assert_reset_close(socket: &mut TcpStream) {
+        let (opcode, payload) = fixture_frame(socket);
+        assert_eq!(
+            opcode,
+            8,
+            "expected reset close, received {}",
+            String::from_utf8_lossy(&payload)
+        );
+        assert!(payload.len() >= 2);
+        assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1012);
+    }
+
+    fn fixture_event() -> inline_client::ClientEvent {
+        inline_client::ClientEvent::ChatUpserted {
+            chat_id: InlineId::new(7),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_generation_reset_after_empty_replay_closes_before_filtering() {
+        let client = InlineClient::builder().build().spawn();
+        let state = AdapterHttpState::with_event_store(
+            client.clone(),
+            AdapterEventStore::open_in_memory("fixture").unwrap(),
+        );
+        let generation = state.event_store.generation("fixture").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = sidecar_router_with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut socket = fixture_socket(addr, &format!("/ws/events?generation={generation}"));
+        state.event_store.remove_namespace("fixture").unwrap();
+        let envelope = state
+            .event_store
+            .append_for_namespace("fixture", fixture_event())
+            .unwrap();
+        assert_ne!(envelope.generation, generation);
+        state.events.send(envelope).unwrap();
+        assert_reset_close(&mut socket);
+
+        // A reconnect negotiates the current generation and can replay it.
+        let current = state.event_store.generation("fixture").unwrap();
+        let mut next = fixture_socket(addr, &format!("/ws/events?generation={current}"));
+        let (opcode, data) = fixture_frame(&mut next);
+        assert_eq!(opcode, 1);
+        let replay: SidecarEventEnvelope = serde_json::from_slice(&data).unwrap();
+        assert_eq!(replay.generation, current);
+        assert_eq!(replay.sequence, Some(1));
+        server.abort();
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_reset_does_not_suppress_new_low_sequence_regression() {
+        let client = InlineClient::builder().build().spawn();
+        let state = AdapterHttpState::with_event_store(
+            client.clone(),
+            AdapterEventStore::open_in_memory("fixture").unwrap(),
+        );
+        let first = state.event_store.append(fixture_event()).unwrap();
+        let second = state.event_store.append(fixture_event()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = sidecar_router_with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut socket = fixture_socket(
+            addr,
+            &format!(
+                "/ws/events?generation={}&after_sequence=2",
+                first.generation
+            ),
+        );
+        // Same-generation duplicates and unrelated namespaces must not reset or
+        // leak; the following same-generation sequence must be the next frame.
+        state.events.send(second).unwrap();
+        let unrelated = state
+            .event_store
+            .append_for_namespace("other", fixture_event())
+            .unwrap();
+        state.events.send(unrelated).unwrap();
+        let third = state.event_store.append(fixture_event()).unwrap();
+        state.events.send(third.clone()).unwrap();
+        let (opcode, data) = fixture_frame(&mut socket);
+        assert_eq!(opcode, 1);
+        let received: SidecarEventEnvelope = serde_json::from_slice(&data).unwrap();
+        assert_eq!(received, third);
+        state.event_store.remove_namespace("fixture").unwrap();
+        let next = state.event_store.append(fixture_event()).unwrap();
+        assert_eq!(next.sequence, Some(1));
+        state.events.send(next).unwrap();
+        assert_reset_close(&mut socket);
+        server.abort();
+        client.shutdown().await.unwrap();
+    }
+
+    #[hegel::test(test_cases = 1000)]
+    fn websocket_lag_recovery_stays_in_generation(tc: hegel::TestCase) {
+        let watermark = tc.draw(hegel::generators::integers::<u64>());
+        let reset = tc.draw(hegel::generators::booleans());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = InlineClient::builder().build().spawn();
+            let state = AdapterHttpState::with_event_store(
+                client.clone(),
+                AdapterEventStore::open_in_memory("fixture").unwrap(),
+            );
+            let original_generation = state.event_store.generation("fixture").unwrap();
+            let live = state.subscribe_events();
+            // Deliberately lag the actual broadcast receiver before the socket
+            // starts consuming, avoiding scheduler/sleep-based lag fixtures.
+            let transient = inline_client::ClientEvent::Typing {
+                chat_id: InlineId::new(7),
+                user_id: InlineId::new(8),
+                is_typing: true,
+            };
+            for _ in 0..257 {
+                let event = state
+                    .event_store
+                    .append_for_namespace("other", transient.clone())
+                    .unwrap();
+                state.events.send(event).unwrap();
+            }
+            if reset {
+                state.event_store.remove_namespace("fixture").unwrap();
+            }
+            let next = state.event_store.append(fixture_event()).unwrap();
+            let state_for_socket = state.clone();
+            let expected = next.clone();
+            let generation_for_socket = original_generation.clone();
+            let live = Arc::new(StdMutex::new(Some(live)));
+            let app = Router::new().route(
+                "/fixture",
+                get(move |ws: WebSocketUpgrade| {
+                    let state = state_for_socket.clone();
+                    let live = live.clone();
+                    let generation = generation_for_socket.clone();
+                    async move {
+                        let live = live.lock().unwrap().take().unwrap();
+                        ws.on_upgrade(move |socket| {
+                            event_socket(
+                                state,
+                                socket,
+                                "fixture".to_owned(),
+                                generation,
+                                if reset { watermark } else { 0 },
+                                Vec::new(),
+                                live,
+                            )
+                        })
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut socket = fixture_socket(addr, "/fixture");
+            if reset {
+                assert_ne!(next.generation, original_generation);
+                assert_reset_close(&mut socket);
+            } else {
+                let (opcode, data) = fixture_frame(&mut socket);
+                assert_eq!(opcode, 1);
+                let received: SidecarEventEnvelope = serde_json::from_slice(&data).unwrap();
+                assert_eq!(received, expected);
+            }
+            server.abort();
+            client.shutdown().await.unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn invalid_wire_request_id_rejects_before_factory() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let factory: AdapterClientFactory = Arc::new(move |_| {
+            counted.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Err("factory must not run".to_owned()) })
+        });
+        let state = AdapterHttpState::with_client_factory(
+            AdapterEventStore::open_in_memory("fixture").unwrap(),
+            factory,
+        );
+        let app = sidecar_router_with_state(state);
+        for id in [
+            "".to_owned(),
+            " \t ".to_owned(),
+            "x\0y".to_owned(),
+            "a".repeat(129),
+            "é".repeat(65),
+        ] {
+            let request =
+                serde_json::json!({"protocol_version":5,"id":id,"command":{"type":"status"}});
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/rpc")
+                        .header(PROTOCOL_VERSION_HEADER, "5")
+                        .header(SESSION_NAMESPACE_HEADER, "fixture")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{id:?}"
+            );
+        }
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn generic_rpc_body_version_rejects_before_account_factory() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let factory: AdapterClientFactory = Arc::new(move |_| {
+            counted.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Err("factory must not run".to_owned()) })
+        });
+        let state = AdapterHttpState::with_client_factory(
+            AdapterEventStore::open_in_memory("fixture").unwrap(),
+            factory,
+        );
+        let request = serde_json::json!({"protocol_version":4,"id":"fixture-rpc","command":{"type":"status"}});
+        let response = sidecar_router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc")
+                    .header(PROTOCOL_VERSION_HEADER, "5")
+                    .header(SESSION_NAMESPACE_HEADER, "fixture")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        let response: SidecarResponse = json_response(response).await;
+        assert!(matches!(response.outcome, SidecarOutcome::Error(_)));
+    }
+
+    #[hegel::test]
+    fn protocol_version_requires_exact_supported_value(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let version = tc.draw(gs::integers::<u16>());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            PROTOCOL_VERSION_HEADER,
+            version.to_string().parse().unwrap(),
+        );
+        assert_eq!(compatible_protocol(&headers), version == 5);
+        headers.append(PROTOCOL_VERSION_HEADER, "5".parse().unwrap());
+        assert!(
+            !compatible_protocol(&headers),
+            "duplicate version headers are ambiguous"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_gate_precedes_every_account_factory() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let factory: AdapterClientFactory = Arc::new(move |_| {
+            counted.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Err("factory must not run".to_owned()) })
+        });
+        let store = AdapterEventStore::open_in_memory("fixture").unwrap();
+        let app = sidecar_router_with_state(AdapterHttpState::with_client_factory(store, factory));
+        let paths = [
+            "/health",
+            "/status",
+            "/ws/events",
+            "/rpc",
+            "/rpc/auth/start",
+            "/rpc/auth/verify",
+            "/rpc/resume",
+            "/rpc/connect",
+            "/rpc/logout",
+            "/rpc/dialogs",
+            "/rpc/state/dialogs",
+            "/rpc/state/account",
+            "/rpc/state/chat",
+            "/rpc/state/chat/history",
+            "/rpc/history",
+            "/rpc/chat/participants",
+            "/rpc/chat/participants/add",
+            "/rpc/chat/participants/remove",
+            "/rpc/chat/info",
+            "/rpc/chat/delete",
+            "/rpc/chat/create-dm",
+            "/rpc/chat/create-thread",
+            "/rpc/chat/create-reply-thread",
+            "/rpc/send",
+            "/rpc/send_text",
+            "/rpc/edit",
+            "/rpc/delete",
+            "/rpc/react",
+            "/rpc/read",
+            "/rpc/marked-unread",
+            "/rpc/dialog/notifications",
+            "/rpc/typing",
+            "/rpc/events/ack",
+            "/rpc/upload",
+        ];
+        for path in paths {
+            for version in [None, Some("4"), Some("6"), Some("garbage")] {
+                let method = if path.starts_with("/rpc") && path != "/rpc/state/account" {
+                    "POST"
+                } else {
+                    "GET"
+                };
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(SESSION_NAMESPACE_HEADER, "fixture");
+                if let Some(version) = version {
+                    request = request.header("x-inline-protocol-version", version);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from("not json")).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::CONFLICT,
+                    "{path} {version:?}"
+                );
+            }
+        }
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/compatibility")
+                    .header(SESSION_NAMESPACE_HEADER, "ignored")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let info: ProtocolInfo = json_response(response).await;
+        assert_eq!(info.protocol_version, 5);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn health_endpoint_reports_protocol_and_status() {
         let client = InlineClient::builder()
@@ -1378,6 +1878,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .uri("/health")
                     .body(Body::empty())
                     .unwrap(),
@@ -1446,7 +1947,7 @@ mod tests {
         let app = sidecar_router_with_state(state.clone());
         let body = serde_json::to_vec(&EventsAckRequest {
             session_namespace: "test".to_owned(),
-            generation: String::new(),
+            generation: state.event_store().generation("test").unwrap(),
             sequence: 1,
         })
         .unwrap();
@@ -1454,6 +1955,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/events/ack")
                     .header("content-type", "application/json")
@@ -1488,6 +1990,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/events/ack")
                     .header(SESSION_NAMESPACE_HEADER, "test")
@@ -1524,6 +2027,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .body(Body::empty())
                     .unwrap(),
@@ -1579,6 +2083,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                         .uri("/status")
                         .header(SESSION_NAMESPACE_HEADER, namespace)
                         .body(Body::empty())
@@ -1600,6 +2105,7 @@ mod tests {
         let missing = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .body(Body::empty())
                     .unwrap(),
@@ -1626,6 +2132,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .header(SESSION_NAMESPACE_HEADER, "account-1")
                     .body(Body::empty())
@@ -1669,6 +2176,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .header(SESSION_NAMESPACE_HEADER, "account-1")
                     .body(Body::empty())
@@ -1682,6 +2190,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/logout")
                     .header(SESSION_NAMESPACE_HEADER, "account-1")
@@ -1695,6 +2204,7 @@ mod tests {
         let recreated = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .header(SESSION_NAMESPACE_HEADER, "account-1")
                     .body(Body::empty())
@@ -1717,6 +2227,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/resume")
                     .body(Body::empty())
@@ -1748,6 +2259,7 @@ mod tests {
         app.clone()
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/connect")
                     .header("content-type", "application/json")
@@ -1767,6 +2279,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/send")
                     .header("content-type", "application/json")
@@ -1811,6 +2324,7 @@ mod tests {
         app.clone()
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/connect")
                     .header("content-type", "application/json")
@@ -1827,6 +2341,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/chat/participants")
                     .header("content-type", "application/json")
@@ -1861,6 +2376,7 @@ mod tests {
         app.clone()
             .oneshot(
                 Request::builder()
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/connect")
                     .header("content-type", "application/json")
@@ -1926,6 +2442,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
                         .method("POST")
                         .uri(uri)
                         .header("content-type", "application/json")

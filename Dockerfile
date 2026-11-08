@@ -5,7 +5,7 @@ ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
 
-FROM ${DOCKER_HUB}/golang:1.25-alpine AS go-builder
+FROM ${DOCKER_HUB}/golang:1.26-alpine AS go-builder
 ARG VERSION
 ARG COMMIT
 ARG BUILD_TIME
@@ -81,6 +81,6 @@ VOLUME ["/data"]
 EXPOSE 29343
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:29342/health >/dev/null || exit 1
+    CMD curl -fsS -H "X-Inline-Protocol-Version: 5" http://127.0.0.1:29342/health >/dev/null || exit 1
 
 CMD ["/docker-run.sh"]

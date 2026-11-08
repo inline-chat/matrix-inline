@@ -15,7 +15,7 @@ import (
 )
 
 func TestClientStatusDecodesVersionedResponse(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/status" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -46,7 +46,7 @@ func TestClientStatusDecodesVersionedResponse(t *testing.T) {
 }
 
 func TestClientConnectReturnsSidecarError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/connect" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -78,7 +78,7 @@ func TestClientConnectReturnsSidecarError(t *testing.T) {
 }
 
 func TestClientAuthStartAndVerify(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/rpc/auth/start":
 			var request AuthStartRequest
@@ -141,7 +141,7 @@ func TestClientAuthStartAndVerify(t *testing.T) {
 }
 
 func TestClientResumeDecodesStatus(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/resume" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -162,7 +162,7 @@ func TestClientResumeDecodesStatus(t *testing.T) {
 }
 
 func TestClientDialogsAndHistoryDecodeVersionedResponses(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/rpc/dialogs":
 			synced := int64(11)
@@ -238,7 +238,7 @@ func TestClientDialogsAndHistoryDecodeVersionedResponses(t *testing.T) {
 }
 
 func TestClientParticipantsAndChatCreation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/rpc/chat/participants":
 			var request ChatParticipantsRequest
@@ -401,7 +401,7 @@ func TestClientParticipantsAndChatCreation(t *testing.T) {
 }
 
 func TestClientUploadSendsMultipartMetadataAndFile(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/upload" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -579,7 +579,7 @@ func TestEventEnvelopeDecodesSpaceMemberChanged(t *testing.T) {
 }
 
 func TestEventsAfterRequestsNamespaceAndCursor(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/ws/events" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -623,7 +623,7 @@ func TestEventsAfterRequestsNamespaceAndCursor(t *testing.T) {
 }
 
 func TestEventsAfterMapsGoneToReplayUnavailable(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusGone)
 		_, _ = w.Write([]byte(`{"error":"sidecar_event_replay_unavailable","requested_after_sequence":3,"oldest_retained_sequence":8,"latest_sequence":12,"event_generation":"generation-2"}`))
@@ -641,7 +641,7 @@ func TestEventsAfterMapsGoneToReplayUnavailable(t *testing.T) {
 }
 
 func TestAckEventsPostsDurableCursor(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := compatibleTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/events/ack" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -711,4 +711,19 @@ func stringPtr(value string) *string {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+// Compatible fixtures expose the same static, account-free preflight as the adapter.
+func compatibleTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/compatibility" {
+			writeJSON(t, w, ProtocolInfo{ProtocolVersion: ProtocolVersion})
+			return
+		}
+		if r.Header.Get(ProtocolVersionHeader) != "5" {
+			t.Errorf("missing protocol header on %s", r.URL.Path)
+		}
+		handler.ServeHTTP(w, r)
+	}))
 }

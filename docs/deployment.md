@@ -282,7 +282,7 @@ Check status:
 systemctl status matrix-inline-adapter.service
 systemctl status matrix-inline.service
 journalctl -u matrix-inline-adapter.service -u matrix-inline.service -f
-curl -fsS http://127.0.0.1:29342/health
+curl -fsS -H "X-Inline-Protocol-Version: 5" http://127.0.0.1:29342/health
 ```
 
 ## After Deployment

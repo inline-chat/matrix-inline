@@ -17,7 +17,7 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Message edits
 - [x] Message deletes/redactions
 - [x] Reactions
-- [x] Read receipts and marked-unread state
+- [x] Verified source read-prefix projection with double puppeting (limits below)
 - [x] Permanent per-room mute/unmute
 - [x] Typing notifications
 - [x] Images, videos, files, audio, and voice/audio files
@@ -29,7 +29,8 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Add/remove Inline thread participants from Matrix membership changes
 - [x] Rename Inline threads from Matrix
 - [x] Explicit Inline thread deletion from Beeper/Matrix
-- [x] Management commands for status and reconnect
+- [x] Account-scoped workspace Spaces and in-place presentation migration
+- [x] Management commands for status, settings, and reconnect
 - [ ] New Inline account signup or invite-code onboarding
 - [ ] Matrix-native thread UI for Inline reply-thread chats
 - [ ] Contact search for DM creation
@@ -37,18 +38,28 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [ ] Pins and Inline link-preview projection
 - [ ] Room avatars
 - [ ] Room topic/description editing
-- [ ] Presence and richer workspace/space representation
+- [ ] Presence
 - [ ] Timed mute expiration (permanent mute is supported)
 - [ ] Calls
+
+Channels are ordinary Matrix rooms, while DMs retain DM identity. Workspace
+navigation requires source-backed access evidence. Automatic channel mute and
+manual-unread writes remain disabled until their origin can be distinguished
+from user changes; the bridge reports degraded notification policy and continues
+delivery. Mute channels manually for a quiet inbox. Source read state uses a
+verified private receipt/fully-read prefix and never crosses an unmapped event;
+genuine private user receipts are not forwarded by the pinned framework.
+See [operations](docs/operations.md#notification-and-read-state-limits) for these
+limits and the explicit preview/apply/rollback migration commands.
 
 ## Requirements
 
 - An existing Inline account
 - A Matrix homeserver or Beeper bridge deployment
-- Docker and Docker Compose, or Go 1.25 plus Rust 1.96 for native builds
+- Docker and Docker Compose, or Go 1.26.1 plus Rust 1.96 for native builds
 - A published container image from `ghcr.io/inline-chat/matrix-inline`
 
-Source builds require a local checkout of `inline-chat/inline-public` next to this repo
+Source builds require a local checkout of `inline-chat/inline` named `inline-public` next to this repo
 because the bridge builds against the Rust Inline client crates:
 
 ```text
@@ -289,6 +300,7 @@ libolm headers.
 
 - [Deployment](docs/deployment.md)
 - [Operations](docs/operations.md)
+- [Adapter protocol and compatibility](docs/adapter-protocol.md)
 - [Smoke test](docs/smoke-test.md)
 - [Local E2E harness](docs/local-e2e.md)
 - [systemd units](deploy/systemd)

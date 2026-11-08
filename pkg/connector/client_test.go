@@ -220,7 +220,11 @@ func TestBackfillCursorUsesMinimumIDNotFirstChronologicalMessage(t *testing.T) {
 }
 
 func TestFetchMessagesUsesSidecarHistory(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rpc/state/chat" {
+			json.NewEncoder(w).Encode(sidecar.Response{ProtocolVersion: sidecar.ProtocolVersion, Outcome: sidecar.ResponseOutcome{Status: "ok", Data: json.RawMessage(`{"type":"chat_state","data":{}}`)}})
+			return
+		}
 		if r.URL.Path != "/rpc/history" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -272,7 +276,7 @@ func TestFetchMessagesUsesSidecarHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchMessages() error = %v", err)
 	}
-	if !resp.HasMore || !resp.MarkRead || resp.Forward {
+	if !resp.HasMore || resp.MarkRead || resp.Forward {
 		t.Fatalf("response flags = has_more:%v mark_read:%v forward:%v", resp.HasMore, resp.MarkRead, resp.Forward)
 	}
 	if resp.Cursor != networkid.PaginationCursor("7/19") {
@@ -287,7 +291,7 @@ func TestFetchMessagesUsesSidecarHistory(t *testing.T) {
 }
 
 func TestGetChatInfoFetchesFullInlineMembers(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/chat/participants" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -316,6 +320,7 @@ func TestGetChatInfoFetchesFullInlineMembers(t *testing.T) {
 		AccountID: "1",
 		Sidecar:   sidecar.NewClient(server.URL),
 		users:     make(map[int64]sidecar.UserRecord),
+		dialogs:   map[int64]sidecar.DialogRecord{7: {ChatID: 7, Structure: &sidecar.DialogStructure{Kind: "channel"}}},
 	}
 	info, err := ic.GetChatInfo(context.Background(), testPortal("7"))
 	if err != nil {
@@ -327,8 +332,8 @@ func TestGetChatInfoFetchesFullInlineMembers(t *testing.T) {
 	if info.Members.TotalMemberCount != 2 || len(info.Members.MemberMap) != 2 {
 		t.Fatalf("member count = %d/%d, want 2", info.Members.TotalMemberCount, len(info.Members.MemberMap))
 	}
-	if info.Type == nil || *info.Type != database.RoomTypeGroupDM {
-		t.Fatalf("Type = %#v, want group DM", info.Type)
+	if info.Type == nil || *info.Type != database.RoomTypeDefault {
+		t.Fatalf("Type = %#v, want ordinary channel", info.Type)
 	}
 	if info.Members.OtherUserID != "" {
 		t.Fatalf("OtherUserID = %q, want empty for group chat", info.Members.OtherUserID)
@@ -344,7 +349,7 @@ func TestGetChatInfoFetchesFullInlineMembers(t *testing.T) {
 
 func TestGetChatInfoUsesCachedDMDialogMembers(t *testing.T) {
 	calledParticipants := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calledParticipants = true
 		t.Fatalf("unexpected sidecar call %s", r.URL.Path)
 	}))
@@ -360,6 +365,7 @@ func TestGetChatInfoUsesCachedDMDialogMembers(t *testing.T) {
 			7: {
 				ChatID:     7,
 				PeerUserID: &peerUserID,
+				Structure:  &sidecar.DialogStructure{Kind: "direct", PeerUserID: &peerUserID},
 				Title:      stringPtr("Ada Lovelace"),
 			},
 		},
@@ -401,12 +407,13 @@ func TestChatInfoForDialogIncludesSelfForGroupWithoutParticipantFetch(t *testing
 	}
 
 	info := ic.chatInfoForDialog(context.Background(), sidecar.DialogRecord{
-		ChatID: 7,
-		Title:  &title,
+		ChatID:    7,
+		Structure: &sidecar.DialogStructure{Kind: "channel"},
+		Title:     &title,
 	}, &title)
 
-	if info.Type == nil || *info.Type != database.RoomTypeGroupDM {
-		t.Fatalf("Type = %#v, want group DM", info.Type)
+	if info.Type == nil || *info.Type != database.RoomTypeDefault {
+		t.Fatalf("Type = %#v, want ordinary channel", info.Type)
 	}
 	if info.Name == nil || *info.Name != title {
 		t.Fatalf("Name = %#v, want %q", info.Name, title)
@@ -430,7 +437,7 @@ func TestChatInfoForDialogIncludesSelfForGroupWithoutParticipantFetch(t *testing
 }
 
 func TestResolveIdentifierCreatesDM(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/chat/create-dm" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -474,7 +481,7 @@ func TestResolveIdentifierCreatesDM(t *testing.T) {
 }
 
 func TestHandleMatrixViewingChatMarksInlineChatRead(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/read" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -500,34 +507,16 @@ func TestHandleMatrixViewingChatMarksInlineChatRead(t *testing.T) {
 	}
 }
 
-func TestChatManagementCapabilitiesAreScopedToInlineThreads(t *testing.T) {
+func TestChatManagementCapabilitiesRequireSourcePermissionEvidence(t *testing.T) {
 	ic := &InlineClient{}
-	group := testPortal("7")
-	features := ic.GetCapabilities(context.Background(), group)
-	if !features.MarkAsUnread || !features.DeleteChat || !features.DeleteChatForEveryone {
-		t.Fatalf("group capabilities = %#v, want marked unread and delete-chat support", features)
-	}
-	if name := features.State[event.StateRoomName.Type]; name == nil || name.Level != event.CapLevelFullySupported {
-		t.Fatalf("room-name capability = %#v, want fully supported", name)
-	}
-	for _, action := range []event.MemberAction{
-		event.MemberActionInvite,
-		event.MemberActionKick,
-		event.MemberActionRevokeInvite,
-	} {
-		if features.MemberActions[action] != event.CapLevelFullySupported {
-			t.Fatalf("member action %q = %v, want fully supported", action, features.MemberActions[action])
+	for _, p := range []*bridgev2.Portal{testPortal("7"), testPortal("8"), testPortal("space:1")} {
+		features := ic.GetCapabilities(t.Context(), p)
+		if features.DeleteChat || features.DeleteChatForEveryone || len(features.State) > 0 || len(features.MemberActions) > 0 || features.CustomEmojiReactions {
+			t.Fatalf("unproven mutation/custom emoji capabilities advertised: %+v", features)
 		}
-	}
-
-	dm := testPortal("8")
-	dm.OtherUserID = makeUserID("42")
-	dmFeatures := ic.GetCapabilities(context.Background(), dm)
-	if !dmFeatures.MarkAsUnread {
-		t.Fatal("DM marked-unread capability = false, want true")
-	}
-	if dmFeatures.DeleteChat || len(dmFeatures.State) != 0 || len(dmFeatures.MemberActions) != 0 {
-		t.Fatalf("DM chat-management capabilities = %#v, want no thread-only operations", dmFeatures)
+		if !features.MarkAsUnread {
+			t.Fatal("explicit user marked-unread action missing")
+		}
 	}
 }
 
@@ -545,7 +534,7 @@ func TestDialogDisplayNameKeepsEmojiSeparateFromTitle(t *testing.T) {
 func TestDialogSyncUsesOneLiveSnapshotThenCachedPages(t *testing.T) {
 	liveCalls := 0
 	cachedCalls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/rpc/dialogs":
 			liveCalls++
@@ -577,7 +566,7 @@ func TestDialogSyncUsesOneLiveSnapshotThenCachedPages(t *testing.T) {
 func TestReplayReconciliationUsesOneLiveSnapshotThenCachedPages(t *testing.T) {
 	liveCalls := 0
 	cachedCalls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/rpc/dialogs":
 			liveCalls++
@@ -618,7 +607,7 @@ func TestRateLimitRetryDelayUsesTypedHint(t *testing.T) {
 }
 
 func TestMatrixChatManagementCallsSidecar(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/rpc/marked-unread":
 			var request sidecar.SetMarkedUnreadRequest
@@ -966,7 +955,7 @@ func TestDialogVisibilityChangeTriggersResyncComparison(t *testing.T) {
 
 func TestShouldProjectChatLoadsUnknownHiddenDialogVisibility(t *testing.T) {
 	hidden := true
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/state/chat" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -995,7 +984,7 @@ func TestShouldProjectChatLoadsUnknownHiddenDialogVisibility(t *testing.T) {
 
 func TestChatUpsertRefreshesVisibleDialogToHiddenBeforeProjection(t *testing.T) {
 	hidden := true
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/rpc/state/chat" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -1114,9 +1103,9 @@ func TestPrioritizedHistoryDialogsPrefersActiveDMsAndNewest(t *testing.T) {
 	got := ic.prioritizedHistoryDialogs([]sidecar.DialogRecord{
 		{ChatID: 2, LastMessageID: &last40},
 		{ChatID: 5, LastMessageID: &last9},
-		{ChatID: 1, PeerUserID: &peer100, LastMessageID: &last5},
+		{ChatID: 1, Structure: &sidecar.DialogStructure{Kind: "direct", PeerUserID: &peer100}, PeerUserID: &peer100, LastMessageID: &last5},
 		{ChatID: 4, LastMessageID: &last22},
-		{ChatID: 3, PeerUserID: &peer101, LastMessageID: &last30},
+		{ChatID: 3, Structure: &sidecar.DialogStructure{Kind: "direct", PeerUserID: &peer101}, PeerUserID: &peer101, LastMessageID: &last30},
 	})
 
 	want := []int64{4, 3, 1, 2}
@@ -1187,7 +1176,7 @@ func TestIsRateLimitedErrorDetectsInlineFloodResponses(t *testing.T) {
 func TestSyncDeferredDialogWorkStopsOnRateLimitedHistory(t *testing.T) {
 	var historyCalls int
 	var participantsCalls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/rpc/history":
 			historyCalls++
@@ -1219,7 +1208,7 @@ func TestSyncDeferredDialogWorkStopsOnRateLimitedHistory(t *testing.T) {
 }
 
 func TestGetUserInfoUsesCachedInlineUser(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/avatar.jpg" {
 			t.Fatalf("path = %s, want /avatar.jpg", r.URL.Path)
 		}
@@ -1265,7 +1254,7 @@ func TestGetUserInfoUsesCachedInlineUser(t *testing.T) {
 }
 
 func TestDownloadInlineMedia(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("method = %s, want GET", r.Method)
 		}
@@ -1292,7 +1281,7 @@ func TestDownloadInlineMediaRejectsUnsupportedScheme(t *testing.T) {
 
 func TestDownloadInlineMediaClassifiesPermanentAndRetryableHTTPFailures(t *testing.T) {
 	status := http.StatusNotFound
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(status)
 	}))
 	defer server.Close()
@@ -1363,7 +1352,7 @@ func TestSidecarErrorCertaintyOnlyMarksPermanentFailures(t *testing.T) {
 
 func TestDuplicateSidecarReplayOnlyReacknowledgesContiguousCursor(t *testing.T) {
 	acked := make(chan sidecar.EventAckRequest, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request sidecar.EventAckRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("decode ack request: %v", err)
@@ -1471,4 +1460,131 @@ func mustConnectorJSON(t *testing.T, value any) json.RawMessage {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func newSidecarTestServer(handler http.Handler) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/compatibility" {
+			json.NewEncoder(w).Encode(sidecar.ProtocolInfo{ProtocolVersion: sidecar.ProtocolVersion})
+			return
+		}
+		if r.URL.Path == "/rpc/state/account" {
+			json.NewEncoder(w).Encode(sidecar.Response{ProtocolVersion: sidecar.ProtocolVersion, Outcome: sidecar.ResponseOutcome{Status: "ok", Data: json.RawMessage(`{"type":"account_state","data":{"deleted_chat_ids":[]}}`)}})
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
+}
+
+func TestFinalReviewBackwardPageMustNotSkipHistoricalGap(t *testing.T) {
+	t.Run("backward", func(t *testing.T) { checkGenericPageDoesNotSkipHistory(t, false) })
+	t.Run("unrelated-forward-anchor", func(t *testing.T) { checkGenericPageDoesNotSkipHistory(t, true) })
+}
+
+func checkGenericPageDoesNotSkipHistory(t *testing.T, forward bool) {
+	t.Helper()
+	messageID := int64(20)
+	if forward {
+		messageID = 22
+	}
+	path := t.TempDir() + "/history.db"
+	ic := fixtureHistoryClient(t, path)
+	if err := ic.persistHistoryCheckpoint(t.Context(), 7, 10); err != nil {
+		t.Fatal(err)
+	}
+	key := ic.portalKeyForChat(7)
+	for _, row := range []*database.Message{
+		{ID: "7/10", MXID: "$10", Room: key, Timestamp: time.Unix(200, 0)},
+		{ID: "7/21", MXID: "$21", Room: key, Timestamp: time.Unix(100, 0)},
+	} {
+		if err := ic.UserLogin.Bridge.DB.Message.Insert(t.Context(), row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	anchor, err := ic.UserLogin.Bridge.DB.Message.GetFirstPortalMessage(t.Context(), key)
+	if err != nil || anchor.ID != "7/21" {
+		t.Fatalf("actual backward anchor: %+v %v", anchor, err)
+	}
+	server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/rpc/state/chat":
+			writeConnectorSidecarResult(t, w, "chat_state", sidecar.ChatStateSnapshot{ChatID: 7})
+		case "/rpc/history":
+			var req sidecar.HistoryRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Error(err)
+			}
+			if (forward && (req.AfterMessageID == nil || *req.AfterMessageID != 21)) || (!forward && (req.BeforeMessageID == nil || *req.BeforeMessageID != 21)) || req.Limit == nil || *req.Limit != 1 {
+				t.Errorf("unexpected request: %+v", req)
+			}
+			writeConnectorSidecarResult(t, w, "history", sidecar.HistoryPage{HasMore: true, Messages: []sidecar.MessageRecord{{ChatID: 7, MessageID: messageID, Timestamp: 50, Content: sidecar.MessageContent{Type: "text", Text: "synthetic"}}}})
+		default:
+			t.Errorf("unexpected route: %s", r.URL.Path)
+			w.WriteHeader(400)
+		}
+	}))
+	defer server.Close()
+	ic.Sidecar = sidecar.NewClient(server.URL)
+	// A plain portal keeps message conversion independent of Matrix I/O. The
+	// completion callback uses the real SQLite mapping/metadata store above.
+	p := testPortal("7")
+	p.Receiver = key.Receiver
+	resp, err := ic.FetchMessages(t.Context(), bridgev2.FetchMessagesParams{Portal: p, Forward: forward, AnchorMessage: anchor, Count: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Messages) != 1 || resp.Messages[0].ID != makeMessageID(7, messageID) || resp.CompleteCallback == nil {
+		t.Fatalf("backfill response: %+v", resp)
+	}
+	if err = ic.UserLogin.Bridge.DB.Message.Insert(t.Context(), &database.Message{ID: makeMessageID(7, messageID), MXID: "$page", Room: key, Timestamp: time.Unix(50, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	resp.CompleteCallback()
+	restarted := fixtureHistoryClient(t, path)
+	got, err := restarted.loadHistoryCheckpoint(t.Context(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 10 {
+		t.Fatalf("generic callback advanced frontier to %d while source IDs11..19 have no mappings; expected10", got)
+	}
+}
+
+func TestGetChatInfoPreservesUnknownMembershipForEmptyParticipants(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		participants []sidecar.ChatParticipantRecord
+	}{
+		{"empty", nil},
+		{"all-invalid", []sidecar.ChatParticipantRecord{{UserID: 0}, {UserID: -1}, {UserID: -9223372036854775808}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/rpc/chat/participants" {
+					t.Errorf("unexpected path %s", r.URL.Path)
+					w.WriteHeader(400)
+					return
+				}
+				calls++
+				writeConnectorSidecarResult(t, w, "chat_participants", sidecar.ChatParticipantsPage{Participants: tc.participants})
+			}))
+			defer server.Close()
+			ic := &InlineClient{
+				UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "1"}},
+				AccountID: "1", Sidecar: sidecar.NewClient(server.URL),
+				dialogs: map[int64]sidecar.DialogRecord{7: {ChatID: 7, Structure: &sidecar.DialogStructure{Kind: "channel"}}},
+			}
+			info, err := ic.GetChatInfo(t.Context(), testPortal("7"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info == nil || info.Members != nil {
+				t.Fatalf("unknown participant response became authoritative membership: %+v", info)
+			}
+			if info.Type == nil || *info.Type != database.RoomTypeDefault || calls != 1 {
+				t.Fatalf("lost channel info/call: %+v calls%d", info, calls)
+			}
+		})
+	}
 }

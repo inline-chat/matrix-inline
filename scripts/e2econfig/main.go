@@ -158,6 +158,8 @@ func patchBridgeConfig(doc map[string]any, patch bridgePatch) {
 		patch.HomeserverDomain: "user",
 		adminMXID:              "admin",
 	})
+	// Cached source history uses the framework's historical-delivery path.
+	setPath(doc, "backfill.enabled", true)
 }
 
 type synapsePatch struct {
@@ -174,6 +176,12 @@ func patchSynapseConfig(doc map[string]any, patch synapsePatch) {
 	setPath(doc, "app_service_config_files", []any{patch.RegistrationPath})
 	setPath(doc, "report_stats", false)
 	setPath(doc, "suppress_key_server_warning", true)
+	// Repeated fixture runs log in and create/join several synthetic rooms.
+	// Keep the local server's limits above that deterministic test workload.
+	for _, path := range []string{"rc_login.address", "rc_login.account", "rc_room_creation", "rc_joins.local", "rc_message"} {
+		setPath(doc, path+".per_second", 10)
+		setPath(doc, path+".burst_count", 100)
+	}
 }
 
 func readYAMLMap(path string) (map[string]any, error) {

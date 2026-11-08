@@ -47,11 +47,12 @@ type InlineConnector struct {
 }
 
 type Config struct {
-	DisplayName   string `yaml:"displayname" json:"displayname"`
-	NetworkURL    string `yaml:"network_url" json:"network_url"`
-	NetworkIcon   string `yaml:"network_icon" json:"network_icon"`
-	SidecarURL    string `yaml:"sidecar_url" json:"sidecar_url"`
-	HiddenDialogs string `yaml:"hidden_dialogs" json:"hidden_dialogs"`
+	DisplayName           string `yaml:"displayname" json:"displayname"`
+	NetworkURL            string `yaml:"network_url" json:"network_url"`
+	NetworkIcon           string `yaml:"network_icon" json:"network_icon"`
+	SidecarURL            string `yaml:"sidecar_url" json:"sidecar_url"`
+	HiddenDialogs         string `yaml:"hidden_dialogs" json:"hidden_dialogs"`
+	MuteChannelsByDefault *bool  `yaml:"mute_channels_by_default" json:"mute_channels_by_default"`
 }
 
 type UserLoginMetadata struct {
@@ -65,6 +66,7 @@ type UserLoginMetadata struct {
 	BridgeRecoveryCursor   int64  `json:"bridge_recovery_cursor,omitempty"`
 	DialogSyncCursor       string `json:"dialog_sync_cursor,omitempty"`
 	HiddenDialogs          string `json:"hidden_dialogs,omitempty"`
+	ChannelMuteDefault     string `json:"channel_mute_default,omitempty"`
 	SessionInvalidated     bool   `json:"session_invalidated,omitempty"`
 }
 
@@ -74,7 +76,8 @@ type MessageMetadata struct {
 }
 
 type PortalMetadata struct {
-	HistoryCheckpoint int64 `json:"history_checkpoint,omitempty"`
+	HistoryCheckpoint    int64 `json:"history_checkpoint,omitempty"`
+	HistoricalCheckpoint int64 `json:"historical_checkpoint,omitempty"`
 }
 
 func (meta *PortalMetadata) CopyFrom(other any) {
@@ -103,6 +106,7 @@ var _ bridgev2.NetworkConnector = (*InlineConnector)(nil)
 
 func (ic *InlineConnector) Init(bridge *bridgev2.Bridge) {
 	ic.br = bridge
+	disableImplicitHistoryRead(bridge)
 	registerInlineCommands(bridge)
 }
 
@@ -130,16 +134,16 @@ func validatePortalEventDelivery() error {
 }
 
 func (ic *InlineConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 2, 1
+	return 3, 2
 }
 
 func (ic *InlineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 	return &bridgev2.NetworkGeneralCapabilities{
 		AggressiveUpdateInfo: true,
-		ImplicitReadReceipts: true,
+		ImplicitReadReceipts: false,
 		Provisioning: bridgev2.ProvisioningCapabilities{
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
-				LookupUsername: true,
+				LookupUsername: false,
 				Search:         false,
 				ContactList:    false,
 				CreateDM:       true,
@@ -154,7 +158,7 @@ func (ic *InlineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilitie
 						MaxLength: 256,
 					},
 					Topic: bridgev2.GroupFieldCapability{
-						Allowed:   true,
+						Allowed:   false,
 						MaxLength: 4096,
 					},
 					Participants: bridgev2.GroupFieldCapability{
@@ -187,6 +191,9 @@ sidecar_url: http://127.0.0.1:29342
 # Whether dialogs hidden from Inline's normal chat list should be projected to Matrix.
 # Per-account bridge bot settings can override this default.
 hidden_dialogs: exclude
+# Desired policy for new channels only. Automatic mute writes are currently
+# disabled because target origin attribution is unverified; mute manually.
+mute_channels_by_default: true
 `, &ic.Config, nil
 }
 
@@ -351,6 +358,8 @@ func newInlineClient(login *bridgev2.UserLogin, meta *UserLoginMetadata, sidecar
 		bridgeRecoveryCursor:   meta.BridgeRecoveryCursor,
 		dialogSyncCursor:       meta.DialogSyncCursor,
 		hiddenDialogsDefault:   hiddenDialogsPolicyForLogin(login),
+		channelMuteDefault:     channelMuteDefaultForLogin(login),
+		channelMuteOverride:    channelMutePolicyFromMetadata(meta.ChannelMuteDefault),
 		hiddenDialogsOverride:  hiddenDialogsPolicyFromMetadata(meta.HiddenDialogs),
 		loggedIn:               !meta.SessionInvalidated,
 		users:                  make(map[int64]sidecar.UserRecord),

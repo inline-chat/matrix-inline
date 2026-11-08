@@ -405,7 +405,6 @@ impl AdapterEventStore {
         let latest = latest_sequence(&connection, &namespace)?;
         if expected_generation
             .map(str::trim)
-            .filter(|expected| !expected.is_empty())
             .is_some_and(|expected| expected != generation)
         {
             return Err(AdapterEventStoreError::GenerationChanged {
@@ -599,6 +598,43 @@ mod tests {
     use inline_client::{ClientStatus, InlineId};
 
     use super::*;
+
+    #[hegel::test(test_cases = 1000)]
+    fn acknowledgement_requires_the_supplied_generation(tc: hegel::TestCase) {
+        let namespace = format!("fixture-{}", tc.draw(hegel::generators::integers::<u64>()));
+        let suffix = tc.draw(hegel::generators::text());
+        let store = AdapterEventStore::open_in_memory(namespace.clone()).unwrap();
+        let first = store
+            .append(ClientEvent::ChatUpserted {
+                chat_id: InlineId::new(7),
+            })
+            .unwrap();
+        for invalid in [
+            String::new(),
+            " \t ".to_owned(),
+            format!("{}-other-{suffix}", first.generation),
+        ] {
+            match store.acknowledge_for_generation(&namespace, Some(&invalid), 1) {
+                Err(AdapterEventStoreError::GenerationChanged {
+                    generation,
+                    latest_sequence,
+                }) => {
+                    assert_eq!(generation, first.generation);
+                    assert_eq!(latest_sequence, 1);
+                }
+                other => panic!("wrong/missing generation must not acknowledge: {other:?}"),
+            }
+            assert_eq!(store.replay(&namespace, 0).unwrap(), vec![first.clone()]);
+        }
+        store
+            .acknowledge_for_generation(&namespace, Some(&first.generation), 0)
+            .unwrap();
+        assert_eq!(store.replay(&namespace, 0).unwrap(), vec![first.clone()]);
+        store
+            .acknowledge_for_generation(&namespace, Some(&first.generation), 1)
+            .unwrap();
+        assert!(store.replay(&namespace, 1).unwrap().is_empty());
+    }
 
     #[test]
     fn lossless_events_are_sequenced_replayed_and_acknowledged() {

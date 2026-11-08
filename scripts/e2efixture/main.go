@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,6 +33,12 @@ const (
 
 type fixtureServer struct {
 	mu            sync.Mutex
+	saveMu        sync.Mutex
+	generation    string
+	spaces        []sidecar.SpaceRecord
+	access        []sidecar.SpaceAccessRecord
+	readStates    map[int64]sidecar.ReadStateRecord
+	sourceCalls   map[string]int
 	statePath     string
 	loggedIn      bool
 	nextMessageID int64
@@ -45,13 +52,22 @@ type fixtureServer struct {
 }
 
 type fixtureEvent struct {
-	sequence uint64
-	payload  []byte
+	Sequence uint64          `json:"sequence"`
+	Payload  json.RawMessage `json:"payload"`
 }
 
 type storedState struct {
-	LoggedIn      bool  `json:"logged_in"`
-	NextMessageID int64 `json:"next_message_id"`
+	LoggedIn      bool                              `json:"logged_in"`
+	NextMessageID int64                             `json:"next_message_id"`
+	Generation    string                            `json:"generation"`
+	Sequence      uint64                            `json:"sequence"`
+	Events        []fixtureEvent                    `json:"events"`
+	Dialogs       []sidecar.DialogRecord            `json:"dialogs"`
+	Spaces        []sidecar.SpaceRecord             `json:"spaces"`
+	Access        []sidecar.SpaceAccessRecord       `json:"access"`
+	ReadStates    map[int64]sidecar.ReadStateRecord `json:"read_states"`
+	History       map[int64][]sidecar.MessageRecord `json:"history"`
+	SourceCalls   map[string]int                    `json:"source_calls"`
 }
 
 type sentText struct {
@@ -94,6 +110,11 @@ func newFixtureServer(statePath string) *fixtureServer {
 	groupLast := int64(6001)
 	return &fixtureServer{
 		statePath:     statePath,
+		generation:    rand.Text(),
+		spaces:        []sidecar.SpaceRecord{{SpaceID: 301, Name: "Fixture Workspace A"}, {SpaceID: 302, Name: "Fixture Workspace B"}},
+		access:        []sidecar.SpaceAccessRecord{{SpaceID: 301, Status: "accessible"}, {SpaceID: 302, Status: "accessible"}},
+		readStates:    map[int64]sidecar.ReadStateRecord{101: {ChatID: 101}, 202: {ChatID: 202, ReadMaxID: int64Ptr(6000), MarkedUnread: true}, 208: {ChatID: 208, ReadMaxID: int64Ptr(10), MarkedUnread: true}},
+		sourceCalls:   make(map[string]int),
 		nextMessageID: 7000,
 		users: []sidecar.UserRecord{
 			{UserID: accountID, DisplayName: stringPtr("Fixture Self"), Username: stringPtr("fixture_self")},
@@ -101,10 +122,17 @@ func newFixtureServer(statePath string) *fixtureServer {
 			{UserID: groupUserID, DisplayName: stringPtr("Lin Fixture"), Username: stringPtr("lin_fixture")},
 		},
 		dialogs: []sidecar.DialogRecord{
-			{ChatID: dmChatID, PeerUserID: int64Ptr(peerUserID), Title: &dmTitle, LastMessageID: &dmLast},
-			{ChatID: groupChatID, Title: &groupTitle, LastMessageID: &groupLast},
+			{Structure: &sidecar.DialogStructure{Kind: "direct", PeerUserID: int64Ptr(peerUserID)}, ChatID: dmChatID, PeerUserID: int64Ptr(peerUserID), Title: &dmTitle, LastMessageID: &dmLast},
+			{Structure: &sidecar.DialogStructure{Kind: "channel", SpaceID: int64Ptr(301)}, SpaceID: int64Ptr(301), NotificationMode: stringPtr("mentions"), IsPublic: boolPtr(false), ChatID: groupChatID, Title: &groupTitle, LastMessageID: &groupLast},
+			{ChatID: 203, Title: stringPtr("Fixture Public"), Structure: &sidecar.DialogStructure{Kind: "channel", SpaceID: int64Ptr(301)}, SpaceID: int64Ptr(301), IsPublic: boolPtr(true), NotificationMode: stringPtr("all")},
+			{ChatID: 208, Title: stringPtr("Fixture Receipt Order"), Structure: &sidecar.DialogStructure{Kind: "channel", SpaceID: int64Ptr(301)}, SpaceID: int64Ptr(301), LastMessageID: int64Ptr(20)},
+			{ChatID: 404, Title: stringPtr("Fixture Hidden"), Structure: &sidecar.DialogStructure{Kind: "channel"}, ChatListHidden: boolPtr(true)},
+			{ChatID: 405, Title: stringPtr("Fixture Child"), Structure: &sidecar.DialogStructure{Kind: "reply_child", ParentChatID: int64Ptr(202), ParentMessageID: int64Ptr(6001)}, ParentChatID: int64Ptr(202), ParentMessageID: int64Ptr(6001), ChatListHidden: boolPtr(true)},
+			{ChatID: 406, Title: stringPtr("Fixture Unknown")},
+			{ChatID: 407, Title: stringPtr("Fixture Archived"), Structure: &sidecar.DialogStructure{Kind: "channel"}, Archived: boolPtr(true), NotificationMode: stringPtr("none")},
 		},
 		history: map[int64][]sidecar.MessageRecord{
+			208: {{ChatID: 208, MessageID: 20, SenderID: groupUserID, Timestamp: 100, Content: sidecar.MessageContent{Type: "text", Text: "fixture source unread 20"}}, {ChatID: 208, MessageID: 10, SenderID: groupUserID, Timestamp: 200, Content: sidecar.MessageContent{Type: "text", Text: "fixture source read 10"}}},
 			dmChatID: {{
 				ChatID:    dmChatID,
 				MessageID: dmLast,
@@ -125,6 +153,7 @@ func newFixtureServer(statePath string) *fixtureServer {
 }
 
 func (srv *fixtureServer) register(mux *http.ServeMux) {
+	mux.HandleFunc("/compatibility", func(w http.ResponseWriter, r *http.Request) { srv.writeJSON(w, srv.protocol()) })
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/status", srv.handleStatus)
 	mux.HandleFunc("/rpc/resume", srv.handleResume)
@@ -135,18 +164,22 @@ func (srv *fixtureServer) register(mux *http.ServeMux) {
 	mux.HandleFunc("/rpc/dialogs", srv.handleDialogs)
 	mux.HandleFunc("/rpc/state/dialogs", srv.handleDialogs)
 	mux.HandleFunc("/rpc/history", srv.handleHistory)
+	mux.HandleFunc("/rpc/state/chat/history", srv.handleHistory)
+	mux.HandleFunc("/rpc/state/account", srv.handleAccountState)
+	mux.HandleFunc("/rpc/state/chat", srv.handleChatState)
 	mux.HandleFunc("/rpc/chat/participants", srv.handleParticipants)
 	mux.HandleFunc("/rpc/chat/participants/add", srv.handleEmpty)
 	mux.HandleFunc("/rpc/chat/participants/remove", srv.handleEmpty)
 	mux.HandleFunc("/rpc/chat/info", srv.handleEmpty)
 	mux.HandleFunc("/rpc/chat/delete", srv.handleEmpty)
 	mux.HandleFunc("/rpc/send", srv.handleSend)
-	mux.HandleFunc("/rpc/read", srv.handleEmpty)
+	mux.HandleFunc("/rpc/read", srv.handleRead)
 	mux.HandleFunc("/rpc/marked-unread", srv.handleEmpty)
 	mux.HandleFunc("/rpc/dialog/notifications", srv.handleEmpty)
 	mux.HandleFunc("/rpc/typing", srv.handleEmpty)
 	mux.HandleFunc("/rpc/events/ack", srv.handleEventAck)
 	mux.HandleFunc("/ws/events", srv.handleEvents)
+	mux.HandleFunc("/fixture/presentation", srv.handlePresentation)
 	mux.HandleFunc("/fixture/sent", srv.handleFixtureSent)
 	mux.HandleFunc("/fixture/status", srv.handleFixtureStatus)
 	mux.HandleFunc("/fixture/push-message", srv.handleFixturePushMessage)
@@ -154,9 +187,10 @@ func (srv *fixtureServer) register(mux *http.ServeMux) {
 
 func (srv *fixtureServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	srv.writeJSON(w, sidecar.Health{
-		OK:       true,
-		Protocol: srv.protocol(),
-		Status:   srv.status().Status,
+		OK:              true,
+		EventGeneration: srv.generation,
+		Protocol:        srv.protocol(),
+		Status:          srv.status().Status,
 	})
 }
 
@@ -230,6 +264,8 @@ func (srv *fixtureServer) handleDialogs(w http.ResponseWriter, r *http.Request) 
 	if !decodeRequest(w, r, &req) || !srv.requireLogin(w) {
 		return
 	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 	limit := len(srv.dialogs)
 	if req.Limit != nil && int(*req.Limit) < limit {
 		limit = int(*req.Limit)
@@ -245,6 +281,8 @@ func (srv *fixtureServer) handleHistory(w http.ResponseWriter, r *http.Request) 
 	if !decodeRequest(w, r, &req) || !srv.requireLogin(w) {
 		return
 	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 	messages := append([]sidecar.MessageRecord(nil), srv.history[req.ChatID]...)
 	messages = filterHistory(messages, req.BeforeMessageID, req.AfterMessageID)
 	if req.Limit != nil && int(*req.Limit) < len(messages) {
@@ -317,6 +355,12 @@ func (srv *fixtureServer) handleSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *fixtureServer) handleEmpty(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/rpc/marked-unread" || r.URL.Path == "/rpc/dialog/notifications" {
+		srv.mu.Lock()
+		srv.sourceCalls[r.URL.Path]++
+		srv.mu.Unlock()
+		_ = srv.saveState()
+	}
 	if !srv.requireLogin(w) {
 		return
 	}
@@ -331,11 +375,11 @@ func (srv *fixtureServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	afterSequence, _ := strconv.ParseUint(r.URL.Query().Get("after_sequence"), 10, 64)
 	srv.mu.Lock()
 	for _, event := range srv.events {
-		if event.sequence <= afterSequence {
+		if event.Sequence <= afterSequence {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		err := conn.Write(ctx, websocket.MessageText, event.payload)
+		err := conn.Write(ctx, websocket.MessageText, event.Payload)
 		cancel()
 		if err != nil {
 			srv.mu.Unlock()
@@ -363,7 +407,7 @@ func (srv *fixtureServer) handleEventAck(w http.ResponseWriter, r *http.Request)
 		srv.writeError(w, err)
 		return
 	}
-	srv.writeJSON(w, sidecar.EventAckResponse{AcknowledgedSequence: request.Sequence})
+	srv.writeJSON(w, sidecar.EventAckResponse{Generation: request.Generation, AcknowledgedSequence: request.Sequence})
 }
 
 func (srv *fixtureServer) handleFixtureSent(w http.ResponseWriter, r *http.Request) {
@@ -380,6 +424,10 @@ func (srv *fixtureServer) handleFixtureStatus(w http.ResponseWriter, r *http.Req
 		"event_clients":   len(srv.clients),
 		"sent_texts":      len(srv.sent),
 		"next_message_id": srv.nextMessageID,
+		"source_calls":    srv.sourceCalls,
+		"read_states":     srv.readStates,
+		"generation":      srv.generation,
+		"sequence":        srv.sequence,
 	})
 }
 
@@ -389,6 +437,7 @@ func (srv *fixtureServer) handleFixturePushMessage(w http.ResponseWriter, r *htt
 		SenderID  int64  `json:"sender_id"`
 		MessageID int64  `json:"message_id"`
 		Text      string `json:"text"`
+		Timestamp int64  `json:"timestamp"`
 	}
 	if !decodeRequest(w, r, &req) || !srv.requireLogin(w) {
 		return
@@ -412,7 +461,7 @@ func (srv *fixtureServer) handleFixturePushMessage(w http.ResponseWriter, r *htt
 		ChatID:    req.ChatID,
 		MessageID: req.MessageID,
 		SenderID:  req.SenderID,
-		Timestamp: time.Now().Unix(),
+		Timestamp: req.Timestamp,
 		Content:   sidecar.MessageContent{Type: "text", Text: req.Text},
 	}
 	srv.history[req.ChatID] = append(srv.history[req.ChatID], record)
@@ -464,6 +513,9 @@ func (srv *fixtureServer) requireLogin(w http.ResponseWriter) bool {
 func (srv *fixtureServer) setLastMessageIDLocked(chatID, messageID int64) {
 	for idx := range srv.dialogs {
 		if srv.dialogs[idx].ChatID == chatID {
+			if srv.dialogs[idx].LastMessageID != nil && *srv.dialogs[idx].LastMessageID > messageID {
+				return
+			}
 			srv.dialogs[idx].LastMessageID = &messageID
 			return
 		}
@@ -483,6 +535,7 @@ func (srv *fixtureServer) broadcast(event map[string]any) error {
 		"protocol_version":  sidecar.ProtocolVersion,
 		"session_namespace": strconv.FormatInt(accountID, 10),
 		"sequence":          sequence,
+		"generation":        srv.generation,
 		"reliability":       sidecar.EventLossless,
 		"event":             event,
 	}
@@ -491,8 +544,11 @@ func (srv *fixtureServer) broadcast(event map[string]any) error {
 		return err
 	}
 	srv.mu.Lock()
-	srv.events = append(srv.events, fixtureEvent{sequence: sequence, payload: data})
+	srv.events = append(srv.events, fixtureEvent{Sequence: sequence, Payload: data})
 	srv.mu.Unlock()
+	if err := srv.saveState(); err != nil {
+		return err
+	}
 	for _, conn := range clients {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := conn.Write(ctx, websocket.MessageText, data)
@@ -516,6 +572,29 @@ func (srv *fixtureServer) loadState() error {
 		return fmt.Errorf("parse fixture state: %w", err)
 	}
 	srv.loggedIn = state.LoggedIn
+	if state.Generation != "" {
+		srv.generation = state.Generation
+	}
+	srv.sequence = state.Sequence
+	srv.events = state.Events
+	if state.Dialogs != nil {
+		srv.dialogs = state.Dialogs
+	}
+	if state.Spaces != nil {
+		srv.spaces = state.Spaces
+	}
+	if state.Access != nil {
+		srv.access = state.Access
+	}
+	if state.ReadStates != nil {
+		srv.readStates = state.ReadStates
+	}
+	if state.History != nil {
+		srv.history = state.History
+	}
+	if state.SourceCalls != nil {
+		srv.sourceCalls = state.SourceCalls
+	}
 	if state.NextMessageID > 0 {
 		srv.nextMessageID = state.NextMessageID
 	}
@@ -523,17 +602,23 @@ func (srv *fixtureServer) loadState() error {
 }
 
 func (srv *fixtureServer) saveState() error {
+	srv.saveMu.Lock()
+	defer srv.saveMu.Unlock()
 	srv.mu.Lock()
-	state := storedState{LoggedIn: srv.loggedIn, NextMessageID: srv.nextMessageID}
+	state := storedState{LoggedIn: srv.loggedIn, NextMessageID: srv.nextMessageID, Generation: srv.generation, Sequence: srv.sequence, Events: srv.events, Dialogs: srv.dialogs, Spaces: srv.spaces, Access: srv.access, ReadStates: srv.readStates, History: srv.history, SourceCalls: srv.sourceCalls}
+	data, err := json.Marshal(state)
 	srv.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(srv.statePath), 0o700); err != nil {
-		return fmt.Errorf("create fixture state dir: %w", err)
-	}
-	data, err := json.MarshalIndent(state, "", "\t")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(srv.statePath, data, 0o600)
+	if err = os.MkdirAll(filepath.Dir(srv.statePath), 0o700); err != nil {
+		return err
+	}
+	tmp := srv.statePath + ".tmp"
+	if err = os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, srv.statePath)
 }
 
 func (srv *fixtureServer) writeResult(w http.ResponseWriter, resultType string, data any) {
@@ -611,4 +696,148 @@ func stringPtr(value string) *string {
 
 func int64Ptr(value int64) *int64 {
 	return &value
+}
+
+func boolPtr(v bool) *bool { return &v }
+func (srv *fixtureServer) handleAccountState(w http.ResponseWriter, r *http.Request) {
+	if !srv.requireLogin(w) {
+		return
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.writeResult(w, "account_state", sidecar.AccountStateSnapshot{Spaces: srv.spaces, SpaceAccess: srv.access, SpaceAccessComplete: true, Users: srv.users, DeletedChatIDs: []int64{}})
+}
+func (srv *fixtureServer) handleChatState(w http.ResponseWriter, r *http.Request) {
+	var req sidecar.ChatStateRequest
+	if !decodeRequest(w, r, &req) || !srv.requireLogin(w) {
+		return
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	state := sidecar.ChatStateSnapshot{ChatID: req.ChatID, DeletedMessageIDs: []int64{}, ReactionSnapshotMessageIDs: []int64{}}
+	for _, d := range srv.dialogs {
+		if d.ChatID == req.ChatID {
+			copy := d
+			state.Dialog = &copy
+			break
+		}
+	}
+	if read, ok := srv.readStates[req.ChatID]; ok {
+		state.ReadState = &read
+	}
+	srv.writeResult(w, "chat_state", state)
+}
+func (srv *fixtureServer) handleRead(w http.ResponseWriter, r *http.Request) {
+	var req sidecar.ReadRequest
+	if !decodeRequest(w, r, &req) || !srv.requireLogin(w) {
+		return
+	}
+	srv.mu.Lock()
+	srv.sourceCalls["/rpc/read"]++
+	state := srv.readStates[req.ChatID]
+	state.ChatID = req.ChatID
+	state.ReadMaxID = req.MaxMessageID
+	state.MarkedUnread = false
+	srv.readStates[req.ChatID] = state
+	srv.mu.Unlock()
+	_ = srv.saveState()
+	srv.writeResult(w, "empty", struct{}{})
+}
+func (srv *fixtureServer) handlePresentation(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action       string `json:"action"`
+		ChatID       int64  `json:"chat_id"`
+		SpaceID      int64  `json:"space_id"`
+		ReadMaxID    int64  `json:"read_max_id"`
+		MarkedUnread bool   `json:"marked_unread"`
+	}
+	if !decodeRequest(w, r, &req) {
+		return
+	}
+	if req.ChatID == 0 {
+		req.ChatID = 202
+	}
+	var evt map[string]any
+	srv.mu.Lock()
+	switch req.Action {
+	case "receipt_case":
+		if req.ChatID <= 0 {
+			srv.mu.Unlock()
+			http.Error(w, "receipt case requires a positive chat ID", http.StatusBadRequest)
+			return
+		}
+		for _, d := range srv.dialogs {
+			if d.ChatID == req.ChatID {
+				srv.mu.Unlock()
+				http.Error(w, "receipt case already exists", http.StatusConflict)
+				return
+			}
+		}
+		srv.dialogs = append(srv.dialogs, sidecar.DialogRecord{ChatID: req.ChatID, Title: stringPtr("Fixture Receipt Order"), Structure: &sidecar.DialogStructure{Kind: "channel", SpaceID: int64Ptr(301)}, SpaceID: int64Ptr(301), LastMessageID: int64Ptr(20)})
+		srv.history[req.ChatID] = []sidecar.MessageRecord{
+			{ChatID: req.ChatID, MessageID: 20, SenderID: groupUserID, Timestamp: 100, Content: sidecar.MessageContent{Type: "text", Text: "fixture source unread 20"}},
+			{ChatID: req.ChatID, MessageID: 10, SenderID: groupUserID, Timestamp: 200, Content: sidecar.MessageContent{Type: "text", Text: "fixture source read 10"}},
+		}
+		srv.readStates[req.ChatID] = sidecar.ReadStateRecord{ChatID: req.ChatID, ReadMaxID: int64Ptr(10), MarkedUnread: true}
+		evt = map[string]any{"ChatUpserted": map[string]any{"chat_id": req.ChatID}}
+	case "read":
+		srv.readStates[req.ChatID] = sidecar.ReadStateRecord{ChatID: req.ChatID, ReadMaxID: int64Ptr(req.ReadMaxID), MarkedUnread: req.MarkedUnread}
+		evt = map[string]any{"ReadStateChanged": map[string]any{"chat_id": req.ChatID}}
+	case "move", "detach":
+		found := false
+		for i := range srv.dialogs {
+			if srv.dialogs[i].ChatID == req.ChatID {
+				d := &srv.dialogs[i]
+				s := &sidecar.DialogStructure{Kind: "channel"}
+				if req.Action == "move" {
+					s.SpaceID = int64Ptr(req.SpaceID)
+				}
+				d.Structure = s
+				d.SpaceID = s.SpaceID
+				d.PeerUserID = nil
+				d.ParentChatID = nil
+				d.ParentMessageID = nil
+				found = true
+				break
+			}
+		}
+		if !found {
+			srv.mu.Unlock()
+			http.Error(w, "unknown fixture chat", 400)
+			return
+		}
+		evt = map[string]any{"ChatUpserted": map[string]any{"chat_id": req.ChatID}}
+	case "access_removed", "access_restored":
+		status := "removed"
+		if req.Action == "access_restored" {
+			status = "accessible"
+		}
+		for i := range srv.access {
+			if srv.access[i].SpaceID == req.SpaceID {
+				srv.access[i].Status = status
+			}
+		}
+		evt = map[string]any{"SpaceMemberChanged": map[string]any{"space_id": req.SpaceID, "user_id": accountID}}
+	case "rename":
+		for i := range srv.spaces {
+			if srv.spaces[i].SpaceID == req.SpaceID {
+				srv.spaces[i].Name = "Fixture Renamed Workspace"
+			}
+		}
+		evt = map[string]any{"SpaceUpserted": map[string]any{"space_id": req.SpaceID}}
+	default:
+		srv.mu.Unlock()
+		http.Error(w, "unknown fixture action", 400)
+		return
+	}
+	srv.mu.Unlock()
+	if err := srv.saveState(); err != nil {
+		srv.writeError(w, err)
+		return
+	}
+	if err := srv.broadcast(evt); err != nil {
+		srv.writeError(w, err)
+		return
+	}
+	srv.writeJSON(w, map[string]any{"ok": true})
 }

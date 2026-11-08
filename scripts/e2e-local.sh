@@ -117,6 +117,8 @@ services:
     image: ${SYNAPSE_IMAGE}
     environment:
       SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+      UID: "$(id -u)"
+      GID: "$(id -g)"
     ports:
       - "127.0.0.1:${SYNAPSE_PORT}:8008"
     volumes:
@@ -200,6 +202,8 @@ function generate_synapse_config {
 		echo "==> Generating Synapse config with ${SYNAPSE_IMAGE}"
 		docker run --rm \
 			-v "${SYNAPSE_DATA}:/data" \
+			-e "UID=$(id -u)" \
+			-e "GID=$(id -g)" \
 			-e "SYNAPSE_SERVER_NAME=${SERVER_NAME}" \
 			-e "SYNAPSE_REPORT_STATS=no" \
 			"${SYNAPSE_IMAGE}" generate
@@ -225,9 +229,13 @@ function prepare {
 
 function wait_for_http {
 	local name=$1 url=$2
+    local -a protocol_headers=()
+    if [[ "${url}" == "${SIDECAR_URL}/"* ]]; then
+        protocol_headers=(-H "X-Inline-Protocol-Version: 5")
+    fi
 	echo "==> Waiting for ${name}: ${url}"
 	for _ in $(seq 1 90); do
-		if curl -fsS "${url}" >/dev/null 2>&1; then
+		if curl -fsS "${protocol_headers[@]}" "${url}" >/dev/null 2>&1; then
 			return 0
 		fi
 		sleep 1
@@ -397,8 +405,8 @@ function matrix_login_token {
 	response=$(curl -fsS \
 		-H "Content-Type: application/json" \
 		-d "${body}" \
-		"${HOMESERVER_ADDRESS}/_matrix/client/v3/login")
-	jq -r '.access_token' <<<"${response}"
+		"${HOMESERVER_ADDRESS}/_matrix/client/v3/login") || return
+	jq -er '.access_token | select(type == "string" and length > 0)' <<<"${response}"
 }
 
 function matrix_auth_json {
@@ -469,10 +477,11 @@ function matrix_join_room {
 
 function wait_for_room_message_body {
 	local token=$1 room_id=$2 pattern=$3
-	local encoded_room response
+	local encoded_room response filter
 	encoded_room=$(uri_encode "${room_id}")
+	filter=$(uri_encode '{"types":["m.room.message"]}')
 	for _ in $(seq 1 60); do
-		response=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/rooms/${encoded_room}/messages?dir=b&limit=50")
+		response=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/rooms/${encoded_room}/messages?dir=b&limit=50&filter=${filter}")
 		if jq -e --arg pattern "${pattern}" '
 			($pattern | ascii_downcase) as $needle
 			|
@@ -492,13 +501,13 @@ function wait_for_room_message_body {
 function sidecar_post_json {
 	local path=$1 body=${2:-}
 	if [[ -n "${body}" ]]; then
-		curl -fsS \
+		curl -fsS -H "X-Inline-Protocol-Version: 5" \
 			-X POST \
 			-H "Content-Type: application/json" \
 			-d "${body}" \
 			"${SIDECAR_URL}${path}"
 	else
-		curl -fsS -X POST "${SIDECAR_URL}${path}"
+		curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST "${SIDECAR_URL}${path}"
 	fi
 }
 
@@ -618,11 +627,11 @@ function wait_for_portal_room {
 }
 
 function fixture_sent_count {
-	curl -fsS "${SIDECAR_URL}/fixture/sent" | jq -r '.sent_texts | length'
+	curl -fsS -H "X-Inline-Protocol-Version: 5" "${SIDECAR_URL}/fixture/sent" | jq -r '.sent_texts | length'
 }
 
 function fixture_event_client_count {
-	curl -fsS "${SIDECAR_URL}/fixture/status" | jq -r '.event_clients'
+	curl -fsS -H "X-Inline-Protocol-Version: 5" "${SIDECAR_URL}/fixture/status" | jq -r '.event_clients'
 }
 
 function wait_for_fixture_sent_count {
@@ -726,15 +735,253 @@ function fixture_prepare_logged_in_portals {
 	wait_for_room_message_body "${token}" "${group_room}" "fixture group hello"
 	FIXTURE_DM_ROOM="${dm_room}"
 	FIXTURE_GROUP_ROOM="${group_room}"
+	FIXTURE_MGMT_ROOM="${room_id}"
+	FIXTURE_SOURCE_CALLS=$(fixture_source_calls)
+}
+
+function fixture_status_json {
+	curl -fsS -H "X-Inline-Protocol-Version: 5" "${SIDECAR_URL}/fixture/status"
+}
+
+function fixture_source_calls {
+	fixture_status_json | jq -c '[.source_calls["/rpc/read"] // 0, .source_calls["/rpc/marked-unread"] // 0, .source_calls["/rpc/dialog/notifications"] // 0]'
+}
+
+function fixture_assert_no_source_calls {
+	[[ "$(fixture_source_calls)" == "${FIXTURE_SOURCE_CALLS}" ]]
+}
+
+function fixture_presentation {
+	sidecar_post_json /fixture/presentation "$1" >/dev/null
+}
+
+function fixture_room_state {
+	local token=$1 room=$2
+	matrix_auth_json "${token}" GET "/_matrix/client/v3/rooms/$(uri_encode "${room}")/state"
+}
+
+# Inspect emitted Matrix state as well as the bridge's persisted identity.
+function fixture_wait_hierarchy {
+	local token=$1 child=$2 desired=$3 old=${4:-}
+	local state parent_state old_state
+	for _ in $(seq 1 60); do
+		state=$(fixture_room_state "${token}" "${child}")
+		if ! jq -e --arg parent "${desired}" '
+			[.[] | select(.type == "m.space.parent" and ((.content.via // []) | length > 0))] as $parents
+			| if $parent == "" then ($parents | length == 0)
+			  else ($parents | length == 1 and .[0].state_key == $parent and .[0].content.canonical == true) end
+		' >/dev/null <<<"${state}"; then
+			sleep 1
+			continue
+		fi
+		if [[ -n "${desired}" ]]; then
+			parent_state=$(fixture_room_state "${token}" "${desired}")
+			if ! jq -e --arg child "${child}" 'any(.[]; .type == "m.space.child" and .state_key == $child and ((.content.via // []) | length > 0))' >/dev/null <<<"${parent_state}"; then
+				sleep 1
+				continue
+			fi
+		fi
+		if [[ -n "${old}" && "${old}" != "${desired}" ]]; then
+			old_state=$(fixture_room_state "${token}" "${old}")
+			if ! jq -e --arg child "${child}" 'all(.[]; .type != "m.space.child" or .state_key != $child or ((.content.via // []) | length == 0))' >/dev/null <<<"${old_state}"; then
+				sleep 1
+				continue
+			fi
+		fi
+		return 0
+	done
+	echo "Fixture hierarchy failed for ${child}, expected parent ${desired:-none}" >&2
+	return 1
+}
+
+function fixture_assert_room_identity {
+	local token=$1 room=$2 kind=$3 state
+	state=$(fixture_room_state "${token}" "${room}")
+	jq -e --arg kind "${kind}" '
+		[.[] | select(.type == "m.bridge" or .type == "uk.half-shot.bridge")] as $info
+		| ($info | length == 2)
+		and all($info[]; (.content["com.beeper.room_type.v2"] // "") == $kind
+		  and (if $kind == "dm" then .content["com.beeper.room_type"] == "dm" else (.content["com.beeper.room_type"] // "") == "" end))
+	' >/dev/null <<<"${state}"
+}
+
+function fixture_assert_presentation {
+	local token=$1 group=$2 dm=$3 space_a space_b hidden
+	echo "==> Checking emitted channel/DM identity, exclusions, and workspace links"
+	fixture_assert_room_identity "${token}" "${group}" ""
+	fixture_assert_room_identity "${token}" "${dm}" dm
+	hidden=$(bridge_db_scalar "SELECT COUNT(*) FROM portal WHERE id IN ('404','405') AND mxid IS NOT NULL AND mxid <> '';")
+	[[ "${hidden}" == 0 ]]
+	space_a=$(wait_for_portal_room space:301)
+	matrix_join_room "${token}" "${space_a}"
+	fixture_wait_hierarchy "${token}" "${group}" "${space_a}"
+
+	fixture_presentation '{"action":"move","chat_id":202,"space_id":302}'
+	space_b=$(wait_for_portal_room space:302)
+	matrix_join_room "${token}" "${space_b}"
+	fixture_wait_hierarchy "${token}" "${group}" "${space_b}" "${space_a}"
+	fixture_presentation '{"action":"detach","chat_id":202}'
+	fixture_wait_hierarchy "${token}" "${group}" "" "${space_b}"
+	fixture_presentation '{"action":"move","chat_id":202,"space_id":301}'
+	fixture_wait_hierarchy "${token}" "${group}" "${space_a}"
+	fixture_presentation '{"action":"access_removed","space_id":301}'
+	fixture_wait_hierarchy "${token}" "${group}" "" "${space_a}"
+	fixture_presentation '{"action":"access_restored","space_id":301}'
+	fixture_wait_hierarchy "${token}" "${group}" "${space_a}"
+	[[ "$(wait_for_portal_room 202)" == "${group}" ]]
+	fixture_assert_no_source_calls
+}
+
+function fixture_wait_read_applied {
+	local chat=$1 cursor=$2 applied
+	for _ in $(seq 1 60); do
+		applied=$(bridge_db_scalar "SELECT COALESCE(json_extract(state,'$.read_applied'),0) FROM inline_projection WHERE chat='${chat}';")
+		if [[ "${applied}" == "${cursor}" ]]; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Fixture source cursor ${cursor} was not projected for chat ${chat}" >&2
+	return 1
+}
+
+function fixture_assert_read_state {
+	local token=$1 bot_mxid=$2 room chat encoded_room encoded_user event10 event20 target state baseline_reads
+	echo "==> Checking exact read prefix, private receipt echo, and manual unread"
+	chat=$(( $(date +%s) * 100000 + RANDOM ))
+	fixture_presentation "$(jq -nc --argjson chat "${chat}" '{action:"receipt_case",chat_id:$chat}')"
+	room=$(wait_for_portal_room "${chat}")
+	FIXTURE_RECEIPT_CHAT="${chat}"
+	FIXTURE_RECEIPT_ROOM="${room}"
+	matrix_join_room "${token}" "${room}"
+	wait_for_room_message_body "${token}" "${room}" "fixture source unread 20"
+	wait_for_room_message_body "${token}" "${room}" "fixture source read 10"
+	encoded_room=$(uri_encode "${room}")
+	encoded_user=$(uri_encode "$(test_user_mxid)")
+	# Both messages are present, but cursor10 cannot cross the preceding unread20.
+	[[ "$(bridge_db_scalar "SELECT COALESCE(json_extract(state,'$.read_applied'),0) FROM inline_projection WHERE chat='${chat}';")" == 0 ]]
+	matrix_auth_json "${token}" PUT "/_matrix/client/v3/user/${encoded_user}/rooms/${encoded_room}/account_data/m.marked_unread" '{"unread":true}' >/dev/null
+	send_matrix_text "${token}" "${FIXTURE_MGMT_ROOM}" "!inline login-matrix ${token}"
+	wait_for_bot_message "${token}" "${FIXTURE_MGMT_ROOM}" "${bot_mxid}" "Successfully switched puppets"
+	event10=$(bridge_db_scalar "SELECT mxid FROM message WHERE id='${chat}/10' LIMIT 1;")
+	event20=$(bridge_db_scalar "SELECT mxid FROM message WHERE id='${chat}/20' LIMIT 1;")
+	[[ -n "${event10}" && -n "${event20}" ]]
+	fixture_presentation "$(jq -nc --argjson chat "${chat}" '{action:"read",chat_id:$chat,read_max_id:20,marked_unread:true}')"
+	fixture_wait_read_applied "${chat}" 20
+	target=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/user/${encoded_user}/rooms/${encoded_room}/account_data/m.fully_read" | jq -r '.event_id')
+	[[ "${target}" == "${event10}" ]]
+	matrix_auth_json "${token}" GET "/_matrix/client/v3/user/${encoded_user}/rooms/${encoded_room}/account_data/m.marked_unread" | jq -e '.unread == true' >/dev/null
+	fixture_wait_private_receipt "${token}" "${room}" "${event10}"
+	fixture_assert_no_source_calls
+
+	# A late lower ID is still source-read, even after the desire was applied.
+	sidecar_post_json /fixture/push-message "$(jq -nc --argjson chat "${chat}" '{chat_id:$chat,message_id:15,timestamp:300,text:"fixture late read 15"}')" >/dev/null
+	wait_for_room_message_body "${token}" "${room}" "fixture late read 15"
+	fixture_wait_receipt_target "${token}" "${chat}" "${room}" 15 20
+	# Persist a cursor whose target has not arrived yet, then deliver it.
+	fixture_presentation "$(jq -nc --argjson chat "${chat}" '{action:"read",chat_id:$chat,read_max_id:30,marked_unread:true}')"
+	fixture_wait_read_pending "${chat}" 30
+	sidecar_post_json /fixture/push-message "$(jq -nc --argjson chat "${chat}" '{chat_id:$chat,message_id:30,timestamp:400,text:"fixture read before delivery 30"}')" >/dev/null
+	wait_for_room_message_body "${token}" "${room}" "fixture read before delivery 30"
+	fixture_wait_receipt_target "${token}" "${chat}" "${room}" 30 30
+	fixture_assert_no_source_calls
+
+	# A genuine public user receipt must still reach Inline exactly once.
+	baseline_reads=$(jq -r '.[0]' <<<"${FIXTURE_SOURCE_CALLS}")
+	matrix_auth_json "${token}" POST "/_matrix/client/v3/rooms/${encoded_room}/receipt/m.read/$(uri_encode "${event20}")" '{}' >/dev/null
+	for _ in $(seq 1 60); do
+		if fixture_status_json | jq -e --argjson expected "$((baseline_reads+1))" '(.source_calls["/rpc/read"] // 0) == $expected' >/dev/null; then
+			fixture_assert_receipt_barrier "${token}" "${chat}" "${room}"
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Genuine Matrix user read receipt did not reach Inline exactly once" >&2
+	return 1
+}
+
+function fixture_assert_receipt_barrier {
+	local token=$1 chat=$2 room=$3 encoded_room before after
+	echo "==> Checking arbitrary Matrix content blocks source read projection"
+	encoded_room=$(uri_encode "${room}")
+	before=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/user/$(uri_encode "$(test_user_mxid)")/rooms/${encoded_room}/account_data/m.fully_read" | jq -r '.event_id')
+	matrix_auth_json "${token}" PUT "/_matrix/client/v3/rooms/${encoded_room}/send/m.sticker/fixture-barrier-${chat}" '{"body":"fixture unread sticker","url":"mxc://localhost/fixture-sticker","info":{"mimetype":"image/png","w":1,"h":1}}' >/dev/null
+	sidecar_post_json /fixture/push-message "$(jq -nc --argjson chat "${chat}" '{chat_id:$chat,message_id:40,timestamp:500,text:"fixture read after unknown sticker 40"}')" >/dev/null
+	wait_for_room_message_body "${token}" "${room}" "fixture read after unknown sticker 40"
+	fixture_presentation "$(jq -nc --argjson chat "${chat}" '{action:"read",chat_id:$chat,read_max_id:40,marked_unread:true}')"
+	fixture_wait_read_pending "${chat}" 40
+	[[ "$(bridge_db_scalar "SELECT COALESCE(json_extract(state,'$.read_applied'),0) FROM inline_projection WHERE chat='${chat}';")" == 30 ]]
+	after=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/user/$(uri_encode "$(test_user_mxid)")/rooms/${encoded_room}/account_data/m.fully_read" | jq -r '.event_id')
+	[[ "${after}" == "${before}" ]]
+}
+
+function fixture_wait_read_pending {
+	local chat=$1 cursor=$2
+	for _ in $(seq 1 60); do
+		if [[ "$(bridge_db_scalar "SELECT json_extract(state,'$.read_max_id') || ':' || json_extract(state,'$.read_pending') FROM inline_projection WHERE chat='${chat}';")" == "${cursor}:1" ]]; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Missing pending source cursor ${cursor} for ${chat}" >&2
+	return 1
+}
+
+function fixture_wait_private_receipt {
+	local token=$1 room=$2 target=$3 filter state
+	filter=$(jq -nc --arg room "${room}" '{room:{rooms:[$room],timeline:{limit:1},ephemeral:{types:["m.receipt"]}}}' | jq -sr '.[0] | tojson | @uri')
+	for _ in $(seq 1 60); do
+		state=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/sync?timeout=0&filter=${filter}")
+		if jq -e --arg room "${room}" --arg event "${target}" --arg user "$(test_user_mxid)" 'any(.rooms.join[$room].ephemeral.events[]?; .type == "m.receipt" and .content[$event]["m.read.private"][$user] != null)' >/dev/null <<<"${state}"; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Private receipt for the exact fixture target was not visible" >&2
+	return 1
+}
+
+function fixture_wait_receipt_target {
+	local token=$1 chat=$2 room=$3 source=$4 coverage=$5 expected actual journal
+	for _ in $(seq 1 60); do
+		expected=$(bridge_db_scalar "SELECT mxid FROM message WHERE id='${chat}/${source}' LIMIT 1;")
+		journal=$(bridge_db_scalar "SELECT COALESCE(json_extract(state,'$.read_applied'),0) || ':' || json_extract(state,'$.read_pending') FROM inline_projection WHERE chat='${chat}';")
+		actual=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/user/$(uri_encode "$(test_user_mxid)")/rooms/$(uri_encode "${room}")/account_data/m.fully_read" | jq -r '.event_id')
+		if [[ -n "${expected}" && "${actual}" == "${expected}" && "${journal}" == "${coverage}:0" ]]; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Receipt did not retarget to source ${source} with coverage ${coverage}" >&2
+	return 1
+}
+
+function fixture_assert_receipt_recovery {
+	local token=$1 chat=$2 room=$3 expected actual journal
+	echo "==> Checking persisted receipt barrier after restart"
+	expected=$(bridge_db_scalar "SELECT mxid FROM message WHERE id='${chat}/30' LIMIT 1;")
+	[[ -n "${expected}" ]]
+	for _ in $(seq 1 60); do
+		journal=$(bridge_db_scalar "SELECT json_extract(state,'$.read_max_id') || ':' || COALESCE(json_extract(state,'$.read_applied'),0) || ':' || json_extract(state,'$.read_pending') || ':' || (COALESCE(json_extract(state,'$.receipt_sync_token'),'') != '') FROM inline_projection WHERE chat='${chat}';")
+		actual=$(matrix_auth_json "${token}" GET "/_matrix/client/v3/user/$(uri_encode "$(test_user_mxid)")/rooms/$(uri_encode "${room}")/account_data/m.fully_read" | jq -r '.event_id')
+		if [[ "${journal}" == '40:30:1:1' && "${actual}" == "${expected}" ]]; then
+			matrix_auth_json "${token}" GET "/_matrix/client/v3/user/$(uri_encode "$(test_user_mxid)")/rooms/$(uri_encode "${room}")/account_data/m.marked_unread" | jq -e '.unread == true' >/dev/null
+			fixture_assert_no_source_calls
+			return 0
+		fi
+		sleep 1
+	done
+	echo "Receipt barrier or sync cursor was lost after fixture restart" >&2
+	return 1
 }
 
 function smoke {
 	start
 
 	echo "==> Adapter status"
-	curl -fsS "${SIDECAR_URL}/status" | jq .
+	curl -fsS -H "X-Inline-Protocol-Version: 5" "${SIDECAR_URL}/status" | jq .
 	echo "==> Adapter resume"
-	curl -fsS -X POST "${SIDECAR_URL}/rpc/resume" | jq .
+	curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST "${SIDECAR_URL}/rpc/resume" | jq .
 
 	local token bot_localpart bot_mxid room_id
 	token=$(matrix_login_token)
@@ -871,6 +1118,8 @@ function fixture_check {
 
 	fixture_prepare_logged_in_portals "${token}" "${bot_mxid}"
 	dm_room="${FIXTURE_DM_ROOM}"
+	fixture_assert_presentation "${token}" "${FIXTURE_GROUP_ROOM}" "${dm_room}"
+	fixture_assert_read_state "${token}" "${bot_mxid}"
 
 	echo "==> Sending Matrix outbound message through DM portal"
 	initial_sent_count=$(fixture_sent_count)
@@ -892,21 +1141,31 @@ function fixture_restart_check {
 	require_live_commands
 	start
 
-	local token bot_localpart bot_mxid dm_room catchup_text realtime_text
+	local token bot_localpart bot_mxid dm_room catchup_text realtime_text space_room
 	token=$(matrix_login_token)
 	bot_localpart=$(bridge_config_value appservice.bot.username)
 	bot_mxid="@${bot_localpart}:${SERVER_NAME}"
 	fixture_prepare_logged_in_portals "${token}" "${bot_mxid}"
 	dm_room="${FIXTURE_DM_ROOM}"
+	fixture_assert_presentation "${token}" "${FIXTURE_GROUP_ROOM}" "${dm_room}"
+	fixture_assert_read_state "${token}" "${bot_mxid}"
+	FIXTURE_SOURCE_CALLS=$(fixture_source_calls)
+	space_room=$(wait_for_portal_room space:301)
 
 	echo "==> Stopping Go bridge and queuing fixture message while bridge is down"
 	stop_pid "bridge" "${RUN_DIR}/bridge.pid"
 	catchup_text="fixture catchup after bridge restart $(date +%s)"
 	fixture_push_message 101 "${catchup_text}"
+	fixture_presentation '{"action":"detach","chat_id":202}'
 
 	echo "==> Restarting Go bridge and waiting for missed message catch-up"
 	start_bridge
 	wait_for_room_message_body "${token}" "${dm_room}" "${catchup_text}"
+	fixture_wait_hierarchy "${token}" "${FIXTURE_GROUP_ROOM}" "" "${space_room}"
+	[[ "$(wait_for_portal_room 202)" == "${FIXTURE_GROUP_ROOM}" ]]
+	fixture_assert_receipt_recovery "${token}" "${FIXTURE_RECEIPT_CHAT}" "${FIXTURE_RECEIPT_ROOM}"
+	fixture_presentation '{"action":"move","chat_id":202,"space_id":301}'
+	fixture_wait_hierarchy "${token}" "${FIXTURE_GROUP_ROOM}" "${space_room}"
 
 	echo "==> Restarting bridge and fixture sidecar, then verifying realtime resumes"
 	stop_pid "bridge" "${RUN_DIR}/bridge.pid"
@@ -918,6 +1177,8 @@ function fixture_restart_check {
 	wait_for_fixture_event_clients 1
 	fixture_push_message 101 "${realtime_text}"
 	wait_for_room_message_body "${token}" "${dm_room}" "${realtime_text}"
+	fixture_wait_hierarchy "${token}" "${FIXTURE_GROUP_ROOM}" "${space_room}"
+	fixture_assert_receipt_recovery "${token}" "${FIXTURE_RECEIPT_CHAT}" "${FIXTURE_RECEIPT_ROOM}"
 
 	echo "Fixture restart recovery and catch-up check passed."
 }
@@ -932,7 +1193,7 @@ function status {
 	else
 		echo "Synapse: not reachable at ${HOMESERVER_ADDRESS}"
 	fi
-	if curl -fsS "${SIDECAR_URL}/health" >/dev/null 2>&1; then
+	if curl -fsS -H "X-Inline-Protocol-Version: 5" "${SIDECAR_URL}/health" >/dev/null 2>&1; then
 		echo "Adapter: reachable at ${SIDECAR_URL}"
 	else
 		echo "Adapter: not reachable at ${SIDECAR_URL}"

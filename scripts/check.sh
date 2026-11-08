@@ -28,8 +28,10 @@ bash -n scripts/check.sh scripts/smoke-local.sh scripts/e2e-local.sh docker-run.
 
 echo "==> Compose config"
 docker compose config >/dev/null
-docker compose config | grep -q 'INLINE_API_BASE_URL:'
-docker compose config | grep -q 'INLINE_REALTIME_URL:'
+# Read the full output: grep -q closes the pipe early and can make Compose
+# exit with a broken pipe under pipefail even when the expected key exists.
+docker compose config | grep 'INLINE_API_BASE_URL:' >/dev/null
+docker compose config | grep 'INLINE_REALTIME_URL:' >/dev/null
 
 echo "==> Go tests"
 go test -tags goolm ./...

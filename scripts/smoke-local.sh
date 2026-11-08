@@ -33,18 +33,18 @@ fi
 
 echo "==> Waiting for adapter health at ${URL}/health"
 for _ in $(seq 1 60); do
-	if curl -fsS "${URL}/health" >/dev/null 2>&1; then
+	if curl -fsS -H "X-Inline-Protocol-Version: 5" "${URL}/health" >/dev/null 2>&1; then
 		break
 	fi
 	sleep 1
 done
 
-curl -fsS "${URL}/health" | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" "${URL}/health" | jq .
 
 echo "==> Adapter status"
-curl -fsS "${URL}/status" | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" "${URL}/status" | jq .
 
 echo "==> Adapter resume"
-curl -fsS -X POST "${URL}/rpc/resume" | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST "${URL}/rpc/resume" | jq .
 
 echo "Smoke check passed."

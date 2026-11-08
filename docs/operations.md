@@ -28,7 +28,7 @@ Start the adapter before the bridge. Stop the bridge before the adapter.
 Adapter health:
 
 ```sh
-curl -fsS http://127.0.0.1:29342/health | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" http://127.0.0.1:29342/health | jq .
 ```
 
 Account-specific adapter endpoints require the bridge's private session
@@ -93,13 +93,28 @@ Adapter event cursors are `(generation, sequence)` pairs. If the adapter SQLite
 database is restored behind the Matrix database, the adapter rotates to a new
 generation and returns a structured reset. The Go bridge then performs
 authoritative reconciliation and atomically replaces its saved cursor before
-resuming replay. Protocol v4 requires the Go bridge and Rust sidecar to be
+resuming replay. Protocol v5 requires the Go bridge and Rust sidecar to be
 upgraded together.
+
+Receipt reconciliation conservatively reinspects timeline order after delivery,
+including messages beyond the source read cursor. Inspection is limited to 20
+pages of 500 events and a five-second reconciliation timeout. Long timelines can
+delay the serialized room lane or leave read projection pending. The persisted
+applied cursor alone cannot justify a shortcut after failed completion saves,
+late delivery, deletion or mapping changes; receipt recovery remains enabled.
 
 Dialog reconciliation uses stable chat-ID keyset pagination and persists its
 next cursor in login metadata. Activity reordering cannot skip rows, and large
 accounts resume from the last completed page after restart or RPC-budget yield.
-Delivered message IDs are also persisted monotonically in portal metadata.
+Live message delivery and historical coverage use separate monotonic portal
+checkpoints. A live message does not skip an older history page. History advances
+only for an explicit source-ID catchup page requested from its current historical
+frontier, after every selected message has a real mapping in the same portal and
+receiver. Generic forward and backward pages verify mappings without advancing
+that frontier; a new empty frontier requests source IDs after zero. Existing message and room IDs are retained. Enable
+`backfill.enabled` to import or recover history; disabled backfill leaves history
+pending. The pinned framework's timestamp cutoff is supplemented by bounded
+source-ID recovery in the existing portal event lane.
 
 Permanent media projection failures (invalid schemes, reviewed terminal 4xx,
 or the configured size ceiling) produce a stable Matrix unavailable notice and
@@ -128,6 +143,87 @@ reconciled. Excluding a dialog is non-destructive: an existing Matrix room is
 not left or deleted automatically, but new Inline events for the hidden dialog
 are no longer projected. If the Inline dialog later becomes visible, normal
 reconciliation resumes and fills its missing history from durable state.
+
+### Channel identity and workspace navigation
+
+Authoritative Inline structure distinguishes DMs, channels, and separate reply
+children. Channels use ordinary Matrix rooms; this changes their presentation in
+clients that previously treated all non-DMs as group DMs. A partial or conflicting
+descriptor does not invent a room type. Descriptions and workspace names come
+from the account's cached source records.
+
+A workspace becomes a Matrix Space only with source-backed access evidence for
+that login. Explicitly removed access or absence from a complete access list detaches
+navigation; unknown access holds existing links and pending hierarchy work. A
+failed snapshot refresh retains the last known snapshot and does not trigger a
+detach. Navigation records never grant mutation permission or delete
+independently accessible chat rooms or their history. Access proof is refreshed
+in bounded passes, so a newly discovered workspace can appear later. Status
+reports unverified access without exposing workspace names or member lists.
+
+### Notification and read-state limits
+
+`network.mute_channels_by_default: true` records the operator's desired default
+for new channels. Each login can override that desired default:
+
+```text
+inline-channel-default muted
+inline-channel-default normal
+inline-channel-default default
+inline-settings
+```
+
+Automatic mute, Low Priority, and manual-unread writes are disabled because the
+current target cannot reliably distinguish their bridge echoes from later user
+choices. `notification_policy_degraded` is reported immediately and message
+delivery continues. These settings do not silently quiet channels. For a quiet
+inbox, mute channels manually in Beeper/Matrix; putting them in Low Priority and
+choosing a DMs view are separate client settings. Inline's native notification
+mode is preserved independently. Explicit user mute/unmute remains supported.
+
+Incoming source read state uses only the verified prefix of the actual Matrix
+timeline. An unmapped event or an unread source event is a barrier, including
+stickers and polls. Timeline inspection is bounded to 10,000 events; missing
+mappings, exhausted bounds, or a missing double puppet leave the intent pending.
+With double puppeting, the bridge writes private read receipts and fully-read
+markers, verifies their readback, and checks that manual-unread was untouched.
+Exact receipt observations and sync positions survive later readback failures in
+the journal, bound to the account, room, puppet, target, and current source intent.
+A changed intent or conflicting private receipt invalidates that evidence.
+It does not emit public source-driven receipts. The pinned mautrix version
+forwards genuine public user receipts to Inline but ignores genuine private user
+receipts, which is a known outgoing fidelity limit. Unverified manual-unread
+projection remains pending rather than being claimed as applied.
+
+### Existing-room presentation migration
+
+Migration preserves room IDs, message mappings, history checkpoints, and local
+notification/tag state. Select 1–50 explicit positive numeric chat IDs in the
+management room; omission of a mode means preview:
+
+```text
+inline-migrate preview 202 203
+inline-migrate apply 202 203
+inline-migrate rollback 202 203
+```
+
+Preview performs no presentation writes. Apply journals the before and desired
+room kind, workspace links, and bridge metadata before making effects. A repeated
+apply or rollback resumes an interrupted operation. Every link write uses an
+exact journaled value, so restart can distinguish a partial migration from an
+unrelated later edit. Rollback restores saved relationship metadata as well as
+both link directions. A differing user value causes a conflict. Rolled-back or
+conflicted presentation stays held until explicitly selected again. The hold runs
+before the framework receives mutable room metadata, including on resync after a
+restart. History checks and post-delivery reconciliation continue while
+presentation is held.
+
+Run apply/rollback in a controlled window with no concurrent administrators or
+clients editing room presentation. Matrix has no atomic conditional state write:
+per-write read guards detect existing edits, but an edit racing between the read
+and write can still be overwritten. This is not an atomic remote compare-and-set
+guarantee. Inspect preview and status before and after the operation; resolve
+conflicts deliberately rather than repeatedly overriding a user's choice.
 
 ## Backups
 
@@ -256,5 +352,5 @@ ireconnect
 - Run:
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST http://127.0.0.1:29342/rpc/resume | jq .
 ```

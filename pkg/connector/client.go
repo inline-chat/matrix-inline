@@ -75,22 +75,29 @@ type InlineClient struct {
 	AccountID string
 	Sidecar   *sidecar.Client
 
-	mu                     sync.RWMutex
-	loggedIn               bool
-	users                  map[int64]sidecar.UserRecord
-	dialogs                map[int64]sidecar.DialogRecord
-	details                map[int64]struct{}
-	history                map[int64]int64
-	historyLoaded          map[int64]struct{}
-	storeNamespace         string
-	lastSidecarSequence    uint64
-	sidecarEventGeneration string
-	bridgeStateVersion     uint32
-	bridgeRecoveryCursor   int64
-	dialogSyncCursor       string
-	hiddenDialogsDefault   hiddenDialogsPolicy
-	hiddenDialogsOverride  hiddenDialogsPolicy
-	metadataSaveMu         sync.Mutex
+	mu                         sync.RWMutex
+	loggedIn                   bool
+	users                      map[int64]sidecar.UserRecord
+	dialogs                    map[int64]sidecar.DialogRecord
+	spaces                     map[int64]sidecar.SpaceRecord
+	spaceAccess                map[int64]string
+	spaceAccessComplete        bool
+	workspaceRevision          uint64
+	workspaceProjectedRevision uint64
+	details                    map[int64]struct{}
+	history                    map[int64]int64
+	historyLoaded              map[int64]struct{}
+	storeNamespace             string
+	lastSidecarSequence        uint64
+	sidecarEventGeneration     string
+	bridgeStateVersion         uint32
+	bridgeRecoveryCursor       int64
+	dialogSyncCursor           string
+	hiddenDialogsDefault       hiddenDialogsPolicy
+	hiddenDialogsOverride      hiddenDialogsPolicy
+	channelMuteDefault         string
+	channelMuteOverride        string
+	metadataSaveMu             sync.Mutex
 
 	runCancel context.CancelFunc
 	wg        sync.WaitGroup
@@ -217,6 +224,23 @@ func (ic *InlineClient) GetUserID() networkid.UserID {
 }
 
 func (ic *InlineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
+	if err := ic.guardMigrationPresentation(ctx, portal); err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(string(portal.ID), "space:") {
+		n, err := strconv.ParseInt(strings.TrimPrefix(string(portal.ID), "space:"), 10, 64)
+		if err != nil || n <= 0 {
+			return nil, errors.New("invalid workspace portal")
+		}
+		ic.mu.RLock()
+		space, ok := ic.spaces[n]
+		access := ic.spaceAccess[n]
+		ic.mu.RUnlock()
+		if !ok || access != "accessible" {
+			return nil, errors.New("workspace access unavailable")
+		}
+		return ic.workspaceChatInfo(space), nil
+	}
 	chatID, err := chatIDFromPortal(portal)
 	if err != nil {
 		return nil, err
@@ -252,6 +276,7 @@ func (ic *InlineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) 
 
 func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	features := &event.RoomFeatures{
+		ID:            "inline-foundation-v1",
 		MaxTextLength: 5000,
 		File: event.FileFeatureMap{
 			event.MsgImage: {
@@ -292,22 +317,10 @@ func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Po
 		Delete:               event.CapLevelFullySupported,
 		Reaction:             event.CapLevelFullySupported,
 		ReactionCount:        1,
-		CustomEmojiReactions: true,
+		CustomEmojiReactions: false,
 		ReadReceipts:         true,
 		TypingNotifications:  true,
 		MarkAsUnread:         true,
-	}
-	if portal != nil && portal.OtherUserID == "" {
-		features.State = event.StateFeatureMap{
-			event.StateRoomName.Type: {Level: event.CapLevelFullySupported},
-		}
-		features.MemberActions = event.MemberFeatureMap{
-			event.MemberActionInvite:       event.CapLevelFullySupported,
-			event.MemberActionKick:         event.CapLevelFullySupported,
-			event.MemberActionRevokeInvite: event.CapLevelFullySupported,
-		}
-		features.DeleteChat = true
-		features.DeleteChatForEveryone = true
 	}
 	return features
 }
@@ -591,7 +604,7 @@ func (ic *InlineClient) HandleMatrixMessageRemove(ctx context.Context, msg *brid
 
 func (ic *InlineClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
 	reaction := strings.TrimSpace(msg.Content.RelatesTo.Key)
-	if reaction == "" {
+	if reaction == "" || strings.Contains(reaction, "://") {
 		return bridgev2.MatrixReactionPreResponse{}, bridgev2.WrapErrorInStatus(fmt.Errorf("Inline reactions require a non-empty emoji")).
 			WithErrorAsMessage().
 			WithIsCertain(true).
@@ -673,13 +686,14 @@ func (ic *InlineClient) HandleMatrixReadReceipt(ctx context.Context, msg *bridge
 	if err != nil {
 		return fmt.Errorf("Inline portal ID %q is not a numeric chat ID yet: %w", msg.Portal.ID, err)
 	}
-	var maxMessageID *int64
-	if msg.ExactMessage != nil {
-		_, parsedMessageID, err := parseMessageID(msg.ExactMessage.ID)
-		if err == nil {
-			maxMessageID = &parsedMessageID
-		}
+	if msg.ExactMessage == nil {
+		return errors.New("Inline read receipt has no exact source target")
 	}
+	targetChat, targetID, err := parseMessageID(msg.ExactMessage.ID)
+	if err != nil || targetChat != chatID || targetID <= 0 {
+		return errors.New("Inline read receipt target does not match this chat")
+	}
+	maxMessageID := &targetID
 	if err := ic.Sidecar.Read(ctx, sidecar.ReadRequest{
 		ChatID:       chatID,
 		MaxMessageID: maxMessageID,
@@ -1122,8 +1136,18 @@ func (ic *InlineClient) persistHiddenDialogsOverride(ctx context.Context, policy
 }
 
 func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error {
+	if err := ic.refreshWorkspaceSnapshot(ctx); err != nil {
+		// A failed observation is not proof that source access was removed.
+		// Keep the complete prior snapshot and its presentation revision.
+		if ic.UserLogin != nil && ic.UserLogin.Bridge != nil {
+			ic.UserLogin.Bridge.Log.Warn().Err(err).Msg("Workspace refresh failed; retaining last known snapshot")
+		}
+	}
+
 	limit := uint32(startupDialogPageLimit)
 	ic.mu.RLock()
+	workspaceRevision := ic.workspaceRevision
+	workspaceChanged := workspaceRevision != ic.workspaceProjectedRevision
 	cursor := ic.dialogSyncCursor
 	ic.mu.RUnlock()
 	seenCursors := make(map[string]struct{})
@@ -1162,7 +1186,7 @@ func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error
 			if !ic.shouldProjectDialog(dialog) {
 				continue
 			}
-			if changed {
+			if changed || workspaceChanged {
 				ic.queueDialogResync(ctx, dialog)
 				resyncsQueued++
 			}
@@ -1175,6 +1199,9 @@ func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error
 		}
 
 		if page.NextCursor == "" {
+			ic.mu.Lock()
+			ic.workspaceProjectedRevision = workspaceRevision
+			ic.mu.Unlock()
 			if err := ic.persistDialogSyncCursor(ctx, ""); err != nil {
 				return err
 			}
@@ -1291,12 +1318,13 @@ func (ic *InlineClient) syncDialogDetails(ctx context.Context, dialog sidecar.Di
 	}
 	ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
-			Type:         bridgev2.RemoteEventChatResync,
-			PortalKey:    ic.portalKeyForChat(dialog.ChatID),
-			Timestamp:    time.Now(),
-			CreatePortal: true,
+			Type:           bridgev2.RemoteEventChatResync,
+			PostHandleFunc: ic.projectionPostHandler,
+			PortalKey:      ic.portalKeyForChat(dialog.ChatID),
+			Timestamp:      time.Now(),
+			CreatePortal:   true,
 		},
-		ChatInfo: info,
+		GetChatInfoFunc: ic.migrationGatedInfoProvider(info),
 	})
 	return nil
 }
@@ -1305,30 +1333,15 @@ func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.Di
 	if !ic.shouldProjectDialog(dialog) || !ic.needsHistoryDelivery(dialog) {
 		return nil
 	}
-	request := historyRequestForDelivery(dialog, ic.historyCheckpoint(dialog.ChatID), startupHistoryLimit)
+	checkpoint := ic.historyCheckpoint(dialog.ChatID)
+	request := historyRequestForDelivery(dialog, checkpoint, startupHistoryLimit)
 	page, err := ic.Sidecar.History(ctx, request)
 	if err != nil {
 		return err
 	}
 	ic.cacheUsers(page.Users)
 
-	sort.SliceStable(page.Messages, func(i, j int) bool {
-		left, right := page.Messages[i], page.Messages[j]
-		if left.Timestamp != right.Timestamp {
-			return left.Timestamp < right.Timestamp
-		}
-		return left.MessageID < right.MessageID
-	})
-
-	for _, msg := range page.Messages {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := eventHandlingResultError("Inline history message", ic.queueInlineMessage(ctx, msg)); err != nil {
-			return err
-		}
-	}
-	return nil
+	return ic.queueHistoricalPage(ctx, dialog.ChatID, page.Messages, &checkpoint)
 }
 
 func historyRequestForDelivery(dialog sidecar.DialogRecord, checkpoint int64, limit uint32) sidecar.HistoryRequest {
@@ -1336,9 +1349,9 @@ func historyRequestForDelivery(dialog sidecar.DialogRecord, checkpoint int64, li
 		ChatID: dialog.ChatID,
 		Limit:  &limit,
 	}
-	if checkpoint > 0 {
-		request.AfterMessageID = &checkpoint
-	}
+	// An explicit zero cursor selects the oldest source IDs, rather than a
+	// recent tail page that cannot establish coverage from an empty frontier.
+	request.AfterMessageID = &checkpoint
 	return request
 }
 
@@ -1395,22 +1408,11 @@ func (ic *InlineClient) loadHistoryCheckpoint(ctx context.Context, chatID int64)
 	if err != nil {
 		return 0, fmt.Errorf("load Inline portal history checkpoint: %w", err)
 	}
-	if metadata, ok := portal.Metadata.(*PortalMetadata); ok && metadata != nil && metadata.HistoryCheckpoint > 0 {
-		checkpoint = metadata.HistoryCheckpoint
-		ic.rememberHistoryDelivered(chatID, checkpoint)
-		return checkpoint, nil
+	if metadata, ok := portal.Metadata.(*PortalMetadata); ok && metadata != nil {
+		checkpoint = metadata.HistoricalCheckpoint
 	}
-
-	messages, err := ic.UserLogin.Bridge.DB.Message.GetLastNInPortal(ctx, ic.portalKeyForChat(chatID), 16)
-	if err != nil {
-		return 0, err
-	}
-	checkpoint = maxInlineMessageIDForChat(messages, chatID)
-	if checkpoint > 0 {
-		if err := ic.persistHistoryCheckpoint(ctx, chatID, checkpoint); err != nil {
-			return 0, err
-		}
-	}
+	// A mapped live maximum does not prove coverage of lower historical IDs.
+	// Legacy rows restart from zero and deduplicate through persisted mappings.
 
 	ic.mu.Lock()
 	if ic.history == nil {
@@ -1512,15 +1514,35 @@ func (ic *InlineClient) FetchMessages(ctx context.Context, params bridgev2.Fetch
 		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
 	}
 
-	request, err := historyRequestForBackfill(params)
+	chat, err := chatIDFromPortal(params.Portal)
 	if err != nil {
 		return nil, err
 	}
-	page, err := ic.Sidecar.History(ctx, request)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch Inline history: %w", err)
+	if err = ic.readDesireBeforeDelivery(ctx, chat); err != nil {
+		return nil, err
+	}
+	var page *sidecar.HistoryPage
+	if bundled, ok := params.BundledData.(historicalPage); ok {
+		if bundled.ChatID != chat {
+			return nil, errors.New("historical bundle belongs to another chat")
+		}
+		page = &sidecar.HistoryPage{Messages: bundled.Records}
+	} else {
+		request, err := historyRequestForBackfill(params)
+		if err != nil {
+			return nil, err
+		}
+		page, err = ic.Sidecar.History(ctx, request)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch Inline history: %w", err)
+		}
 	}
 	ic.cacheUsers(page.Users)
+	for _, record := range page.Messages {
+		if record.ChatID != chat || record.MessageID <= 0 {
+			return nil, errors.New("history record belongs to another chat")
+		}
+	}
 
 	messages, cursor := ic.backfillMessagesFromHistory(ctx, params.Portal, page.Messages)
 	hasMore := page.HasMore && cursor != ""
@@ -1529,7 +1551,11 @@ func (ic *InlineClient) FetchMessages(ctx context.Context, params bridgev2.Fetch
 		Cursor:   cursor,
 		HasMore:  hasMore,
 		Forward:  params.Forward,
-		MarkRead: true,
+		MarkRead: false,
+		CompleteCallback: func() {
+			_ = ic.persistHistoricalMappings(ctx, params.Portal, page.Messages)
+			ic.reconcileProjection(ctx, params.Portal)
+		},
 	}, nil
 }
 
@@ -1649,6 +1675,7 @@ func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal 
 			ID:               messageID,
 			TxnID:            transactionIDForMessage(record),
 			Timestamp:        inlineTimestamp(record.Timestamp),
+			StreamOrder:      record.MessageID,
 		})
 	}
 	return backfillMessages, cursor
@@ -1889,6 +1916,7 @@ func (ic *InlineClient) reconcileAccountDeletes(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fetch Inline account reconciliation state: %w", err)
 	}
+	ic.cacheWorkspaceSnapshot(accountState)
 	for _, chatID := range accountState.DeletedChatIDs {
 		if err := eventHandlingResultError("reconciled chat delete", ic.queueChatDelete(chatID)); err != nil {
 			return err
@@ -1933,12 +1961,13 @@ func (ic *InlineClient) reconcileDialogState(ctx context.Context, dialog sidecar
 	}
 	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
-			Type:         bridgev2.RemoteEventChatResync,
-			PortalKey:    ic.portalKeyForChat(dialog.ChatID),
-			Timestamp:    time.Now(),
-			CreatePortal: true,
+			Type:           bridgev2.RemoteEventChatResync,
+			PostHandleFunc: ic.projectionPostHandler,
+			PortalKey:      ic.portalKeyForChat(dialog.ChatID),
+			Timestamp:      time.Now(),
+			CreatePortal:   true,
 		},
-		ChatInfo: info,
+		GetChatInfoFunc: ic.migrationGatedInfoProvider(info),
 	})
 	if err := eventHandlingResultError("reconciled chat resync", result); err != nil {
 		return err
@@ -2025,10 +2054,8 @@ func (ic *InlineClient) reconcileCachedHistory(ctx context.Context, chatID int64
 		if err != nil {
 			return fmt.Errorf("validate cached Inline history for chat %d: %w", chatID, err)
 		}
-		for _, message := range page.Messages {
-			if err := eventHandlingResultError("reconciled message upsert", ic.queueInlineMessage(ctx, message)); err != nil {
-				return err
-			}
+		if err := ic.queueHistoricalPage(ctx, chatID, page.Messages, nil); err != nil {
+			return err
 		}
 		after = pageMax
 		if !page.HasMore {
@@ -2125,34 +2152,17 @@ func (ic *InlineClient) queueReadState(state *sidecar.ReadStateRecord) error {
 	if state == nil {
 		return nil
 	}
-	sender := bridgev2.EventSender{
-		Sender:   makeUserID(ic.AccountID),
-		IsFromMe: true,
+	ctx := context.Background()
+	if err := ic.storeReadDesire(ctx, state); err != nil {
+		return err
 	}
-	if state.ReadMaxID != nil && *state.ReadMaxID > 0 {
-		result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.Receipt{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventReadReceipt,
-				PortalKey: ic.portalKeyForChat(state.ChatID),
-				Sender:    sender,
-				Timestamp: time.Now(),
-			},
-			LastTarget: makeMessageID(state.ChatID, *state.ReadMaxID),
-		})
-		if err := eventHandlingResultError("read receipt", result); err != nil {
-			return err
-		}
-	}
-	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.MarkUnread{
-		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventMarkUnread,
-			PortalKey: ic.portalKeyForChat(state.ChatID),
-			Sender:    sender,
-			Timestamp: time.Now(),
-		},
-		Unread: state.MarkedUnread,
+	// A ChatResync is a serialized wakeup, never an ordinary framework receipt:
+	// MarkRead/MarkUnread can clear manual unread with unmarked account data.
+	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
+		EventMeta:       simplevent.EventMeta{Type: bridgev2.RemoteEventChatResync, PortalKey: ic.portalKeyForChat(state.ChatID), PostHandleFunc: ic.projectionPostHandler},
+		GetChatInfoFunc: ic.migrationGatedInfoProvider(&bridgev2.ChatInfo{}),
 	})
-	return eventHandlingResultError("mark unread", result)
+	return eventHandlingResultError("pending read projection", result)
 }
 
 func (ic *InlineClient) handleSequencedSidecarEvent(ctx context.Context, envelope *sidecar.EventEnvelope) error {
@@ -2500,15 +2510,19 @@ func (ic *InlineClient) queueDialogResync(ctx context.Context, dialog sidecar.Di
 	if !ic.shouldProjectDialog(dialog) {
 		return bridgev2.EventHandlingResultIgnored
 	}
+	if err := ic.ensureWorkspace(ctx, dialog); err != nil {
+		return bridgev2.EventHandlingResult{Error: err}
+	}
 	chatInfo := ic.chatInfoForDialog(ctx, dialog, dialogName(dialog))
 	return ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
-			Type:         bridgev2.RemoteEventChatResync,
-			PortalKey:    ic.portalKeyForChat(dialog.ChatID),
-			Timestamp:    time.Now(),
-			CreatePortal: true,
+			Type:           bridgev2.RemoteEventChatResync,
+			PostHandleFunc: ic.projectionPostHandler,
+			PortalKey:      ic.portalKeyForChat(dialog.ChatID),
+			Timestamp:      time.Now(),
+			CreatePortal:   true,
 		},
-		ChatInfo: chatInfo,
+		GetChatInfoFunc: ic.migrationGatedInfoProvider(chatInfo),
 	})
 }
 
@@ -2543,6 +2557,9 @@ func (ic *InlineClient) queueChatResyncByID(ctx context.Context, chatID int64) b
 }
 
 func (ic *InlineClient) queueSpaceDialogResync(ctx context.Context, spaceID int64) error {
+	if err := ic.refreshWorkspaceSnapshot(ctx); err != nil {
+		return err
+	}
 	ic.mu.RLock()
 	dialogs := make([]sidecar.DialogRecord, 0)
 	for _, dialog := range ic.dialogs {
@@ -2601,6 +2618,15 @@ func (ic *InlineClient) rememberDialog(dialog sidecar.DialogRecord) bool {
 		ic.dialogs = make(map[int64]sidecar.DialogRecord)
 	}
 	previous, ok := ic.dialogs[dialog.ChatID]
+	// A partial observation cannot erase a previously complete structure. A
+	// conflicting complete observation remains unknown and must be enriched.
+	if dialog.Structure == nil && ok && previous.Structure != nil {
+		dialog.Structure = previous.Structure
+		dialog.PeerUserID = previous.PeerUserID
+		dialog.SpaceID = previous.SpaceID
+		dialog.ParentChatID = previous.ParentChatID
+		dialog.ParentMessageID = previous.ParentMessageID
+	}
 	ic.dialogs[dialog.ChatID] = dialog
 	changed := !ok || !sameDialogRecord(previous, dialog)
 	if !ok || !int64PtrEqual(previous.PeerUserID, dialog.PeerUserID) {
@@ -2616,22 +2642,8 @@ func (ic *InlineClient) cachedDialog(chatID int64) (sidecar.DialogRecord, bool) 
 	return dialog, ok
 }
 
-func sameDialogRecord(left, right sidecar.DialogRecord) bool {
-	return left.ChatID == right.ChatID &&
-		int64PtrEqual(left.PeerUserID, right.PeerUserID) &&
-		stringPtrEqual(left.Title, right.Title) &&
-		int64PtrEqual(left.LastMessageID, right.LastMessageID) &&
-		int64PtrEqual(left.SyncedThroughMessageID, right.SyncedThroughMessageID) &&
-		boolPtrEqual(left.ChatListHidden, right.ChatListHidden) &&
-		uint32PtrEqual(left.UnreadCount, right.UnreadCount)
-}
-
 func boolPtrEqual(left, right *bool) bool {
 	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
-}
-
-func isDMDialog(dialog sidecar.DialogRecord) bool {
-	return dialog.PeerUserID != nil && *dialog.PeerUserID > 0
 }
 
 func (ic *InlineClient) needsDialogDetailsSync(chatID int64) bool {
@@ -2673,6 +2685,14 @@ func (ic *InlineClient) cachedUser(userID int64) (sidecar.UserRecord, bool) {
 }
 
 func (ic *InlineClient) chatInfoForChat(ctx context.Context, chatID int64, name *string) (*bridgev2.ChatInfo, error) {
+	if d, ok := ic.cachedDialog(chatID); !ok || classifyDialog(d) == roomUnknown {
+		bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+		state, err := ic.Sidecar.ChatState(bounded, sidecar.ChatStateRequest{ChatID: chatID})
+		cancel()
+		if err == nil && state.Dialog != nil {
+			ic.rememberDialog(*state.Dialog)
+		}
+	}
 	if dialog, ok := ic.cachedDialog(chatID); ok && isDMDialog(dialog) {
 		return ic.chatInfoForDialog(ctx, dialog, name), nil
 	}
@@ -2681,31 +2701,13 @@ func (ic *InlineClient) chatInfoForChat(ctx context.Context, chatID int64, name 
 		return nil, fmt.Errorf("failed to fetch Inline chat participants: %w", err)
 	}
 	ic.cacheUsers(page.Users)
-	roomType := database.RoomTypeGroupDM
-	return &bridgev2.ChatInfo{
-		Type:        &roomType,
-		Name:        name,
-		Members:     ic.chatMemberListFromParticipants(ctx, page),
-		CanBackfill: true,
-	}, nil
-}
-
-func (ic *InlineClient) chatInfoForDialog(ctx context.Context, dialog sidecar.DialogRecord, name *string) *bridgev2.ChatInfo {
-	info := &bridgev2.ChatInfo{
-		Name:        name,
-		CanBackfill: true,
+	dialog, _ := ic.cachedDialog(chatID)
+	info := ic.chatInfoForDialog(ctx, dialog, name)
+	info.Members = ic.chatMemberListFromParticipants(ctx, page)
+	if info.Members != nil {
+		info.Members.OtherUserID = ""
 	}
-	if dialog.PeerUserID != nil && *dialog.PeerUserID > 0 {
-		roomType := database.RoomTypeDM
-		info.Type = &roomType
-		info.Name = nil
-		info.Members = ic.chatMemberListForDM(ctx, *dialog.PeerUserID)
-	} else {
-		roomType := database.RoomTypeGroupDM
-		info.Type = &roomType
-		info.Members = ic.chatMemberListForKnownSelf(ctx)
-	}
-	return info
+	return info, nil
 }
 
 func (ic *InlineClient) chatMemberListFromParticipants(ctx context.Context, page *sidecar.ChatParticipantsPage) *bridgev2.ChatMemberList {
@@ -2890,17 +2892,23 @@ func eventHandlingResultError(kind string, result bridgev2.EventHandlingResult) 
 func (ic *InlineClient) queueInlineMessage(ctx context.Context, msg sidecar.MessageRecord) bridgev2.EventHandlingResult {
 	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, ic.remoteMessageEvent(msg))
 	if historyDeliveryAccepted(result) {
-		if err := ic.persistHistoryCheckpoint(ctx, msg.ChatID, msg.MessageID); err != nil {
+		row, err := ic.UserLogin.Bridge.DB.Message.GetFirstPartByID(ctx, ic.portalKeyForChat(msg.ChatID).Receiver, makeMessageID(msg.ChatID, msg.MessageID))
+		if err != nil || row == nil || row.MXID == "" || row.HasFakeMXID() || row.Room != ic.portalKeyForChat(msg.ChatID) {
+			return bridgev2.EventHandlingResultFailed.WithError(errors.New("live delivery awaits persisted Matrix mapping"))
+		}
+		if err := ic.persistDeliveryCheckpoint(ctx, msg.ChatID, msg.MessageID, false); err != nil {
 			result.Success = false
 			result.Error = err
 			return result
 		}
-		ic.rememberHistoryDelivered(msg.ChatID, msg.MessageID)
 	}
 	return result
 }
 
 func (ic *InlineClient) persistHistoryCheckpoint(ctx context.Context, chatID, messageID int64) error {
+	return ic.persistDeliveryCheckpoint(ctx, chatID, messageID, true)
+}
+func (ic *InlineClient) persistDeliveryCheckpoint(ctx context.Context, chatID, messageID int64, historical bool) error {
 	if chatID <= 0 || messageID <= 0 {
 		return errors.New("invalid Inline history checkpoint")
 	}
@@ -2912,13 +2920,18 @@ func (ic *InlineClient) persistHistoryCheckpoint(ctx context.Context, chatID, me
 	if !ok || metadata == nil {
 		return errors.New("Inline portal metadata is unavailable")
 	}
-	if messageID <= metadata.HistoryCheckpoint {
+	previous := *metadata
+	if messageID > metadata.HistoryCheckpoint {
+		metadata.HistoryCheckpoint = messageID
+	}
+	if historical && messageID > metadata.HistoricalCheckpoint {
+		metadata.HistoricalCheckpoint = messageID
+	}
+	if *metadata == previous {
 		return nil
 	}
-	previous := metadata.HistoryCheckpoint
-	metadata.HistoryCheckpoint = messageID
 	if err := portal.Save(ctx); err != nil {
-		metadata.HistoryCheckpoint = previous
+		*metadata = previous
 		return fmt.Errorf("save Inline history checkpoint: %w", err)
 	}
 	return nil
@@ -3033,7 +3046,9 @@ func (ic *InlineClient) remoteMessageEvent(msg sidecar.MessageRecord) *simpleven
 				Sender:   makeUserID(strconv.FormatInt(msg.SenderID, 10)),
 				IsFromMe: msg.IsOutgoing,
 			},
-			Timestamp: inlineTimestamp(msg.Timestamp),
+			Timestamp:      inlineTimestamp(msg.Timestamp),
+			StreamOrder:    msg.MessageID,
+			PostHandleFunc: ic.projectionPostHandler,
 		},
 		Data:               msg,
 		ID:                 makeMessageID(msg.ChatID, msg.MessageID),

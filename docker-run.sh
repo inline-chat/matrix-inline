@@ -1,6 +1,25 @@
 #!/bin/bash
 set -Eeuo pipefail
 
+function wait_for_sidecar {
+	for _ in $(seq 1 60); do
+		if curl -fsS -H "X-Inline-Protocol-Version: 5" "http://${INLINE_SIDECAR_BIND}/health" >/dev/null 2>&1; then
+			break
+		fi
+		if ! kill -0 "${sidecar_pid}" 2>/dev/null; then
+			wait "${sidecar_pid}" || true
+			return 1
+		fi
+		sleep 1
+	done
+	curl -fsS -H "X-Inline-Protocol-Version: 5" "http://${INLINE_SIDECAR_BIND}/health" >/dev/null 2>&1
+}
+
+# The readiness helper can be sourced without config, store or service effects.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+	return 0
+fi
+
 BINARY_NAME=/usr/bin/matrix-inline
 SIDECAR_NAME=/usr/bin/matrix-inline-adapter
 DATA_DIR=${DATA_DIR:-/data}
@@ -154,17 +173,7 @@ function stop_children {
 
 trap stop_children INT TERM
 
-for _ in $(seq 1 60); do
-	if curl -fsS "http://${INLINE_SIDECAR_BIND}/health" >/dev/null 2>&1; then
-		break
-	fi
-	if ! kill -0 "${sidecar_pid}" 2>/dev/null; then
-		wait "${sidecar_pid}"
-	fi
-	sleep 1
-done
-
-if ! curl -fsS "http://${INLINE_SIDECAR_BIND}/health" >/dev/null 2>&1; then
+if ! wait_for_sidecar; then
 	echo "matrix-inline-adapter did not become healthy" >&2
 	stop_children
 	exit 1
