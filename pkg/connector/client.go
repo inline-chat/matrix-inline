@@ -299,7 +299,7 @@ func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Po
 			},
 			event.MsgVideo: {
 				MimeTypes: map[string]event.CapabilitySupportLevel{
-					"video/*": event.CapLevelFullySupported,
+					"video/*": event.CapLevelPartialSupport,
 				},
 				Caption:          event.CapLevelFullySupported,
 				MaxCaptionLength: 5000,
@@ -307,7 +307,7 @@ func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Po
 			},
 			event.MsgAudio: {
 				MimeTypes: map[string]event.CapabilitySupportLevel{
-					"audio/*": event.CapLevelFullySupported,
+					"audio/*": event.CapLevelPartialSupport,
 				},
 				Caption:          event.CapLevelPartialSupport,
 				MaxCaptionLength: 5000,
@@ -455,27 +455,17 @@ func (ic *InlineClient) handleMatrixTextMessage(ctx context.Context, msg *bridge
 }
 
 func (ic *InlineClient) handleMatrixMediaMessage(ctx context.Context, msg *bridgev2.MatrixMessage, chatID int64) (*bridgev2.MatrixMessageResponse, error) {
-	data, err := ic.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+	data, err := downloadBoundedMatrixMedia(ctx, ic.UserLogin.Bridge.Bot, msg.Content)
 	if err != nil {
+		reason := event.MessageStatusGenericError
+		if isPermanentMediaFailure(err) {
+			reason = event.MessageStatusUnsupported
+		}
 		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("failed to download Matrix media: %w", err)).
 			WithErrorAsMessage().
-			WithIsCertain(true).
+			WithIsCertain(isPermanentMediaFailure(err)).
 			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusUnsupported)
-	}
-	if len(data) == 0 {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Matrix media download returned no bytes")).
-			WithErrorAsMessage().
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusUnsupported)
-	}
-	if len(data) > maxInlineMediaDownload {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Matrix media is too large for current Inline bridge upload limit")).
-			WithErrorAsMessage().
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusUnsupported)
+			WithErrorReason(reason)
 	}
 
 	captionContent := *msg.Content
@@ -3319,19 +3309,14 @@ func convertedInlineMedia(ctx context.Context, portal *bridgev2.Portal, intent b
 		info.Duration = duration
 	}
 
-	return &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			Type: event.EventMessage,
-			Content: &event.MessageEventContent{
-				MsgType:  inlineMediaMessageType(content),
-				Body:     inlineMediaBody(content, fileName),
-				URL:      mxc,
-				File:     file,
-				FileName: fileName,
-				Info:     info,
-			},
-		}},
-	}, nil
+	matrixContent := &event.MessageEventContent{MsgType: inlineMediaMessageType(content), Body: inlineMediaBody(content, fileName), URL: mxc, File: file, FileName: fileName, Info: info}
+	if content.Kind == "voice" && matrixContent.MsgType == event.MsgAudio {
+		matrixContent.MSC3245Voice = &event.MSC3245Voice{}
+		if info.Duration > 0 {
+			matrixContent.MSC1767Audio = &event.MSC1767Audio{Duration: info.Duration, Waveform: []int{}}
+		}
+	}
+	return &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{Type: event.EventMessage, Content: matrixContent}}}, nil
 }
 
 func downloadInlineMedia(ctx context.Context, rawURL string) ([]byte, error) {
@@ -3379,6 +3364,9 @@ func downloadInlineURL(ctx context.Context, rawURL string, maxBytes int64, label
 	if int64(len(data)) > maxBytes {
 		return nil, permanentMediaFailure(fmt.Errorf("%s exceeds %d byte bridge download limit", label, maxBytes))
 	}
+	if len(data) == 0 {
+		return nil, permanentMediaFailure(fmt.Errorf("%s is empty", label))
+	}
 	return data, nil
 }
 
@@ -3395,16 +3383,22 @@ func convertedInlineMediaUnavailable(content sidecar.MessageContent) *bridgev2.C
 }
 
 func inlineMediaMessageType(content sidecar.MessageContent) event.MessageType {
+	mime := strings.ToLower(strings.TrimSpace(strings.SplitN(inlineMediaMimeType(content), ";", 2)[0]))
 	switch content.Kind {
 	case "photo":
-		return event.MsgImage
+		if strings.HasPrefix(mime, "image/") {
+			return event.MsgImage
+		}
 	case "video":
-		return event.MsgVideo
+		if strings.HasPrefix(mime, "video/") {
+			return event.MsgVideo
+		}
 	case "voice":
-		return event.MsgAudio
-	default:
-		return event.MsgFile
+		if strings.HasPrefix(mime, "audio/") {
+			return event.MsgAudio
+		}
 	}
+	return event.MsgFile
 }
 
 func inlineMediaMimeType(content sidecar.MessageContent) string {
@@ -3551,9 +3545,14 @@ func sidecarUploadKindForMatrix(content *event.MessageEventContent) string {
 	case event.MsgImage:
 		return "photo"
 	case event.MsgVideo:
-		return "video"
+		if nativeVideoMetadataValid(content.Info) {
+			return "video"
+		}
+		return "document"
 	case event.MsgAudio:
-		return "voice"
+		// Generic audio must never become a voice note. The native voice
+		// endpoint exists upstream, but bridge voice upload remains unvalidated.
+		return "document"
 	default:
 		return "document"
 	}

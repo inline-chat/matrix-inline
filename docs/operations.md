@@ -117,7 +117,7 @@ pending. The pinned framework's timestamp cutoff is supplemented by bounded
 source-ID recovery in the existing portal event lane.
 
 Permanent media projection failures (invalid schemes, reviewed terminal 4xx,
-or the configured size ceiling) produce a stable Matrix unavailable notice and
+empty files, or the configured size ceiling) produce a stable Matrix unavailable notice and
 allow the lossless cursor to continue. Timeouts, 429, and 5xx remain retryable.
 
 Matrix kicks and invite revocations are unsupported because removing a direct
@@ -141,7 +141,19 @@ Caption-only edits require the original Matrix media type, URI, filename and
 attachment metadata. Clients that rewrite or omit that metadata can receive an
 explicit unsupported error. Replacing a file through an edit is unsupported. Old messages without enough
 saved media identity reject caption edits rather than silently ignoring a file
-replacement.
+replacement. Outgoing media uses a bounded authenticated stream, including
+encrypted-file hash verification, without an unbounded temporary-file spool.
+The 100 MiB ceiling applies to declared and actual bytes. Empty and oversized
+files are rejected. A Matrix backend without this bounded transport reports an
+explicit unsupported error.
+
+Incoming native voice records retain voice and duration metadata. A waveform
+is omitted when the source does not provide one. Outgoing audio uses a file
+fallback; native voice upload is not advertised. Video upload requires the
+native dimension and duration metadata, otherwise it uses a file fallback.
+Conflicting source kind/MIME information also uses a file presentation.
+Photo-backed sticker content remains an image; dedicated sticker and animated
+GIF semantics are not advertised.
 
 ### Accessible people and channel creation
 

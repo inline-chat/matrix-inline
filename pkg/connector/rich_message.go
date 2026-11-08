@@ -172,6 +172,12 @@ func convertedInlineEditContent(ctx context.Context, portal *bridgev2.Portal, in
 				return nil, fmt.Errorf("Inline media replacement is unsupported: %w", bridgev2.ErrUnsupportedMessageType)
 			}
 			content := *meta.InlineMedia
+			// A completed upload may have used the native document fallback.
+			// Preserve its Matrix object while presenting the observed source kind.
+			content.MsgType = inlineMediaMessageType(data.Content)
+			if data.Content.Kind != "voice" || content.MsgType != event.MsgAudio {
+				content.MSC3245Voice, content.MSC1767Audio = nil, nil
+			}
 			content.Body = inlineMediaBody(data.Content, content.FileName)
 			content.Format, content.FormattedBody, content.Mentions = "", "", nil
 			return &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{Type: event.EventMessage, Content: &content}}}, nil

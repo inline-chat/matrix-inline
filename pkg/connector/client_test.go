@@ -837,8 +837,8 @@ func TestEffectiveMatrixMessageTypeInfersMediaFromFileMime(t *testing.T) {
 		kind string
 	}{
 		"image": {mime: "image/png", want: event.MsgImage, kind: "photo"},
-		"video": {mime: "video/mp4", want: event.MsgVideo, kind: "video"},
-		"audio": {mime: "audio/ogg", want: event.MsgAudio, kind: "voice"},
+		"video": {mime: "video/mp4", want: event.MsgVideo, kind: "document"},
+		"audio": {mime: "audio/ogg", want: event.MsgAudio, kind: "document"},
 		"file":  {mime: "application/pdf", want: event.MsgFile, kind: "document"},
 	}
 	for name, tt := range cases {
