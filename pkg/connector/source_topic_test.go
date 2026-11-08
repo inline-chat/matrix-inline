@@ -223,6 +223,27 @@ func TestSourceTopicPendingEventRetriesAreRateLimited(t *testing.T) {
 		t.Fatal("repeated portal event retried pending topic without delay")
 	}
 }
+
+func TestSourceTopicIneligibleEventDoesNotDelayRetry(t *testing.T) {
+	f := newTopicFixture(t)
+	d := topicChild()
+	f.ic.rememberDialog(d)
+	f.failWrite = true
+	f.apply(t, d)
+	if !f.pending(t) {
+		t.Fatal("failed write lost pending intent")
+	}
+	unknown := d
+	unknown.Structure = &sidecar.DialogStructure{Kind: "unknown"}
+	f.ic.rememberDialog(unknown)
+	f.ic.projectionPostHandler(t.Context(), f.portal)
+	f.ic.rememberDialog(d)
+	f.failWrite = false
+	f.ic.projectionPostHandler(t.Context(), f.portal)
+	if f.pending(t) || f.writes != 1 || !strings.Contains(f.topic, "chat 3") {
+		t.Fatalf("ineligible event delayed eligible retry: topic %q writes %d", f.topic, f.writes)
+	}
+}
 func TestSourceTopicFailedWriteAndConflictStaySafe(t *testing.T) {
 	for _, conflict := range []bool{false, true} {
 		t.Run(map[bool]string{false: "retry", true: "conflict"}[conflict], func(t *testing.T) {

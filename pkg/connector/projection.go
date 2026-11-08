@@ -203,7 +203,7 @@ func (ic *InlineClient) projectionPostHandler(ctx context.Context, p *bridgev2.P
 				// This callback is already in the portal lane. Only retry a
 				// durable pending topic here; do not enqueue recursively or
 				// read Matrix state for every otherwise healthy message.
-				if meta, ok := p.Metadata.(*PortalMetadata); ok && meta != nil && meta.InlineTopic != nil && !meta.InlineTopic.UserOwned && meta.InlineTopic.Pending != nil && p.MXID != "" && ic.reserveTopicRetry(chat) {
+				if meta, ok := p.Metadata.(*PortalMetadata); ok && meta != nil && meta.InlineTopic != nil && !meta.InlineTopic.UserOwned && meta.InlineTopic.Pending != nil && p.MXID != "" && classifyDialog(d) != roomUnknown && ic.shouldProjectDialog(d) && ic.reserveTopicRetry(chat) {
 					bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
 					if err := ic.reconcileSourceTopic(bounded, p, d); err != nil {
 						zerolog.Ctx(ctx).Warn().Err(err).Msg("Source topic projection remains pending")
