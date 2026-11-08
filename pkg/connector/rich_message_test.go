@@ -114,6 +114,37 @@ func TestRichMessageOutgoingEntitiesReachSource(t *testing.T) {
 	}
 }
 
+func TestRichMessageReplyFallbackPreservesReplyTarget(t *testing.T) {
+	calls := 0
+	s := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request sidecar.SendTextRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		calls++
+		if r.URL.Path != "/rpc/send" || request.Text != "reply 😀" || request.ReplyToMessageID == nil || *request.ReplyToMessageID != 10 {
+			t.Errorf("reply context or body lost: path=%s request=%+v", r.URL.Path, request)
+		}
+		if len(request.Entities) != 1 || request.Entities[0].Kind != "TYPE_BOLD" || request.Entities[0].Offset != 6 || request.Entities[0].Length != 2 {
+			t.Errorf("reply formatting lost: %+v", request.Entities)
+		}
+		mid := int64(11)
+		writeConnectorSidecarResult(t, w, "message", sidecar.MessageMutation{State: sidecar.TransactionCompleted, MessageID: &mid})
+	}))
+	defer s.Close()
+	ic := richClient()
+	ic.Sidecar = sidecar.NewClient(s.URL)
+	content := &event.MessageEventContent{MsgType: event.MsgText, Body: "> quoted\n\nreply 😀", Format: event.FormatHTML, FormattedBody: "<mx-reply><blockquote>quoted</blockquote></mx-reply>reply <b>😀</b>"}
+	msg := &bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{Portal: testPortal("7"), Content: content}, ReplyTo: &database.Message{ID: "7/10"}}
+	if _, err := ic.HandleMatrixMessage(t.Context(), msg); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("send calls %d", calls)
+	}
+}
+
 func TestRichMessageOutgoingMediaReplacementRejected(t *testing.T) {
 	calls := 0
 	s := newSidecarTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
