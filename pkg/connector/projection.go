@@ -9,6 +9,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
@@ -199,12 +200,46 @@ func (ic *InlineClient) projectionPostHandler(ctx context.Context, p *bridgev2.P
 	if p != nil {
 		if chat, err := chatIDFromPortal(p); err == nil {
 			if d, ok := ic.cachedDialog(chat); ok {
+				// This callback is already in the portal lane. Only retry a
+				// durable pending topic here; do not enqueue recursively or
+				// read Matrix state for every otherwise healthy message.
+				if meta, ok := p.Metadata.(*PortalMetadata); ok && meta != nil && meta.InlineTopic != nil && !meta.InlineTopic.UserOwned && meta.InlineTopic.Pending != nil && p.MXID != "" && ic.reserveTopicRetry(chat) {
+					bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+					if err := ic.reconcileSourceTopic(bounded, p, d); err != nil {
+						zerolog.Ctx(ctx).Warn().Err(err).Msg("Source topic projection remains pending")
+					}
+					cancel()
+					if meta.InlineTopic == nil || meta.InlineTopic.Pending == nil {
+						ic.clearTopicRetry(chat)
+					}
+				}
 				ic.projectDialogInLane(ctx, p, d)
 				return
 			}
 		}
 	}
 	ic.reconcileProjection(ctx, p)
+}
+
+// Limit retries for busy rooms. Idle rooms still require a later portal event.
+func (ic *InlineClient) reserveTopicRetry(chat int64) bool {
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	if ic.topicRetryAfter == nil {
+		ic.topicRetryAfter = make(map[int64]time.Time)
+	}
+	now := time.Now()
+	if now.Before(ic.topicRetryAfter[chat]) {
+		return false
+	}
+	ic.topicRetryAfter[chat] = now.Add(30 * time.Second)
+	return true
+}
+
+func (ic *InlineClient) clearTopicRetry(chat int64) {
+	ic.mu.Lock()
+	delete(ic.topicRetryAfter, chat)
+	ic.mu.Unlock()
 }
 func (ic *InlineClient) reconcileProjection(ctx context.Context, portal *bridgev2.Portal) {
 	if portal == nil || portal.MXID == "" {

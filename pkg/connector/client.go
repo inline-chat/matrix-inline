@@ -94,6 +94,7 @@ type InlineClient struct {
 	bridgeStateVersion         uint32
 	bridgeRecoveryCursor       int64
 	dialogSyncCursor           string
+	topicRetryAfter            map[int64]time.Time
 	hiddenDialogsDefault       hiddenDialogsPolicy
 	hiddenDialogsOverride      hiddenDialogsPolicy
 	channelMuteDefault         string

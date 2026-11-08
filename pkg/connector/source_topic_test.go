@@ -172,6 +172,57 @@ func TestSourceTopicPendingReadbackResumesWithoutDuplicateWrite(t *testing.T) {
 		t.Fatal("recovered ownership did not retract context")
 	}
 }
+
+func TestSourceTopicPendingRetriesOnPortalEvent(t *testing.T) {
+	for _, userChoice := range []bool{false, true} {
+		t.Run(fmt.Sprintf("user-choice=%t", userChoice), func(t *testing.T) {
+			f := newTopicFixture(t)
+			d := topicChild()
+			f.ic.rememberDialog(d)
+			f.failWrite = true
+			f.apply(t, d)
+			if !f.pending(t) {
+				t.Fatal("failed write lost pending intent")
+			}
+			f.failWrite = false
+			if userChoice {
+				f.topic = "user choice"
+			}
+			// The next existing portal event invokes the real post-handler;
+			// there is no new dialog observation or manual topic reconciliation.
+			f.ic.projectionPostHandler(t.Context(), f.portal)
+			if f.pending(t) {
+				t.Fatal("portal event did not resolve pending intent")
+			}
+			if userChoice {
+				if f.topic != "user choice" || f.writes != 0 {
+					t.Fatalf("user topic overwritten: %q, writes %d", f.topic, f.writes)
+				}
+			} else if !strings.Contains(f.topic, "chat 3") || f.writes != 1 {
+				t.Fatalf("pending context not applied once: %q, writes %d", f.topic, f.writes)
+			}
+			calls := f.matrixCalls
+			f.ic.projectionPostHandler(t.Context(), f.portal)
+			if f.matrixCalls != calls {
+				t.Fatal("completed intent caused another topic request")
+			}
+		})
+	}
+}
+
+func TestSourceTopicPendingEventRetriesAreRateLimited(t *testing.T) {
+	f := newTopicFixture(t)
+	d := topicChild()
+	f.ic.rememberDialog(d)
+	f.failWrite = true
+	f.apply(t, d)
+	f.ic.projectionPostHandler(t.Context(), f.portal)
+	calls := f.matrixCalls
+	f.ic.projectionPostHandler(t.Context(), f.portal)
+	if !f.pending(t) || f.matrixCalls != calls {
+		t.Fatal("repeated portal event retried pending topic without delay")
+	}
+}
 func TestSourceTopicFailedWriteAndConflictStaySafe(t *testing.T) {
 	for _, conflict := range []bool{false, true} {
 		t.Run(map[bool]string{false: "retry", true: "conflict"}[conflict], func(t *testing.T) {

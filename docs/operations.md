@@ -184,6 +184,9 @@ existing child context; conclusive missing mappings retain readable native IDs.
 Generated topics use a durable pending-intent journal. An authoritative detach
 retracts only connector-owned context after Matrix state comparison/readback;
 unknown descriptors, later user edits and legacy unowned topics are preserved.
+Pending topic writes can retry on a later portal event, at most once per room
+every 30 seconds. An idle room has no automatic retry, and failures before an
+intent is saved require a later dialog reconciliation.
 Topic replacement requires a controlled window: Matrix state comparison is not
 an atomic compare-and-swap with concurrent user edits.
 
