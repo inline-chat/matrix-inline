@@ -12,7 +12,7 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Session resume after bridge restart
 - [x] Startup chat sync
 - [x] Recent history sync and bridgev2 backfill
-- [x] Text messages
+- [x] Text messages, supported formatting, entities and account-scoped mentions
 - [x] Normal message replies
 - [x] Message edits
 - [x] Message deletes/redactions
@@ -26,16 +26,16 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Configurable bridge bot and network profile metadata
 - [x] DM creation with a numeric Inline user ID
 - [x] Basic group/thread creation from Matrix
+- [x] Caption edits that retain existing media and reject file replacements
 - [x] Add Inline thread participants from Matrix invitations
 - [ ] Remove Inline thread access from Matrix kicks or invite revocations
 - [x] Rename Inline threads from Matrix
 - [x] Explicit Inline thread deletion from Beeper/Matrix
 - [x] Account-scoped workspace Spaces and in-place presentation migration
 - [x] Management commands for status, settings, and reconnect
+- [ ] Contact search for DM creation
 - [ ] New Inline account signup or invite-code onboarding
 - [ ] Matrix-native thread UI for Inline reply-thread chats
-- [ ] Contact search for DM creation
-- [ ] Formatted text, rich entities, and Matrix mention mapping
 - [ ] Pins and Inline link-preview projection
 - [ ] Room avatars
 - [ ] Room topic/description editing
@@ -52,6 +52,7 @@ verified private receipt/fully-read prefix and never crosses an unmapped event;
 genuine private user receipts are not forwarded by the pinned framework.
 See [operations](docs/operations.md#notification-and-read-state-limits) for these
 limits and the explicit preview/apply/rollback migration commands.
+The operations guide also describes [rich messages and media](docs/operations.md#rich-messages-and-media).
 
 ## Requirements
 

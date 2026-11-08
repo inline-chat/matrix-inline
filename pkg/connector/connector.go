@@ -13,6 +13,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
@@ -71,8 +72,12 @@ type UserLoginMetadata struct {
 }
 
 type MessageMetadata struct {
-	InlineFingerprint string `json:"inline_fingerprint,omitempty"`
-	MediaHandled      bool   `json:"media_handled,omitempty"`
+	InlineFingerprint string                     `json:"inline_fingerprint,omitempty"`
+	MediaHandled      bool                       `json:"media_handled,omitempty"`
+	InlineRevision    *int64                     `json:"inline_revision,omitempty"`
+	InlineEditTime    *int64                     `json:"inline_edit_time,omitempty"`
+	InlineMediaID     string                     `json:"inline_media_id,omitempty"`
+	InlineMedia       *event.MessageEventContent `json:"inline_media,omitempty"`
 }
 
 type PortalMetadata struct {
@@ -134,7 +139,7 @@ func validatePortalEventDelivery() error {
 }
 
 func (ic *InlineConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 3, 2
+	return 4, 3
 }
 
 func (ic *InlineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {

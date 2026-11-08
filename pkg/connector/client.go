@@ -25,6 +25,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 
+	"github.com/inline-chat/matrix-inline/pkg/msgconv"
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
 )
 
@@ -276,7 +277,15 @@ func (ic *InlineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) 
 
 func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	features := &event.RoomFeatures{
-		ID:            "inline-foundation-v1",
+		ID: "inline-rich-v1",
+		Formatting: event.FormattingFeatureMap{
+			event.FmtBold:       event.CapLevelFullySupported,
+			event.FmtItalic:     event.CapLevelFullySupported,
+			event.FmtInlineCode: event.CapLevelFullySupported,
+			event.FmtCodeBlock:  event.CapLevelFullySupported,
+			event.FmtInlineLink: event.CapLevelFullySupported,
+			event.FmtUserLink:   event.CapLevelPartialSupport,
+		},
 		MaxTextLength: 5000,
 		File: event.FileFeatureMap{
 			event.MsgImage: {
@@ -313,7 +322,7 @@ func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Po
 			},
 		},
 		Reply:                event.CapLevelPartialSupport,
-		Edit:                 event.CapLevelFullySupported,
+		Edit:                 event.CapLevelPartialSupport,
 		Delete:               event.CapLevelFullySupported,
 		Reaction:             event.CapLevelFullySupported,
 		ReactionCount:        1,
@@ -410,9 +419,11 @@ func (ic *InlineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.M
 }
 
 func (ic *InlineClient) handleMatrixTextMessage(ctx context.Context, msg *bridgev2.MatrixMessage, chatID int64) (*bridgev2.MatrixMessageResponse, error) {
+	text, entities := msgconv.FromMatrix(msg.Content, ic.outgoingMentionResolver(msg.Content))
 	request := sidecar.SendTextRequest{
 		Peer:       sidecar.ChatPeer(chatID),
-		Text:       msg.Content.Body,
+		Text:       text,
+		Entities:   entities,
 		ExternalID: matrixExternalID(msg),
 		RandomID:   matrixRandomID(msg),
 	}
@@ -458,13 +469,20 @@ func (ic *InlineClient) handleMatrixMediaMessage(ctx context.Context, msg *bridg
 			WithErrorReason(event.MessageStatusUnsupported)
 	}
 
+	captionContent := *msg.Content
+	captionContent.Body = msg.Content.GetCaption()
+	if captionContent.Body == "" {
+		captionContent.Format, captionContent.FormattedBody = "", ""
+	}
+	caption, entities := msgconv.FromMatrix(&captionContent, ic.outgoingMentionResolver(msg.Content))
 	request := sidecar.UploadRequest{
 		Peer:       sidecar.ChatPeer(chatID),
 		Kind:       sidecarUploadKindForMatrix(msg.Content),
 		FileName:   optionalString(sanitizeMatrixFileName(msg.Content.GetFileName())),
 		MimeType:   optionalString(matrixMediaMimeType(msg.Content)),
 		SizeBytes:  uint64Ptr(uint64(len(data))),
-		Caption:    optionalString(msg.Content.GetCaption()),
+		Caption:    optionalString(caption),
+		Entities:   entities,
 		ExternalID: matrixExternalID(msg),
 		RandomID:   matrixRandomID(msg),
 	}
@@ -541,19 +559,31 @@ func (ic *InlineClient) matrixSendResponse(msg *bridgev2.MatrixMessage, chatID i
 		msg.AddPendingToIgnore(txnID)
 	}
 
+	var metadata *MessageMetadata
+	if msg.Content != nil && msg.Content.MsgType.IsMedia() {
+		media := *msg.Content
+		metadata = &MessageMetadata{InlineMedia: &media, MediaHandled: true}
+	}
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        makeMessageID(chatID, *mutation.MessageID),
 			SenderID:  ic.GetUserID(),
 			Timestamp: time.Now(),
+			Metadata:  metadata,
 		},
 		RemovePending: txnID,
 	}, nil
 }
 
 func (ic *InlineClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
-	if msg.Content.MsgType != event.MsgText {
+	if msg == nil || msg.Content == nil || msg.EditTarget == nil || msg.Portal == nil || msg.Portal.Portal == nil || msg.EditTarget.Room != msg.Portal.PortalKey {
+		return fmt.Errorf("Inline edit target must belong to this conversation and login: %w", bridgev2.ErrUnsupportedMessageType)
+	}
+	if msg.Content.MsgType != event.MsgText && !msg.Content.MsgType.IsMedia() {
 		return bridgev2.ErrUnsupportedMessageType
+	}
+	if msg.Content.MsgType.IsMedia() && !matrixCaptionEditAllowed(msg.EditTarget, msg.Content) {
+		return fmt.Errorf("Inline media replacement or unverified legacy caption edit is unsupported: %w", bridgev2.ErrUnsupportedMessageType)
 	}
 	chatID, messageID, err := parseMessageID(msg.EditTarget.ID)
 	if err != nil {
@@ -563,10 +593,23 @@ func (ic *InlineClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.Matr
 			WithSendNotice(true).
 			WithErrorReason(event.MessageStatusUnsupported)
 	}
+	portalChat, portalErr := chatIDFromPortal(msg.Portal)
+	if portalErr != nil || chatID != portalChat || messageID <= 0 {
+		return fmt.Errorf("Inline edit target must be a positive message in this conversation: %w", bridgev2.ErrUnsupportedMessageType)
+	}
+	content := *msg.Content
+	if content.MsgType.IsMedia() {
+		content.Body = content.GetCaption()
+		if content.Body == "" {
+			content.Format, content.FormattedBody = "", ""
+		}
+	}
+	text, entities := msgconv.FromMatrix(&content, ic.outgoingMentionResolver(msg.Content))
 	if err := ic.Sidecar.EditMessage(ctx, sidecar.EditMessageRequest{
 		ChatID:     chatID,
 		MessageID:  messageID,
-		Text:       msg.Content.Body,
+		Text:       text,
+		Entities:   entities,
 		ExternalID: matrixEventExternalID(msg.Event),
 	}); err != nil {
 		return bridgev2.WrapErrorInStatus(fmt.Errorf("Inline sidecar edit failed: %w", err)).
@@ -1661,7 +1704,7 @@ func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal 
 				continue
 			}
 		}
-		converted, err := convertInlineMessage(ctx, portal, intent, record)
+		converted, err := ic.convertInlineMessage(ctx, portal, intent, record)
 		if err != nil {
 			ic.logBackfillConversionError(err, record)
 			continue
@@ -3053,9 +3096,9 @@ func (ic *InlineClient) remoteMessageEvent(msg sidecar.MessageRecord) *simpleven
 		Data:               msg,
 		ID:                 makeMessageID(msg.ChatID, msg.MessageID),
 		TransactionID:      transactionIDForMessage(msg),
-		ConvertMessageFunc: convertInlineMessage,
-		HandleExistingFunc: upsertExistingInlineMessage,
-		ConvertEditFunc:    convertInlineMessageEdit,
+		ConvertMessageFunc: ic.convertInlineMessage,
+		HandleExistingFunc: ic.upsertExistingInlineMessage,
+		ConvertEditFunc:    ic.convertInlineMessageEdit,
 		TargetMessage:      makeMessageID(msg.ChatID, msg.MessageID),
 	}
 }
@@ -3064,11 +3107,18 @@ func upsertExistingInlineMessage(ctx context.Context, portal *bridgev2.Portal, i
 	if len(existing) == 0 {
 		return bridgev2.UpsertResult{ContinueMessageHandling: true}, nil
 	}
+	if staleInlineRevision(existing[0], data) {
+		return bridgev2.UpsertResult{}, nil
+	}
 	fingerprint := inlineMessageFingerprint(data)
 	if metadata, ok := existing[0].Metadata.(*MessageMetadata); ok &&
-		metadata.InlineFingerprint == fingerprint &&
+		metadata != nil &&
 		(data.Content.Type != "media" || metadata.MediaHandled) {
-		return bridgev2.UpsertResult{}, nil
+		if metadata.InlineFingerprint == fingerprint ||
+			(metadata.InlineFingerprint != "" && emptyInlineMessageMetadata(data.Metadata) &&
+				metadata.InlineFingerprint == legacyInlineMessageFingerprint(data)) {
+			return bridgev2.UpsertResult{}, nil
+		}
 	}
 	return bridgev2.UpsertResult{
 		SubEvents: []bridgev2.RemoteEvent{&simplevent.Message[sidecar.MessageRecord]{
@@ -3089,10 +3139,15 @@ func upsertExistingInlineMessage(ctx context.Context, portal *bridgev2.Portal, i
 }
 
 func convertInlineMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data sidecar.MessageRecord) (*bridgev2.ConvertedMessage, error) {
+	return convertInlineMessageWithResolver(ctx, portal, intent, data, nil)
+}
+
+func convertInlineMessageWithResolver(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data sidecar.MessageRecord, resolve msgconv.InlineToMatrix) (*bridgev2.ConvertedMessage, error) {
 	converted, err := convertedContentFromInline(ctx, portal, intent, data.Content)
 	if err != nil {
 		return nil, err
 	}
+	applyInlineRichContent(converted, data, resolve)
 	if data.ReplyToMessageID != nil {
 		converted.ReplyTo = &networkid.MessageOptionalPartID{
 			MessageID: makeMessageID(data.ChatID, *data.ReplyToMessageID),
@@ -3103,16 +3158,24 @@ func convertInlineMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 }
 
 func convertInlineMessageEdit(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, data sidecar.MessageRecord) (*bridgev2.ConvertedEdit, error) {
+	return convertInlineMessageEditWithResolver(ctx, portal, intent, existing, data, nil)
+}
+
+func convertInlineMessageEditWithResolver(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, data sidecar.MessageRecord, resolve msgconv.InlineToMatrix) (*bridgev2.ConvertedEdit, error) {
 	if len(existing) == 0 {
 		return nil, bridgev2.ErrTargetMessageNotFound
 	}
-	converted, err := convertedContentFromInline(ctx, portal, intent, data.Content)
+	if staleInlineRevision(existing[0], data) {
+		return &bridgev2.ConvertedEdit{}, nil
+	}
+	converted, err := convertedInlineEditContent(ctx, portal, intent, existing[0], data)
 	if err != nil {
 		return nil, err
 	}
 	if len(converted.Parts) == 0 {
 		return &bridgev2.ConvertedEdit{}, nil
 	}
+	applyInlineRichContent(converted, data, resolve)
 	setInlineMessageFingerprint(converted, data)
 	return &bridgev2.ConvertedEdit{
 		ModifiedParts: []*bridgev2.ConvertedEditPart{
@@ -3128,9 +3191,16 @@ func setInlineMessageFingerprint(converted *bridgev2.ConvertedMessage, data side
 	metadata := &MessageMetadata{
 		InlineFingerprint: inlineMessageFingerprint(data),
 		MediaHandled:      data.Content.Type == "media",
+		InlineRevision:    data.Metadata.Revision,
+		InlineEditTime:    data.Metadata.EditTimestamp,
 	}
 	for _, part := range converted.Parts {
 		if part != nil {
+			if data.Content.Type == "media" && part.Content != nil && part.Content.MsgType.IsMedia() {
+				media := *part.Content
+				metadata.InlineMedia = &media
+				metadata.InlineMediaID = inlineMediaIdentity(data.Content)
+			}
 			part.DBMetadata = metadata
 		}
 	}
@@ -3138,16 +3208,40 @@ func setInlineMessageFingerprint(converted *bridgev2.ConvertedMessage, data side
 
 func inlineMessageFingerprint(data sidecar.MessageRecord) string {
 	payload, err := json.Marshal(struct {
-		SenderID         int64                  `json:"sender_id"`
-		IsOutgoing       bool                   `json:"is_outgoing"`
-		Content          sidecar.MessageContent `json:"content"`
-		ReplyToMessageID *int64                 `json:"reply_to_message_id,omitempty"`
+		SenderID         int64                   `json:"sender_id"`
+		IsOutgoing       bool                    `json:"is_outgoing"`
+		Content          sidecar.MessageContent  `json:"content"`
+		ReplyToMessageID *int64                  `json:"reply_to_message_id,omitempty"`
+		Metadata         sidecar.MessageMetadata `json:"metadata"`
 	}{
 		SenderID:         data.SenderID,
 		IsOutgoing:       data.IsOutgoing,
 		Content:          data.Content,
 		ReplyToMessageID: data.ReplyToMessageID,
+		Metadata:         data.Metadata,
 	})
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", digest[:])
+}
+
+// Legacy hashes omitted all metadata. Only semantically empty metadata can use
+// that equality proof: a first rich correction or revisionless edit must survive.
+func emptyInlineMessageMetadata(m sidecar.MessageMetadata) bool {
+	return m.Mentioned == nil && m.EditTimestamp == nil && m.Revision == nil &&
+		m.SenderIsBot == nil && !m.IsService && len(m.Entities) == 0 &&
+		len(m.Attachments) == 0 && len(m.Actions) == 0 && m.AgentSession == nil
+}
+
+func legacyInlineMessageFingerprint(data sidecar.MessageRecord) string {
+	payload, err := json.Marshal(struct {
+		SenderID         int64                  `json:"sender_id"`
+		IsOutgoing       bool                   `json:"is_outgoing"`
+		Content          sidecar.MessageContent `json:"content"`
+		ReplyToMessageID *int64                 `json:"reply_to_message_id,omitempty"`
+	}{data.SenderID, data.IsOutgoing, data.Content, data.ReplyToMessageID})
 	if err != nil {
 		return ""
 	}
