@@ -3176,6 +3176,16 @@ func convertInlineMessageEditWithResolver(ctx context.Context, portal *bridgev2.
 	}
 	applyInlineRichContent(converted, data, resolve)
 	setInlineMessageFingerprint(converted, data)
+	// Keep the original Matrix envelope for later caption-edit identity checks.
+	// The source presentation may have changed to a document fallback on echo.
+	if data.Content.Type == "media" {
+		if old, ok := existing[0].Metadata.(*MessageMetadata); ok && old != nil && old.InlineMedia != nil {
+			if next, ok := converted.Parts[0].DBMetadata.(*MessageMetadata); ok && next != nil {
+				media := *old.InlineMedia
+				next.InlineMedia = &media
+			}
+		}
+	}
 	return &bridgev2.ConvertedEdit{
 		ModifiedParts: []*bridgev2.ConvertedEditPart{
 			converted.Parts[0].ToEditPart(existing[0]),

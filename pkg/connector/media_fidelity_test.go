@@ -342,3 +342,35 @@ func TestMediaFidelityFirstEchoPreservesNativeDocumentFallback(t *testing.T) {
 		t.Fatalf("native document fallback was misrepresented or retransferred: %+v %v", edit, err)
 	}
 }
+
+func TestMediaFidelityFallbackEchoPreservesCaptionEditEnvelope(t *testing.T) {
+	for _, msgType := range []event.MessageType{event.MsgAudio, event.MsgVideo} {
+		t.Run(string(msgType), func(t *testing.T) {
+			original := &event.MessageEventContent{
+				MsgType: msgType, Body: "original", FileName: "clip.bin",
+				URL: "mxc://test/original", Info: &event.FileInfo{MimeType: "application/octet-stream"},
+			}
+			ic := richClient()
+			mid := int64(11)
+			response, err := ic.matrixSendResponse(&bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{Content: original}}, 7, &sidecar.MessageMutation{State: sidecar.TransactionCompleted, MessageID: &mid})
+			if err != nil {
+				t.Fatal(err)
+			}
+			echo := sidecar.MessageRecord{ChatID: 7, MessageID: 11, Content: sidecar.MessageContent{Type: "media", Kind: "document", FileID: "native-file", Caption: stringPtr("caption")}}
+			intent := &richMediaIntent{}
+			edit, err := convertInlineMessageEdit(t.Context(), testPortal("7"), intent, []*database.Message{response.DB}, echo)
+			if err != nil || len(edit.ModifiedParts) != 1 || edit.ModifiedParts[0].Content.MsgType != event.MsgFile || intent.uploads != 0 {
+				t.Fatalf("document fallback echo failed: edit=%+v err=%v uploads=%d", edit, err, intent.uploads)
+			}
+			captionEdit := *original
+			captionEdit.Body = "updated caption"
+			if !matrixCaptionEditAllowed(edit.ModifiedParts[0].Part, &captionEdit) {
+				t.Fatal("fallback echo lost the original caption-edit envelope")
+			}
+			captionEdit.URL = "mxc://test/replacement"
+			if matrixCaptionEditAllowed(edit.ModifiedParts[0].Part, &captionEdit) {
+				t.Fatal("fallback echo allowed replacement media")
+			}
+		})
+	}
+}
