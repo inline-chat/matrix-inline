@@ -26,7 +26,8 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Configurable bridge bot and network profile metadata
 - [x] DM creation with a numeric Inline user ID
 - [x] Basic group/thread creation from Matrix
-- [x] Add/remove Inline thread participants from Matrix membership changes
+- [x] Add Inline thread participants from Matrix invitations
+- [ ] Remove Inline thread access from Matrix kicks or invite revocations
 - [x] Rename Inline threads from Matrix
 - [x] Explicit Inline thread deletion from Beeper/Matrix
 - [x] Account-scoped workspace Spaces and in-place presentation migration
