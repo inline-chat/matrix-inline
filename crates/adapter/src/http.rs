@@ -14,11 +14,13 @@ use std::{
 
 use axum::{
     Json, Router,
+    extract::Request,
     extract::{
         DefaultBodyLimit, FromRequestParts, Multipart, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, request::Parts},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -26,8 +28,9 @@ use inline_client::{
     AuthStartRequest, AuthVerifyRequest, ChatParticipantsRequest, ClientCommandError,
     ClientErrorCategory, ClientRequestError, ClientStatus, ConnectRequest, CreateDmRequest,
     CreateReplyThreadRequest, CreateThreadRequest, DeleteMessageRequest, DialogsRequest,
-    EditMessageRequest, HistoryRequest, InlineClient, ReactRequest, ReadRequest, SendTextRequest,
-    TypingRequest, UploadRequest,
+    EditMessageRequest, HistoryRequest, InlineClient, ReactRequest, ReadRequest,
+    SearchUsersRequest, SendTextRequest, SpaceMembersRequest, TypingRequest, UploadRequest,
+    UsersRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -345,9 +348,8 @@ struct AdapterRequestClient(InlineClient);
 #[derive(Clone, Debug)]
 struct AdapterRequestNamespace(String);
 
-async fn request_namespace(parts: &Parts, state: &AdapterHttpState) -> Result<String, Response> {
-    let namespace = parts
-        .headers
+fn request_namespace(headers: &HeaderMap, state: &AdapterHttpState) -> Result<String, Response> {
+    let namespace = headers
         .get(SESSION_NAMESPACE_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
@@ -373,7 +375,7 @@ impl FromRequestParts<AdapterHttpState> for AdapterRequestClient {
         parts: &mut Parts,
         state: &AdapterHttpState,
     ) -> Result<Self, Self::Rejection> {
-        let namespace = request_namespace(parts, state).await?;
+        let namespace = request_namespace(&parts.headers, state)?;
         state
             .client_for_namespace(&namespace)
             .await
@@ -389,7 +391,7 @@ impl FromRequestParts<AdapterHttpState> for AdapterRequestNamespace {
         parts: &mut Parts,
         state: &AdapterHttpState,
     ) -> Result<Self, Self::Rejection> {
-        let namespace = request_namespace(parts, state).await?;
+        let namespace = request_namespace(&parts.headers, state)?;
         state
             .client_for_namespace(&namespace)
             .await
@@ -418,6 +420,13 @@ pub fn sidecar_router_with_state(state: AdapterHttpState) -> Router {
         .route("/rpc/dialogs", post(rpc_dialogs))
         .route("/rpc/state/dialogs", post(rpc_cached_dialogs))
         .route("/rpc/state/account", get(rpc_account_state))
+        .route(
+            "/rpc/state/account/refresh",
+            post(rpc_refresh_account_state),
+        )
+        .route("/rpc/users", post(rpc_users))
+        .route("/rpc/users/search", post(rpc_search_users))
+        .route("/rpc/spaces/members", post(rpc_space_members))
         .route("/rpc/state/chat", post(rpc_chat_state))
         .route("/rpc/state/chat/history", post(rpc_cached_history))
         .route("/rpc/history", post(rpc_history))
@@ -450,7 +459,34 @@ pub fn sidecar_router_with_state(state: AdapterHttpState) -> Router {
         .route("/rpc/events/ack", post(rpc_events_ack))
         .route("/rpc/upload", post(rpc_upload))
         .layer(DefaultBodyLimit::max(SIDECAR_UPLOAD_BODY_LIMIT_BYTES))
+        .layer(middleware::from_fn(require_rpc_protocol))
         .with_state(state)
+}
+
+// Bare routes lack the versioned command envelope, so require an explicit
+// version before namespace selection, body decoding, or native client work.
+async fn require_rpc_protocol(request: Request, next: Next) -> Response {
+    if request.uri().path().starts_with("/rpc/") {
+        let version = request
+            .headers()
+            .get("x-inline-protocol-version")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u16>().ok());
+        if version != Some(PROTOCOL_VERSION) {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                Json(SidecarResponse::error(
+                    SidecarRequestId::try_new("http-protocol").expect("static request ID"),
+                    SidecarError::new(
+                        ClientErrorCategory::ProtocolMismatch,
+                        format!("x-inline-protocol-version must be {PROTOCOL_VERSION}"),
+                    ),
+                )),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// Serves the localhost adapter router on an existing TCP listener.
@@ -541,10 +577,23 @@ async fn status(
 }
 
 async fn rpc(
-    AdapterRequestClient(client): AdapterRequestClient,
     State(state): State<AdapterHttpState>,
+    headers: HeaderMap,
     Json(request): Json<SidecarRequest>,
 ) -> Response {
+    // Resolve the envelope before lazily creating/resuming an account runtime.
+    // An unsupported command version must never begin native session work.
+    if request.protocol_version != PROTOCOL_VERSION {
+        return protocol_mismatch_response(request.id, request.protocol_version);
+    }
+    let namespace = match request_namespace(&headers, &state) {
+        Ok(namespace) => namespace,
+        Err(response) => return response,
+    };
+    let client = match state.client_for_namespace(&namespace).await {
+        Ok(client) => client,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     dispatch_request(state, client, request).await
 }
 
@@ -615,6 +664,37 @@ async fn rpc_account_state(
     State(state): State<AdapterHttpState>,
 ) -> Response {
     dispatch_command(state, client, SidecarCommand::AccountState).await
+}
+
+async fn rpc_refresh_account_state(
+    State(state): State<AdapterHttpState>,
+    AdapterRequestClient(client): AdapterRequestClient,
+) -> Response {
+    dispatch_command(state, client, SidecarCommand::RefreshAccountState).await
+}
+
+async fn rpc_users(
+    State(state): State<AdapterHttpState>,
+    AdapterRequestClient(client): AdapterRequestClient,
+    Json(request): Json<UsersRequest>,
+) -> Response {
+    dispatch_command(state, client, SidecarCommand::Users(request)).await
+}
+
+async fn rpc_search_users(
+    State(state): State<AdapterHttpState>,
+    AdapterRequestClient(client): AdapterRequestClient,
+    Json(request): Json<SearchUsersRequest>,
+) -> Response {
+    dispatch_command(state, client, SidecarCommand::SearchUsers(request)).await
+}
+
+async fn rpc_space_members(
+    State(state): State<AdapterHttpState>,
+    AdapterRequestClient(client): AdapterRequestClient,
+    Json(request): Json<SpaceMembersRequest>,
+) -> Response {
+    dispatch_command(state, client, SidecarCommand::SpaceMembers(request)).await
 }
 
 async fn rpc_chat_state(
@@ -878,22 +958,7 @@ async fn dispatch_request(
 ) -> Response {
     let request_id = request.id.clone();
     if request.protocol_version != PROTOCOL_VERSION {
-        log::warn!(
-            "adapter protocol mismatch: got {}, expected {}",
-            request.protocol_version,
-            PROTOCOL_VERSION
-        );
-        return Json(SidecarResponse::error(
-            request_id,
-            SidecarError::new(
-                ClientErrorCategory::ProtocolMismatch,
-                format!(
-                    "unsupported adapter protocol version {}; expected {}",
-                    request.protocol_version, PROTOCOL_VERSION
-                ),
-            ),
-        ))
-        .into_response();
+        return protocol_mismatch_response(request_id, request.protocol_version);
     }
 
     log::debug!("handling adapter command: {}", request.command.kind());
@@ -901,6 +966,18 @@ async fn dispatch_request(
         Ok(result) => Json(SidecarResponse::ok(request_id, result)).into_response(),
         Err(error) => request_error_response(request_id, error),
     }
+}
+
+fn protocol_mismatch_response(request_id: SidecarRequestId, version: u16) -> Response {
+    log::warn!("adapter protocol mismatch: got {version}, expected {PROTOCOL_VERSION}");
+    Json(SidecarResponse::error(
+        request_id,
+        SidecarError::new(
+            ClientErrorCategory::ProtocolMismatch,
+            format!("unsupported adapter protocol version {version}; expected {PROTOCOL_VERSION}"),
+        ),
+    ))
+    .into_response()
 }
 
 async fn handle_command(
@@ -952,6 +1029,18 @@ async fn handle_command(
             .account_state()
             .await
             .map(SidecarResult::AccountState),
+        SidecarCommand::RefreshAccountState => client
+            .refresh_account_state()
+            .await
+            .map(SidecarResult::AccountState),
+        SidecarCommand::Users(request) => client.users(request).await.map(SidecarResult::Users),
+        SidecarCommand::SearchUsers(request) => {
+            client.search_users(request).await.map(SidecarResult::Users)
+        }
+        SidecarCommand::SpaceMembers(request) => client
+            .space_members(request)
+            .await
+            .map(SidecarResult::SpaceMembers),
         SidecarCommand::ChatState(request) => client
             .chat_state(request.chat_id)
             .await
@@ -1368,6 +1457,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bare_rpc_rejects_missing_old_and_future_protocol_before_native_work() {
+        let creations = Arc::new(AtomicUsize::new(0));
+        let factory_creations = creations.clone();
+        let factory: AdapterClientFactory = Arc::new(move |_| {
+            factory_creations.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Err("unsupported versions must not create a native client".into()) })
+        });
+        let app = sidecar_router_with_state(AdapterHttpState::with_client_factory(
+            AdapterEventStore::open_in_memory("unused").unwrap(),
+            factory,
+        ));
+        let routes = [
+            "/rpc/auth/start",
+            "/rpc/auth/verify",
+            "/rpc/resume",
+            "/rpc/connect",
+            "/rpc/logout",
+            "/rpc/dialogs",
+            "/rpc/state/dialogs",
+            "/rpc/state/account",
+            "/rpc/state/account/refresh",
+            "/rpc/users",
+            "/rpc/users/search",
+            "/rpc/spaces/members",
+            "/rpc/state/chat",
+            "/rpc/state/chat/history",
+            "/rpc/history",
+            "/rpc/chat/participants",
+            "/rpc/chat/participants/add",
+            "/rpc/chat/participants/remove",
+            "/rpc/chat/info",
+            "/rpc/chat/delete",
+            "/rpc/chat/create-dm",
+            "/rpc/chat/create-thread",
+            "/rpc/chat/create-reply-thread",
+            "/rpc/send",
+            "/rpc/send_text",
+            "/rpc/edit",
+            "/rpc/delete",
+            "/rpc/react",
+            "/rpc/read",
+            "/rpc/marked-unread",
+            "/rpc/dialog/notifications",
+            "/rpc/typing",
+            "/rpc/events/ack",
+            "/rpc/upload",
+        ];
+        for route in routes {
+            for version in [None, Some("4"), Some("6"), Some("invalid")] {
+                let method = if route == "/rpc/state/account" {
+                    "GET"
+                } else {
+                    "POST"
+                };
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(route)
+                    .header(SESSION_NAMESPACE_HEADER, "account-1")
+                    .header("content-type", "application/json");
+                if let Some(version) = version {
+                    request = request.header("x-inline-protocol-version", version);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from("{}")).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UPGRADE_REQUIRED,
+                    "{route}: {version:?}"
+                );
+                let response: SidecarResponse = json_response(response).await;
+                assert!(
+                    matches!(response.outcome, SidecarOutcome::Error(error) if error.category == ClientErrorCategory::ProtocolMismatch)
+                );
+            }
+        }
+        assert_eq!(creations.load(AtomicOrdering::SeqCst), 0);
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn generic_rpc_validates_body_version_before_creating_native_client() {
+        let creations = Arc::new(AtomicUsize::new(0));
+        let factory_creations = creations.clone();
+        let factory: AdapterClientFactory = Arc::new(move |_| {
+            factory_creations.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Err("current version reached native client creation".into()) })
+        });
+        let app = sidecar_router_with_state(AdapterHttpState::with_client_factory(
+            AdapterEventStore::open_in_memory("unused").unwrap(),
+            factory,
+        ));
+        for version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            let request = SidecarRequest {
+                protocol_version: version,
+                id: SidecarRequestId::try_new("generic-version-test").unwrap(),
+                command: SidecarCommand::Status,
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/rpc")
+                        .header("content-type", "application/json")
+                        .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
+                        .header(SESSION_NAMESPACE_HEADER, "account-1")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let response: SidecarResponse = json_response(response).await;
+            assert!(
+                matches!(response.outcome, SidecarOutcome::Error(error) if error.category == ClientErrorCategory::ProtocolMismatch)
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc")
+                    .header("content-type", "application/json")
+                    .header(SESSION_NAMESPACE_HEADER, "account-1")
+                    .body(Body::from(
+                        r#"{"id":"missing-version","command":{"type":"status"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(creations.load(AtomicOrdering::SeqCst), 0);
+        let request = SidecarRequest::current(
+            SidecarRequestId::try_new("current-version").unwrap(),
+            SidecarCommand::Status,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc")
+                    .header("content-type", "application/json")
+                    .header(SESSION_NAMESPACE_HEADER, "account-1")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(creations.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn health_endpoint_reports_protocol_and_status() {
         let client = InlineClient::builder()
             .initial_status(inline_client::ClientStatus::Connected)
@@ -1378,6 +1633,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .uri("/health")
                     .body(Body::empty())
                     .unwrap(),
@@ -1454,6 +1710,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/events/ack")
                     .header("content-type", "application/json")
@@ -1488,6 +1745,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/events/ack")
                     .header(SESSION_NAMESPACE_HEADER, "test")
@@ -1524,6 +1782,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .body(Body::empty())
                     .unwrap(),
@@ -1579,6 +1838,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                         .uri("/status")
                         .header(SESSION_NAMESPACE_HEADER, namespace)
                         .body(Body::empty())
@@ -1600,6 +1860,7 @@ mod tests {
         let missing = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .body(Body::empty())
                     .unwrap(),
@@ -1626,6 +1887,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .header(SESSION_NAMESPACE_HEADER, "account-1")
                     .body(Body::empty())
@@ -1669,6 +1931,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .header(SESSION_NAMESPACE_HEADER, "account-1")
                     .body(Body::empty())
@@ -1682,6 +1945,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/logout")
                     .header(SESSION_NAMESPACE_HEADER, "account-1")
@@ -1695,6 +1959,7 @@ mod tests {
         let recreated = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .uri("/status")
                     .header(SESSION_NAMESPACE_HEADER, "account-1")
                     .body(Body::empty())
@@ -1717,6 +1982,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/resume")
                     .body(Body::empty())
@@ -1748,6 +2014,7 @@ mod tests {
         app.clone()
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/connect")
                     .header("content-type", "application/json")
@@ -1767,6 +2034,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/send")
                     .header("content-type", "application/json")
@@ -1792,6 +2060,226 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_send_edit_and_multipart_caption_preserve_explicit_utf16_entities() {
+        let client = InlineClient::builder().build().spawn();
+        client
+            .connect(ConnectRequest::new(AuthCredential::AccessToken {
+                token: AuthToken::try_new("test-token").unwrap(),
+            }))
+            .await
+            .unwrap();
+        let app = sidecar_router(client.clone());
+        let entity = inline_client::MessageEntityRecord {
+            kind: "TYPE_BOLD".into(),
+            offset: 3,
+            length: 4,
+            user_id: None,
+            agent_id: None,
+            group_id: None,
+            chat_id: None,
+            value: None,
+        };
+        let mut send = SendTextRequest::new(
+            PeerRef::Chat {
+                chat_id: InlineId::new(7),
+            },
+            "😀 text",
+        );
+        send.entities = vec![entity.clone()];
+        let edit = EditMessageRequest {
+            chat_id: InlineId::new(7),
+            message_id: InlineId::new(1),
+            text: "😀 edit".into(),
+            entities: vec![entity.clone()],
+            external_id: None,
+            parse_markdown: false,
+        };
+        for (route, body) in [
+            ("/rpc/send", serde_json::to_vec(&send).unwrap()),
+            ("/rpc/edit", serde_json::to_vec(&edit).unwrap()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(route)
+                        .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let response: SidecarResponse = json_response(response).await;
+            assert!(
+                matches!(response.outcome, SidecarOutcome::Ok(_)),
+                "{route}: {:?}",
+                response.outcome
+            );
+        }
+        let upload = UploadRequest {
+            peer: send.peer,
+            kind: inline_client::MediaKind::Document,
+            file_name: Some("test.txt".into()),
+            mime_type: Some("text/plain".into()),
+            size_bytes: Some(4),
+            caption: Some("😀 file".into()),
+            entities: vec![entity.clone()],
+            width: None,
+            height: None,
+            duration_ms: None,
+            external_id: None,
+            random_id: None,
+            reply_to_message_id: None,
+        };
+        let metadata = serde_json::to_string(&upload).unwrap();
+        let multipart = format!(
+            "--boundary\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{metadata}\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\nContent-Type: text/plain\r\n\r\nfile\r\n--boundary--\r\n"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc/upload")
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
+                    .header("content-type", "multipart/form-data; boundary=boundary")
+                    .body(Body::from(multipart))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response: SidecarResponse = json_response(response).await;
+        assert!(
+            matches!(
+                response.outcome,
+                SidecarOutcome::Ok(SidecarResult::Message(_))
+            ),
+            "{:?}",
+            response.outcome
+        );
+        let history = client
+            .history(HistoryRequest {
+                chat_id: InlineId::new(7),
+                limit: Some(10),
+                before_message_id: None,
+                after_message_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(history.messages.len(), 2);
+        assert_eq!(history.messages[0].metadata.entities, vec![entity.clone()]);
+        assert_eq!(
+            history.messages[0].content,
+            inline_client::MessageContent::Text {
+                text: "😀 edit".into()
+            }
+        );
+        assert_eq!(history.messages[1].metadata.entities, vec![entity]);
+        assert!(
+            matches!(&history.messages[1].content, inline_client::MessageContent::Media { caption: Some(caption), .. } if caption == "😀 file")
+        );
+        let media_before = history.messages[1].content.clone();
+        let clear = EditMessageRequest {
+            chat_id: InlineId::new(7),
+            message_id: InlineId::new(2),
+            text: String::new(),
+            entities: Vec::new(),
+            external_id: None,
+            parse_markdown: false,
+        };
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc/edit")
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&clear).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response: SidecarResponse = json_response(response).await;
+        assert!(matches!(response.outcome, SidecarOutcome::Ok(_)));
+        let history = client
+            .history(HistoryRequest {
+                chat_id: InlineId::new(7),
+                limit: Some(10),
+                before_message_id: None,
+                after_message_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(history.messages[1].metadata.entities.is_empty());
+        let mut expected = media_before;
+        if let inline_client::MessageContent::Media { caption, .. } = &mut expected {
+            *caption = Some(String::new());
+        }
+        assert_eq!(
+            history.messages[1].content, expected,
+            "clearing a caption retains the original media identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_entity_http_requests_fail_before_connection_or_upload_work() {
+        let app = sidecar_router(InlineClient::builder().build().spawn());
+        let entity = serde_json::json!({"kind":"TYPE_BOLD", "offset":1, "length":1});
+        let bodies = [
+            (
+                "/rpc/send",
+                serde_json::json!({"peer":{"type":"chat","chat_id":7},"text":"😀","entities":[entity.clone()]}),
+            ),
+            (
+                "/rpc/edit",
+                serde_json::json!({"chat_id":7,"message_id":1,"text":"😀","entities":[entity.clone()]}),
+            ),
+        ];
+        for (route, body) in bodies {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(route)
+                        .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let response: SidecarResponse = json_response(response).await;
+            assert!(
+                matches!(response.outcome, SidecarOutcome::Error(error) if error.category == ClientErrorCategory::InvalidInput),
+                "{route}"
+            );
+        }
+        let metadata = serde_json::json!({"peer":{"type":"chat","chat_id":7},"kind":"document","caption":"😀","entities":[entity]});
+        let multipart = format!(
+            "--boundary\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{metadata}\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\r\nfile\r\n--boundary--\r\n"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc/upload")
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
+                    .header("content-type", "multipart/form-data; boundary=boundary")
+                    .body(Body::from(multipart))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response: SidecarResponse = json_response(response).await;
+        assert!(
+            matches!(response.outcome, SidecarOutcome::Error(error) if error.category == ClientErrorCategory::InvalidInput)
+        );
+    }
+
+    #[tokio::test]
     async fn chat_participants_route_dispatches_to_native_client() {
         let backend = InMemoryBackend::new();
         backend.set_chat_participants(
@@ -1811,6 +2299,7 @@ mod tests {
         app.clone()
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/connect")
                     .header("content-type", "application/json")
@@ -1827,6 +2316,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/chat/participants")
                     .header("content-type", "application/json")
@@ -1861,6 +2351,7 @@ mod tests {
         app.clone()
             .oneshot(
                 Request::builder()
+                    .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                     .method("POST")
                     .uri("/rpc/connect")
                     .header("content-type", "application/json")
@@ -1926,6 +2417,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header("x-inline-protocol-version", PROTOCOL_VERSION.to_string())
                         .method("POST")
                         .uri(uri)
                         .header("content-type", "application/json")

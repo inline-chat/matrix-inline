@@ -17,29 +17,33 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - [x] Message edits
 - [x] Message deletes/redactions
 - [x] Reactions
-- [x] Read receipts and marked-unread state
+- [x] Conservative private read projection and Matrix-to-Inline marked-unread changes
 - [x] Permanent per-room mute/unmute
 - [x] Typing notifications
 - [x] Images, videos, files, audio, and voice/audio files
 - [x] Inline member list sync for bridged rooms
 - [x] Matrix ghosts with Inline display names and avatars when available
 - [x] Configurable bridge bot and network profile metadata
-- [x] DM creation with a numeric Inline user ID
-- [x] Basic group/thread creation from Matrix
+- [x] DM creation by source-verified Inline ID or canonical username
+- [x] Private chats and public/private workspace channel creation from Matrix
 - [x] Add/remove Inline thread participants from Matrix membership changes
 - [x] Rename Inline threads from Matrix
 - [x] Explicit Inline thread deletion from Beeper/Matrix
 - [x] Management commands for status and reconnect
 - [ ] New Inline account signup or invite-code onboarding
 - [ ] Matrix-native thread UI for Inline reply-thread chats
-- [ ] Contact search for DM creation
-- [ ] Formatted text, rich entities, and Matrix mention mapping
+- [x] Bounded source-account people search for DM creation
+- [x] Supported rich text, verified user mentions, and attachment caption edits
 - [ ] Pins and Inline link-preview projection
 - [ ] Room avatars
 - [ ] Room topic/description editing
-- [ ] Presence and richer workspace/space representation
+- [x] Account-scoped workspace Spaces and separate child-chat context
+- [ ] Presence
 - [ ] Timed mute expiration (permanent mute is supported)
 - [ ] Calls
+
+See [bridge semantics and upgrade notes](docs/bridge-semantics.md) for supported
+formatting, read-state limits, workspace access and repairing existing channel rooms.
 
 ## Requirements
 
@@ -48,7 +52,7 @@ chats into Matrix rooms, and send messages between Matrix/Beeper and Inline.
 - Docker and Docker Compose, or Go 1.25 plus Rust 1.96 for native builds
 - A published container image from `ghcr.io/inline-chat/matrix-inline`
 
-Source builds require a local checkout of `inline-chat/inline-public` next to this repo
+Source builds require a local checkout of `inline-chat/inline` named `inline-public` next to this repo
 because the bridge builds against the Rust Inline client crates:
 
 ```text

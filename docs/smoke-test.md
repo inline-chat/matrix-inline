@@ -23,7 +23,7 @@ For an installed bridge:
 ```sh
 curl -fsS http://127.0.0.1:29342/health | jq .
 curl -fsS http://127.0.0.1:29342/status | jq .
-curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST http://127.0.0.1:29342/rpc/resume | jq .
 ```
 
 Expected adapter states:
@@ -59,7 +59,13 @@ Verify both directions:
 7. Matrix redactions delete or unsend the Inline message.
 8. Reactions bridge in both directions.
 9. Typing notifications appear where supported.
-10. Opening a Matrix room marks the Inline chat read.
+10. Opening a Matrix room alone does not mark Inline messages read. A public
+    receipt for a delivered message advances Inline only after history and
+    Matrix timeline order are verified.
+11. Read in Inline and confirm a private Matrix marker stops before any unread
+    or unmapped event. A manually marked-unread Matrix room stays marked unread.
+12. Send nested formatting with emoji, then make a formatting-only edit. Confirm
+    formatting and verified user mentions survive in both directions.
 
 ## Media
 
@@ -68,13 +74,27 @@ Verify both directions:
 3. Send an image or video from Inline and confirm it appears in Matrix.
 4. Send a voice or audio file and confirm it appears as playable media or a
    clear unavailable notice.
+5. Edit and clear an attachment caption before and after restarting the bridge.
+   Confirm the Matrix media URI/encryption metadata stays unchanged.
+6. Confirm oversized attachments fail explicitly and a transient download error
+   can be retried.
 
 ## Rooms and Members
 
 1. Confirm the Matrix member list includes current Inline members.
 2. Confirm ghost display names match Inline users where available.
-3. Create a DM using a numeric Inline user ID.
-4. Create a basic Matrix group/thread and confirm an Inline thread is created.
+3. Create a DM using a numeric Inline user ID and a canonical username. An
+   inaccessible or ambiguous lookup must not choose an arbitrary person.
+4. Create a private chat and public/private workspace channels. Confirm the
+   workspace, visibility and participants match the requested source intent.
+5. Confirm channels are ordinary rooms and DMs remain DMs. Preview an old
+   group-DM-classified channel with `inline-repair-room <chat-id>`, then apply
+   explicitly and verify the room ID, message IDs and user topic are preserved.
+6. Confirm accessible workspaces appear as account-scoped Matrix Spaces. A
+   temporary refresh failure preserves navigation; source revocation removes
+   the link without deleting independently accessible history.
+7. Confirm child chats keep separate rooms and audiences. Parent context appears
+   only inside an authorized child, without overwriting a user topic.
 
 ## Restart
 
@@ -93,10 +113,13 @@ has not been invited to or joined to those rooms.
 
 - Login requires an existing Inline account.
 - Invite-code signup is not handled inside the bridge.
-- DM creation currently requires a numeric Inline user ID.
+- DM lookup supports source IDs and canonical usernames, not phone/email search.
 - Inline reply-thread chats are represented as Matrix rooms, not Matrix-native
   thread UI.
 - Room avatars and Matrix-to-Inline topic/description editing are not yet
   supported.
 - Permanent room mute/unmute is supported; timed mute expiration is not.
 - Calls are not bridged.
+
+See [bridge semantics](bridge-semantics.md) for protocol-v5 upgrade requirements,
+bounded read inspection, and the supported creation/formatting/media subset.

@@ -183,7 +183,10 @@ func TestBackfillMessagesFromHistorySortsAndBuildsCursor(t *testing.T) {
 		},
 	}}
 
-	messages, cursor := (&InlineClient{}).backfillMessagesFromHistory(context.Background(), nil, records)
+	messages, cursor, err := (&InlineClient{}).backfillMessagesFromHistory(context.Background(), nil, records)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cursor != networkid.PaginationCursor("7/10") {
 		t.Fatalf("cursor = %q, want 7/10", cursor)
 	}
@@ -210,7 +213,10 @@ func TestBackfillCursorUsesMinimumIDNotFirstChronologicalMessage(t *testing.T) {
 		{ChatID: 7, MessageID: 10, SenderID: 1, Timestamp: 200, Content: sidecar.MessageContent{Type: "text", Text: "lower id"}},
 	}
 
-	messages, cursor := (&InlineClient{}).backfillMessagesFromHistory(context.Background(), nil, records)
+	messages, cursor, err := (&InlineClient{}).backfillMessagesFromHistory(context.Background(), nil, records)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cursor != networkid.PaginationCursor("7/10") {
 		t.Fatalf("cursor = %q, want minimum ID 7/10", cursor)
 	}
@@ -272,7 +278,7 @@ func TestFetchMessagesUsesSidecarHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchMessages() error = %v", err)
 	}
-	if !resp.HasMore || !resp.MarkRead || resp.Forward {
+	if !resp.HasMore || resp.MarkRead || resp.Forward {
 		t.Fatalf("response flags = has_more:%v mark_read:%v forward:%v", resp.HasMore, resp.MarkRead, resp.Forward)
 	}
 	if resp.Cursor != networkid.PaginationCursor("7/19") {
@@ -288,6 +294,10 @@ func TestFetchMessagesUsesSidecarHistory(t *testing.T) {
 
 func TestGetChatInfoFetchesFullInlineMembers(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rpc/state/chat" {
+			writeConnectorSidecarResult(t, w, "chat_state", sidecar.ChatStateSnapshot{ChatID: 7, Dialog: &sidecar.DialogRecord{ChatID: 7, Kind: sidecar.ConversationChat, StructureKnown: true}})
+			return
+		}
 		if r.URL.Path != "/rpc/chat/participants" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -327,8 +337,8 @@ func TestGetChatInfoFetchesFullInlineMembers(t *testing.T) {
 	if info.Members.TotalMemberCount != 2 || len(info.Members.MemberMap) != 2 {
 		t.Fatalf("member count = %d/%d, want 2", info.Members.TotalMemberCount, len(info.Members.MemberMap))
 	}
-	if info.Type == nil || *info.Type != database.RoomTypeGroupDM {
-		t.Fatalf("Type = %#v, want group DM", info.Type)
+	if info.Type == nil || *info.Type != database.RoomTypeDefault {
+		t.Fatalf("Type = %#v, want ordinary room", info.Type)
 	}
 	if info.Members.OtherUserID != "" {
 		t.Fatalf("OtherUserID = %q, want empty for group chat", info.Members.OtherUserID)
@@ -402,11 +412,12 @@ func TestChatInfoForDialogIncludesSelfForGroupWithoutParticipantFetch(t *testing
 
 	info := ic.chatInfoForDialog(context.Background(), sidecar.DialogRecord{
 		ChatID: 7,
+		Kind:   sidecar.ConversationChat,
 		Title:  &title,
 	}, &title)
 
-	if info.Type == nil || *info.Type != database.RoomTypeGroupDM {
-		t.Fatalf("Type = %#v, want group DM", info.Type)
+	if info.Type == nil || *info.Type != database.RoomTypeDefault {
+		t.Fatalf("Type = %#v, want ordinary room", info.Type)
 	}
 	if info.Name == nil || *info.Name != title {
 		t.Fatalf("Name = %#v, want %q", info.Name, title)
@@ -473,22 +484,11 @@ func TestResolveIdentifierCreatesDM(t *testing.T) {
 	}
 }
 
-func TestHandleMatrixViewingChatMarksInlineChatRead(t *testing.T) {
+func TestHandleMatrixViewingChatDoesNotMarkUndeliveredSourceHistoryRead(t *testing.T) {
+	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/rpc/read" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-		var request sidecar.ReadRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatalf("decode read request: %v", err)
-		}
-		if request.ChatID != 7 {
-			t.Fatalf("ChatID = %d, want 7", request.ChatID)
-		}
-		if request.MaxMessageID != nil {
-			t.Fatalf("MaxMessageID = %#v, want nil", request.MaxMessageID)
-		}
-		writeConnectorSidecarResult(t, w, "empty", struct{}{})
+		calls++
+		http.Error(w, "opening a room must not mutate source reads", http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
@@ -497,6 +497,9 @@ func TestHandleMatrixViewingChatMarksInlineChatRead(t *testing.T) {
 		Portal: testPortal("7"),
 	}); err != nil {
 		t.Fatalf("HandleMatrixViewingChat() error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("opening a room made %d source requests", calls)
 	}
 }
 
@@ -836,7 +839,7 @@ func TestEffectiveMatrixMessageTypeInfersMediaFromFileMime(t *testing.T) {
 	}{
 		"image": {mime: "image/png", want: event.MsgImage, kind: "photo"},
 		"video": {mime: "video/mp4", want: event.MsgVideo, kind: "video"},
-		"audio": {mime: "audio/ogg", want: event.MsgAudio, kind: "voice"},
+		"audio": {mime: "audio/ogg", want: event.MsgAudio, kind: "document"},
 		"file":  {mime: "application/pdf", want: event.MsgFile, kind: "document"},
 	}
 	for name, tt := range cases {

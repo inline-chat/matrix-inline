@@ -62,7 +62,7 @@ func registerInlineCommands(bridge *bridgev2.Bridge) {
 		bridge.Log.Warn().Msg("Bridge command processor does not support custom Inline commands")
 		return
 	}
-	processor.AddHandlers(commandInlineStatus, commandInlineReconnect, commandInlineSettings, commandInlineHiddenChats)
+	processor.AddHandlers(commandInlineStatus, commandInlineReconnect, commandInlineSettings, commandInlineHiddenChats, commandInlineRepairRoom)
 }
 
 func fnInlineStatus(ce *commands.Event) {

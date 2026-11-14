@@ -28,3 +28,5 @@ inline-public/cli/target/
 inline-public/cli/target/**
 !inline-public/crates/
 !inline-public/crates/**
+!inline-public/vendor/
+!inline-public/vendor/**

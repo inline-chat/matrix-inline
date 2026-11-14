@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -41,6 +42,7 @@ type fixtureServer struct {
 	sent          []sentText
 	clients       map[*websocket.Conn]struct{}
 	sequence      uint64
+	generation    string
 	events        []fixtureEvent
 }
 
@@ -94,6 +96,7 @@ func newFixtureServer(statePath string) *fixtureServer {
 	groupLast := int64(6001)
 	return &fixtureServer{
 		statePath:     statePath,
+		generation:    rand.Text(),
 		nextMessageID: 7000,
 		users: []sidecar.UserRecord{
 			{UserID: accountID, DisplayName: stringPtr("Fixture Self"), Username: stringPtr("fixture_self")},
@@ -101,8 +104,8 @@ func newFixtureServer(statePath string) *fixtureServer {
 			{UserID: groupUserID, DisplayName: stringPtr("Lin Fixture"), Username: stringPtr("lin_fixture")},
 		},
 		dialogs: []sidecar.DialogRecord{
-			{ChatID: dmChatID, PeerUserID: int64Ptr(peerUserID), Title: &dmTitle, LastMessageID: &dmLast},
-			{ChatID: groupChatID, Title: &groupTitle, LastMessageID: &groupLast},
+			{ChatID: dmChatID, Kind: sidecar.ConversationDirectMessage, StructureKnown: true, PeerUserID: int64Ptr(peerUserID), Title: &dmTitle, LastMessageID: &dmLast},
+			{ChatID: groupChatID, Kind: sidecar.ConversationChat, StructureKnown: true, Title: &groupTitle, LastMessageID: &groupLast},
 		},
 		history: map[int64][]sidecar.MessageRecord{
 			dmChatID: {{
@@ -135,6 +138,10 @@ func (srv *fixtureServer) register(mux *http.ServeMux) {
 	mux.HandleFunc("/rpc/dialogs", srv.handleDialogs)
 	mux.HandleFunc("/rpc/state/dialogs", srv.handleDialogs)
 	mux.HandleFunc("/rpc/history", srv.handleHistory)
+	mux.HandleFunc("/rpc/state/chat/history", srv.handleHistory)
+	mux.HandleFunc("/rpc/state/account", srv.handleAccountState)
+	mux.HandleFunc("/rpc/state/account/refresh", srv.handleAccountState)
+	mux.HandleFunc("/rpc/state/chat", srv.handleChatState)
 	mux.HandleFunc("/rpc/chat/participants", srv.handleParticipants)
 	mux.HandleFunc("/rpc/chat/participants/add", srv.handleEmpty)
 	mux.HandleFunc("/rpc/chat/participants/remove", srv.handleEmpty)
@@ -154,9 +161,10 @@ func (srv *fixtureServer) register(mux *http.ServeMux) {
 
 func (srv *fixtureServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	srv.writeJSON(w, sidecar.Health{
-		OK:       true,
-		Protocol: srv.protocol(),
-		Status:   srv.status().Status,
+		OK:              true,
+		Protocol:        srv.protocol(),
+		Status:          srv.status().Status,
+		EventGeneration: srv.generation,
 	})
 }
 
@@ -238,6 +246,35 @@ func (srv *fixtureServer) handleDialogs(w http.ResponseWriter, r *http.Request) 
 		Dialogs: append([]sidecar.DialogRecord(nil), srv.dialogs[:limit]...),
 		Users:   append([]sidecar.UserRecord(nil), srv.users...),
 	})
+}
+
+func (srv *fixtureServer) handleAccountState(w http.ResponseWriter, r *http.Request) {
+	if !srv.requireLogin(w) {
+		return
+	}
+	srv.writeResult(w, "account_state", sidecar.AccountStateSnapshot{SpacesComplete: true})
+}
+
+func (srv *fixtureServer) handleChatState(w http.ResponseWriter, r *http.Request) {
+	var req sidecar.ChatStateRequest
+	if !decodeRequest(w, r, &req) || !srv.requireLogin(w) {
+		return
+	}
+	srv.mu.Lock()
+	var dialog *sidecar.DialogRecord
+	for _, item := range srv.dialogs {
+		if item.ChatID == req.ChatID {
+			copy := item
+			dialog = &copy
+			break
+		}
+	}
+	srv.mu.Unlock()
+	if dialog == nil {
+		srv.writeSidecarError(w, "NotFound", "fixture chat not found")
+		return
+	}
+	srv.writeResult(w, "chat_state", sidecar.ChatStateSnapshot{ChatID: req.ChatID, Dialog: dialog})
 }
 
 func (srv *fixtureServer) handleHistory(w http.ResponseWriter, r *http.Request) {
@@ -324,6 +361,12 @@ func (srv *fixtureServer) handleEmpty(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *fixtureServer) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if generation := r.URL.Query().Get("generation"); generation != "" && generation != srv.generation {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGone)
+		srv.writeJSON(w, sidecar.EventReplayUnavailableError{EventGeneration: srv.generation, ResetRequired: true})
+		return
+	}
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -363,7 +406,13 @@ func (srv *fixtureServer) handleEventAck(w http.ResponseWriter, r *http.Request)
 		srv.writeError(w, err)
 		return
 	}
-	srv.writeJSON(w, sidecar.EventAckResponse{AcknowledgedSequence: request.Sequence})
+	if request.Generation != "" && request.Generation != srv.generation {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGone)
+		srv.writeJSON(w, sidecar.EventReplayUnavailableError{EventGeneration: srv.generation, ResetRequired: true})
+		return
+	}
+	srv.writeJSON(w, sidecar.EventAckResponse{Generation: srv.generation, AcknowledgedSequence: request.Sequence})
 }
 
 func (srv *fixtureServer) handleFixtureSent(w http.ResponseWriter, r *http.Request) {
@@ -482,6 +531,7 @@ func (srv *fixtureServer) broadcast(event map[string]any) error {
 	envelope := map[string]any{
 		"protocol_version":  sidecar.ProtocolVersion,
 		"session_namespace": strconv.FormatInt(accountID, 10),
+		"generation":        srv.generation,
 		"sequence":          sequence,
 		"reliability":       sidecar.EventLossless,
 		"event":             event,

@@ -492,13 +492,13 @@ function wait_for_room_message_body {
 function sidecar_post_json {
 	local path=$1 body=${2:-}
 	if [[ -n "${body}" ]]; then
-		curl -fsS \
+		curl -fsS -H "X-Inline-Protocol-Version: 5" \
 			-X POST \
 			-H "Content-Type: application/json" \
 			-d "${body}" \
 			"${SIDECAR_URL}${path}"
 	else
-		curl -fsS -X POST "${SIDECAR_URL}${path}"
+		curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST "${SIDECAR_URL}${path}"
 	fi
 }
 
@@ -734,7 +734,7 @@ function smoke {
 	echo "==> Adapter status"
 	curl -fsS "${SIDECAR_URL}/status" | jq .
 	echo "==> Adapter resume"
-	curl -fsS -X POST "${SIDECAR_URL}/rpc/resume" | jq .
+	curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST "${SIDECAR_URL}/rpc/resume" | jq .
 
 	local token bot_localpart bot_mxid room_id
 	token=$(matrix_login_token)

@@ -13,6 +13,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/inline-chat/matrix-inline/pkg/sidecar"
@@ -55,26 +56,38 @@ type Config struct {
 }
 
 type UserLoginMetadata struct {
-	AccountID              string `json:"account_id"`
-	RemoteName             string `json:"remote_name,omitempty"`
-	SidecarURL             string `json:"sidecar_url,omitempty"`
-	StoreNamespace         string `json:"store_namespace,omitempty"`
-	LastSidecarSequence    uint64 `json:"last_sidecar_sequence,omitempty"`
-	SidecarEventGeneration string `json:"sidecar_event_generation,omitempty"`
-	BridgeStateVersion     uint32 `json:"bridge_state_version,omitempty"`
-	BridgeRecoveryCursor   int64  `json:"bridge_recovery_cursor,omitempty"`
-	DialogSyncCursor       string `json:"dialog_sync_cursor,omitempty"`
-	HiddenDialogs          string `json:"hidden_dialogs,omitempty"`
-	SessionInvalidated     bool   `json:"session_invalidated,omitempty"`
+	AccountID              string                          `json:"account_id"`
+	RemoteName             string                          `json:"remote_name,omitempty"`
+	SidecarURL             string                          `json:"sidecar_url,omitempty"`
+	StoreNamespace         string                          `json:"store_namespace,omitempty"`
+	LastSidecarSequence    uint64                          `json:"last_sidecar_sequence,omitempty"`
+	SidecarEventGeneration string                          `json:"sidecar_event_generation,omitempty"`
+	BridgeStateVersion     uint32                          `json:"bridge_state_version,omitempty"`
+	BridgeRecoveryCursor   int64                           `json:"bridge_recovery_cursor,omitempty"`
+	DialogSyncCursor       string                          `json:"dialog_sync_cursor,omitempty"`
+	HiddenDialogs          string                          `json:"hidden_dialogs,omitempty"`
+	WorkspaceNavigation    map[string]*WorkspaceNavigation `json:"workspace_navigation,omitempty"`
+	SessionInvalidated     bool                            `json:"session_invalidated,omitempty"`
 }
 
 type MessageMetadata struct {
-	InlineFingerprint string `json:"inline_fingerprint,omitempty"`
-	MediaHandled      bool   `json:"media_handled,omitempty"`
+	InlineFingerprint   string                     `json:"inline_fingerprint,omitempty"`
+	MediaHandled        bool                       `json:"media_handled,omitempty"`
+	SourceRevision      *int64                     `json:"source_revision,omitempty"`
+	SourceEditTimestamp *int64                     `json:"source_edit_timestamp,omitempty"`
+	MatrixContent       *event.MessageEventContent `json:"matrix_content,omitempty"`
+	MediaIdentity       string                     `json:"media_identity,omitempty"`
 }
 
 type PortalMetadata struct {
-	HistoryCheckpoint int64 `json:"history_checkpoint,omitempty"`
+	HistoryCheckpoint      int64                     `json:"history_checkpoint,omitempty"`
+	ChildTopicOwned        bool                      `json:"child_topic_owned,omitempty"`
+	OwnedChildTopic        string                    `json:"owned_child_topic,omitempty"`
+	UserTopic              bool                      `json:"user_topic,omitempty"`
+	InlineParentChatID     *int64                    `json:"inline_parent_chat_id,omitempty"`
+	InlineParentMessageID  *int64                    `json:"inline_parent_message_id,omitempty"`
+	ClassificationRepair   *RoomClassificationRepair `json:"classification_repair,omitempty"`
+	HistoryCoverageVersion uint32                    `json:"history_coverage_version,omitempty"`
 }
 
 func (meta *PortalMetadata) CopyFrom(other any) {
@@ -121,6 +134,9 @@ func (ic *InlineConnector) Start(ctx context.Context) error {
 
 func validatePortalEventDelivery() error {
 	if bridgev2.PortalEventBuffer == 0 {
+		if bridgev2.EventHandlingTimeoutTicks != int(^uint(0)>>1) {
+			return fmt.Errorf("Inline delivery requires waiting for handler completion without backgrounding")
+		}
 		return nil
 	}
 	return fmt.Errorf(
@@ -140,28 +156,11 @@ func (ic *InlineConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilitie
 		Provisioning: bridgev2.ProvisioningCapabilities{
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
 				LookupUsername: true,
-				Search:         false,
+				Search:         true,
 				ContactList:    false,
 				CreateDM:       true,
 			},
-			GroupCreation: map[string]bridgev2.GroupTypeCapabilities{
-				"thread": {
-					TypeDescription: "Inline thread",
-					Name: bridgev2.GroupFieldCapability{
-						Allowed:   true,
-						Required:  true,
-						MinLength: 1,
-						MaxLength: 256,
-					},
-					Topic: bridgev2.GroupFieldCapability{
-						Allowed:   true,
-						MaxLength: 4096,
-					},
-					Participants: bridgev2.GroupFieldCapability{
-						Allowed: true,
-					},
-				},
-			},
+			GroupCreation: inlineGroupCreationCapabilities(),
 		},
 	}
 }

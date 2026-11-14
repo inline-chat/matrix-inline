@@ -9,14 +9,15 @@ use inline_client::{
     ConnectRequest, CreateDmRequest, CreateReplyThreadRequest, CreateThreadRequest, CreatedChat,
     DeleteChatRequest, DeleteMessageRequest, DialogsPage, DialogsRequest, EditMessageRequest,
     EventReliability, HistoryPage, HistoryRequest, InlineId, MessageMutation, ReactRequest,
-    ReadRequest, RemoveChatParticipantRequest, SendTextRequest, SetMarkedUnreadRequest,
-    TypingRequest, UpdateChatInfoRequest, UpdateDialogNotificationsRequest, UploadHandle,
-    UploadRequest,
+    ReadRequest, RemoveChatParticipantRequest, SearchUsersRequest, SendTextRequest,
+    SetMarkedUnreadRequest, SpaceMembersPage, SpaceMembersRequest, TypingRequest,
+    UpdateChatInfoRequest, UpdateDialogNotificationsRequest, UploadHandle, UploadRequest,
+    UsersPage, UsersRequest,
 };
 use serde::{Deserialize, Serialize};
 
 /// Current bridge adapter command/event protocol version.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Version metadata returned by health/status endpoints.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +198,14 @@ pub enum SidecarCommand {
     CachedDialogs(DialogsRequest),
     /// Fetch account-level durable reconciliation state.
     AccountState,
+    /// Refresh accessible workspace navigation from the source.
+    RefreshAccountState,
+    /// Look up public source profiles by known IDs.
+    Users(UsersRequest),
+    /// Search under the authenticated source discovery policy.
+    SearchUsers(SearchUsersRequest),
+    /// Fetch a bounded member view for an accessible workspace.
+    SpaceMembers(SpaceMembersRequest),
     /// Fetch durable reconciliation state for one chat.
     ChatState(ChatStateRequest),
     /// Fetch history for a chat.
@@ -252,6 +261,10 @@ impl SidecarCommand {
             Self::Dialogs(_) => "dialogs",
             Self::CachedDialogs(_) => "cached_dialogs",
             Self::AccountState => "account_state",
+            Self::RefreshAccountState => "refresh_account_state",
+            Self::Users(_) => "users",
+            Self::SearchUsers(_) => "search_users",
+            Self::SpaceMembers(_) => "space_members",
             Self::ChatState(_) => "chat_state",
             Self::History(_) => "history",
             Self::CachedHistory(_) => "cached_history",
@@ -334,6 +347,10 @@ pub enum SidecarResult {
     Dialogs(DialogsPage),
     /// Account-level durable reconciliation state.
     AccountState(AccountStateSnapshot),
+    /// Source public profile results.
+    Users(UsersPage),
+    /// Source workspace member page.
+    SpaceMembers(SpaceMembersPage),
     /// Durable reconciliation state for one chat.
     ChatState(Box<ChatStateSnapshot>),
     /// History page.
@@ -503,6 +520,7 @@ mod tests {
         let req = SidecarRequest::current(
             SidecarRequestId::try_new("req-1").unwrap(),
             SidecarCommand::SendText(SendTextRequest {
+                entities: Vec::new(),
                 peer: PeerRef::Chat {
                     chat_id: InlineId::new(7),
                 },
@@ -510,6 +528,8 @@ mod tests {
                 external_id: Some(ExternalId::try_new("matrix-event", "$event").unwrap()),
                 random_id: Some(RandomId::new(99)),
                 reply_to_message_id: None,
+                parse_markdown: false,
+                notification_mode: Default::default(),
             }),
         );
 

@@ -30,11 +30,12 @@ docker compose pull
 Published images are built for `linux/amd64` and `linux/arm64`.
 
 Source builds are available with the build override. Build commands must run
-from the `matrix-inline` repo root with the sibling `inline` repo available:
+from the `matrix-inline` repo root with `inline-chat/inline` checked out as the
+sibling `inline-public` directory:
 
 ```text
 inline-chat/
-  inline/
+  inline-public/
   matrix-inline/
 ```
 

@@ -91,6 +91,12 @@ type InlineClient struct {
 	hiddenDialogsDefault   hiddenDialogsPolicy
 	hiddenDialogsOverride  hiddenDialogsPolicy
 	metadataSaveMu         sync.Mutex
+	workspaceStateMu       sync.Mutex
+	navigationMu           sync.Mutex
+	identityRetryCursor    int64
+	readProjectionMu       sync.Mutex
+	readProjectionCursor   int64
+	readProjectionAttempts map[int64]time.Time
 
 	runCancel context.CancelFunc
 	wg        sync.WaitGroup
@@ -217,6 +223,9 @@ func (ic *InlineClient) GetUserID() networkid.UserID {
 }
 
 func (ic *InlineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
+	if info, handled, err := ic.workspacePortalInfo(portal); handled {
+		return info, err
+	}
 	chatID, err := chatIDFromPortal(portal)
 	if err != nil {
 		return nil, err
@@ -227,17 +236,17 @@ func (ic *InlineClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal
 			name = optionalString(displayName)
 		}
 		if isDMDialog(dialog) {
-			return ic.chatInfoForDialog(ctx, dialog, name), nil
+			return preserveExistingRoomClassification(portal, ic.chatInfoForDialog(ctx, dialog, name)), nil
 		}
 	}
 	info, err := ic.chatInfoForChat(ctx, chatID, name)
 	if err != nil {
 		if dialog, ok := ic.cachedDialog(chatID); ok {
-			return ic.chatInfoForDialog(ctx, dialog, name), nil
+			return preserveExistingRoomClassification(portal, ic.chatInfoForDialog(ctx, dialog, name)), nil
 		}
 		return nil, err
 	}
-	return info, nil
+	return preserveExistingRoomClassification(portal, info), nil
 }
 
 func (ic *InlineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.UserInfo, error) {
@@ -253,6 +262,9 @@ func (ic *InlineClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) 
 func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
 	features := &event.RoomFeatures{
 		MaxTextLength: 5000,
+		Formatting: event.FormattingFeatureMap{
+			event.FmtBold: event.CapLevelFullySupported, event.FmtItalic: event.CapLevelFullySupported, event.FmtUnderline: event.CapLevelFullySupported, event.FmtStrikethrough: event.CapLevelFullySupported, event.FmtInlineCode: event.CapLevelFullySupported, event.FmtCodeBlock: event.CapLevelFullySupported, event.FmtSyntaxHighlighting: event.CapLevelFullySupported, event.FmtInlineLink: event.CapLevelFullySupported, event.FmtUserLink: event.CapLevelPartialSupport,
+		},
 		File: event.FileFeatureMap{
 			event.MsgImage: {
 				MimeTypes: map[string]event.CapabilitySupportLevel{
@@ -313,22 +325,7 @@ func (ic *InlineClient) GetCapabilities(ctx context.Context, portal *bridgev2.Po
 }
 
 func (ic *InlineClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
-	userID, err := parseInlineUserID(identifier)
-	if err != nil {
-		return nil, err
-	}
-	resp := &bridgev2.ResolveIdentifierResponse{
-		UserID:   makeUserID(strconv.FormatInt(userID, 10)),
-		UserInfo: ic.userInfoForID(userID),
-	}
-	if createChat {
-		chat, err := ic.createDMWithUserID(ctx, userID)
-		if err != nil {
-			return nil, err
-		}
-		resp.Chat = chat
-	}
-	return resp, nil
+	return ic.resolveInlineIdentifier(ctx, identifier, createChat)
 }
 
 func (ic *InlineClient) CreateChatWithGhost(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.CreateChatResponse, error) {
@@ -343,49 +340,20 @@ func (ic *InlineClient) CreateChatWithGhost(ctx context.Context, ghost *bridgev2
 }
 
 func (ic *InlineClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCreateParams) (*bridgev2.CreateChatResponse, error) {
-	if params == nil {
-		return nil, fmt.Errorf("missing Inline group create params")
-	}
-	var title *string
-	if params.Name != nil {
-		title = optionalString(params.Name.Name)
-	}
-	var description *string
-	if params.Topic != nil {
-		description = optionalString(params.Topic.Topic)
-	}
-	participants := make([]sidecar.ChatCreateParticipant, 0, len(params.Participants))
-	participantIDs := make([]networkid.UserID, 0, len(params.Participants)+1)
-	for _, participant := range params.Participants {
-		userID, err := parseInlineUserID(string(participant))
-		if err != nil {
-			return nil, fmt.Errorf("invalid Inline participant %q: %w", participant, err)
-		}
-		participants = append(participants, sidecar.ChatCreateParticipant{UserID: userID})
-		participantIDs = append(participantIDs, makeUserID(strconv.FormatInt(userID, 10)))
-	}
-	chat, err := ic.Sidecar.CreateThread(ctx, sidecar.CreateThreadRequest{
-		Title:        title,
-		Description:  description,
-		IsPublic:     false,
-		Participants: participants,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("Inline sidecar create thread failed: %w", err)
-	}
-	return ic.createChatResponse(ctx, chat, ic.chatInfoForCreatedChat(ctx, chat, participantIDs)), nil
+	return ic.createInlineGroup(ctx, params)
 }
 
 func (ic *InlineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
-	chatID, err := strconv.ParseInt(string(msg.Portal.ID), 10, 64)
-	if err != nil {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Inline portal ID %q is not a numeric chat ID yet", msg.Portal.ID)).
-			WithErrorAsMessage().
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusUnsupported)
+	if msg == nil || msg.Content == nil {
+		return nil, unsupportedMatrixOperation(fmt.Errorf("missing Matrix message"))
 	}
-
+	chatID, err := ic.validateMessagePortal(msg.Portal)
+	if err != nil {
+		return nil, unsupportedMatrixOperation(err)
+	}
+	if _, err := ic.validatedReply(msg.Portal, msg.ReplyTo); err != nil {
+		return nil, unsupportedMatrixOperation(err)
+	}
 	switch effectiveMatrixMessageType(msg.Content) {
 	case event.MsgText:
 		return ic.handleMatrixTextMessage(ctx, msg, chatID)
@@ -397,83 +365,44 @@ func (ic *InlineClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.M
 }
 
 func (ic *InlineClient) handleMatrixTextMessage(ctx context.Context, msg *bridgev2.MatrixMessage, chatID int64) (*bridgev2.MatrixMessageResponse, error) {
-	request := sidecar.SendTextRequest{
-		Peer:       sidecar.ChatPeer(chatID),
-		Text:       msg.Content.Body,
-		ExternalID: matrixExternalID(msg),
-		RandomID:   matrixRandomID(msg),
+	text, entities, err := matrixTextToInline(msg.Content, false, ic.matrixMentionResolver)
+	if err != nil {
+		return nil, unsupportedMatrixOperation(err)
 	}
-	if msg.ReplyTo != nil {
-		_, replyToMessageID, err := parseMessageID(msg.ReplyTo.ID)
-		if err == nil {
-			request.ReplyToMessageID = &replyToMessageID
-		}
+	reply, err := ic.validatedReply(msg.Portal, msg.ReplyTo)
+	if err != nil {
+		return nil, unsupportedMatrixOperation(err)
 	}
-
+	request := sidecar.SendTextRequest{Peer: sidecar.ChatPeer(chatID), Text: text, Entities: entities, ExternalID: matrixExternalID(msg), RandomID: matrixRandomID(msg), ReplyToMessageID: reply}
 	mutation, err := ic.Sidecar.SendText(ctx, request)
 	if err != nil {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Inline sidecar send failed: %w", err)).
-			WithErrorAsMessage().
-			WithIsCertain(sidecarErrorIsCertain(err)).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusGenericError)
+		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Inline sidecar send failed: %w", err)).WithErrorAsMessage().WithIsCertain(sidecarErrorIsCertain(err)).WithSendNotice(true).WithErrorReason(event.MessageStatusGenericError)
 	}
 	return ic.matrixSendResponse(msg, chatID, mutation)
 }
 
 func (ic *InlineClient) handleMatrixMediaMessage(ctx context.Context, msg *bridgev2.MatrixMessage, chatID int64) (*bridgev2.MatrixMessageResponse, error) {
-	data, err := ic.UserLogin.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.File)
+	caption, entities, err := matrixTextToInline(msg.Content, true, ic.matrixMentionResolver)
 	if err != nil {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("failed to download Matrix media: %w", err)).
-			WithErrorAsMessage().
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusUnsupported)
+		return nil, unsupportedMatrixOperation(err)
 	}
-	if len(data) == 0 {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Matrix media download returned no bytes")).
-			WithErrorAsMessage().
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusUnsupported)
+	reply, err := ic.validatedReply(msg.Portal, msg.ReplyTo)
+	if err != nil {
+		return nil, unsupportedMatrixOperation(err)
 	}
-	if len(data) > maxInlineMediaDownload {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Matrix media is too large for current Inline bridge upload limit")).
-			WithErrorAsMessage().
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusUnsupported)
+	data, err := ic.downloadMatrixMedia(ctx, msg.Content)
+	if err != nil {
+		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("failed to download Matrix media: %w", err)).WithErrorAsMessage().WithIsCertain(isPermanentMediaFailure(err)).WithSendNotice(true).WithErrorReason(event.MessageStatusGenericError)
 	}
-
-	request := sidecar.UploadRequest{
-		Peer:       sidecar.ChatPeer(chatID),
-		Kind:       sidecarUploadKindForMatrix(msg.Content),
-		FileName:   optionalString(sanitizeMatrixFileName(msg.Content.GetFileName())),
-		MimeType:   optionalString(matrixMediaMimeType(msg.Content)),
-		SizeBytes:  uint64Ptr(uint64(len(data))),
-		Caption:    optionalString(msg.Content.GetCaption()),
-		ExternalID: matrixExternalID(msg),
-		RandomID:   matrixRandomID(msg),
-	}
+	request := sidecar.UploadRequest{Peer: sidecar.ChatPeer(chatID), Kind: sidecarUploadKindForMatrix(msg.Content), FileName: optionalString(sanitizeMatrixFileName(msg.Content.GetFileName())), MimeType: optionalString(matrixMediaMimeType(msg.Content)), SizeBytes: uint64Ptr(uint64(len(data))), Caption: nonemptyCaption(caption), Entities: entities, ExternalID: matrixExternalID(msg), RandomID: matrixRandomID(msg), ReplyToMessageID: reply}
 	if msg.Content.Info != nil {
 		request.Width = uint32PtrFromInt(msg.Content.Info.Width)
 		request.Height = uint32PtrFromInt(msg.Content.Info.Height)
 		request.DurationMS = uint64PtrFromInt(msg.Content.Info.Duration)
 	}
-	if msg.ReplyTo != nil {
-		_, replyToMessageID, err := parseMessageID(msg.ReplyTo.ID)
-		if err == nil {
-			request.ReplyToMessageID = &replyToMessageID
-		}
-	}
-
 	mutation, err := ic.Sidecar.Upload(ctx, request, data)
 	if err != nil {
-		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Inline sidecar media send failed: %w", err)).
-			WithErrorAsMessage().
-			WithIsCertain(sidecarErrorIsCertain(err)).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusGenericError)
+		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Inline sidecar media send failed: %w", err)).WithErrorAsMessage().WithIsCertain(sidecarErrorIsCertain(err)).WithSendNotice(true).WithErrorReason(event.MessageStatusGenericError)
 	}
 	return ic.matrixSendResponse(msg, chatID, mutation)
 }
@@ -531,6 +460,7 @@ func (ic *InlineClient) matrixSendResponse(msg *bridgev2.MatrixMessage, chatID i
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        makeMessageID(chatID, *mutation.MessageID),
+			Metadata:  &MessageMetadata{MatrixContent: cloneMatrixContent(msg.Content), MediaHandled: effectiveMatrixMessageType(msg.Content) != event.MsgText},
 			SenderID:  ic.GetUserID(),
 			Timestamp: time.Now(),
 		},
@@ -539,35 +469,53 @@ func (ic *InlineClient) matrixSendResponse(msg *bridgev2.MatrixMessage, chatID i
 }
 
 func (ic *InlineClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
-	if msg.Content.MsgType != event.MsgText {
+	if msg == nil || msg.Content == nil {
+		return unsupportedMatrixOperation(fmt.Errorf("missing Matrix edit"))
+	}
+	chatID, messageID, err := ic.validatedTarget(msg.Portal, msg.EditTarget)
+	if err != nil {
+		return unsupportedMatrixOperation(err)
+	}
+	metadata, _ := msg.EditTarget.Metadata.(*MessageMetadata)
+	original, err := ic.originalEditContent(ctx, msg, metadata)
+	if err != nil {
+		return bridgev2.WrapErrorInStatus(err).WithErrorAsMessage().WithIsCertain(false).WithSendNotice(true).WithErrorReason(event.MessageStatusGenericError)
+	}
+	caption := false
+	switch effectiveMatrixMessageType(msg.Content) {
+	case event.MsgText:
+		if original.URL != "" || original.File != nil {
+			return unsupportedMatrixOperation(fmt.Errorf("an attachment must be edited as an attachment caption"))
+		}
+	case event.MsgImage, event.MsgVideo, event.MsgAudio, event.MsgFile:
+		if err := validateCaptionEdit(original, msg.Content); err != nil {
+			return unsupportedMatrixOperation(err)
+		}
+		caption = true
+	default:
 		return bridgev2.ErrUnsupportedMessageType
 	}
-	chatID, messageID, err := parseMessageID(msg.EditTarget.ID)
+	text, entities, err := matrixTextToInline(msg.Content, caption, ic.matrixMentionResolver)
 	if err != nil {
-		return bridgev2.WrapErrorInStatus(fmt.Errorf("Inline edit target is invalid: %w", err)).
-			WithErrorAsMessage().
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusUnsupported)
+		return unsupportedMatrixOperation(err)
 	}
-	if err := ic.Sidecar.EditMessage(ctx, sidecar.EditMessageRequest{
-		ChatID:     chatID,
-		MessageID:  messageID,
-		Text:       msg.Content.Body,
-		ExternalID: matrixEventExternalID(msg.Event),
-	}); err != nil {
-		return bridgev2.WrapErrorInStatus(fmt.Errorf("Inline sidecar edit failed: %w", err)).
-			WithErrorAsMessage().
-			WithIsCertain(true).
-			WithSendNotice(true).
-			WithErrorReason(event.MessageStatusGenericError)
+	if err := ic.Sidecar.EditMessage(ctx, sidecar.EditMessageRequest{ChatID: chatID, MessageID: messageID, Text: text, Entities: entities, ExternalID: matrixEventExternalID(msg.Event)}); err != nil {
+		return bridgev2.WrapErrorInStatus(fmt.Errorf("Inline sidecar edit failed: %w", err)).WithErrorAsMessage().WithIsCertain(sidecarErrorIsCertain(err)).WithSendNotice(true).WithErrorReason(event.MessageStatusGenericError)
 	}
+	if metadata == nil {
+		metadata = &MessageMetadata{}
+		msg.EditTarget.Metadata = metadata
+	}
+	metadata.MatrixContent = cloneMatrixContent(msg.Content)
 	msg.EditTarget.EditCount++
 	return nil
 }
 
 func (ic *InlineClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.MatrixMessageRemove) error {
-	chatID, messageID, err := parseMessageID(msg.TargetMessage.ID)
+	if msg == nil {
+		return unsupportedMatrixOperation(errors.New("missing Inline redaction target"))
+	}
+	chatID, messageID, err := ic.validatedTarget(msg.Portal, msg.TargetMessage)
 	if err != nil {
 		return bridgev2.WrapErrorInStatus(fmt.Errorf("Inline redaction target is invalid: %w", err)).
 			WithErrorAsMessage().
@@ -607,7 +555,10 @@ func (ic *InlineClient) PreHandleMatrixReaction(ctx context.Context, msg *bridge
 }
 
 func (ic *InlineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
-	chatID, messageID, err := parseMessageID(msg.TargetMessage.ID)
+	if msg == nil || msg.Content == nil {
+		return nil, unsupportedMatrixOperation(errors.New("missing Inline reaction target"))
+	}
+	chatID, messageID, err := ic.validatedTarget(msg.Portal, msg.TargetMessage)
 	if err != nil {
 		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("Inline reaction target is invalid: %w", err)).
 			WithErrorAsMessage().
@@ -633,7 +584,10 @@ func (ic *InlineClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.
 }
 
 func (ic *InlineClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2.MatrixReactionRemove) error {
-	chatID, messageID, err := parseMessageID(msg.TargetReaction.MessageID)
+	if msg == nil || msg.TargetReaction == nil {
+		return unsupportedMatrixOperation(errors.New("missing Inline reaction removal target"))
+	}
+	chatID, messageID, err := ic.validatedTarget(msg.Portal, &database.Message{ID: msg.TargetReaction.MessageID, Room: msg.TargetReaction.Room})
 	if err != nil {
 		return bridgev2.WrapErrorInStatus(fmt.Errorf("Inline reaction remove target is invalid: %w", err)).
 			WithErrorAsMessage().
@@ -669,21 +623,20 @@ func (ic *InlineClient) HandleMatrixReactionRemove(ctx context.Context, msg *bri
 }
 
 func (ic *InlineClient) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.MatrixReadReceipt) error {
-	chatID, err := strconv.ParseInt(string(msg.Portal.ID), 10, 64)
+	if msg == nil {
+		return errors.New("missing Inline read receipt")
+	}
+	if msg.ExactMessage == nil {
+		return nil
+	} // An unknown receipt must not mean read everything.
+	chatID, messageID, err := ic.validatedTarget(msg.Portal, msg.ExactMessage)
 	if err != nil {
-		return fmt.Errorf("Inline portal ID %q is not a numeric chat ID yet: %w", msg.Portal.ID, err)
+		return fmt.Errorf("invalid Inline read receipt target: %w", err)
 	}
-	var maxMessageID *int64
-	if msg.ExactMessage != nil {
-		_, parsedMessageID, err := parseMessageID(msg.ExactMessage.ID)
-		if err == nil {
-			maxMessageID = &parsedMessageID
-		}
+	if err := ic.verifySourceReadReceipt(ctx, msg, chatID, messageID); err != nil {
+		return err
 	}
-	if err := ic.Sidecar.Read(ctx, sidecar.ReadRequest{
-		ChatID:       chatID,
-		MaxMessageID: maxMessageID,
-	}); err != nil {
+	if err := ic.Sidecar.Read(ctx, sidecar.ReadRequest{ChatID: chatID, MaxMessageID: &messageID}); err != nil {
 		return fmt.Errorf("Inline sidecar read failed: %w", err)
 	}
 	return nil
@@ -801,17 +754,10 @@ func (ic *InlineClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev
 	return nil
 }
 
-func (ic *InlineClient) HandleMatrixViewingChat(ctx context.Context, msg *bridgev2.MatrixViewingChat) error {
-	if msg.Portal == nil {
-		return nil
-	}
-	chatID, err := chatIDFromPortal(msg.Portal)
-	if err != nil {
-		return err
-	}
-	if err := ic.Sidecar.Read(ctx, sidecar.ReadRequest{ChatID: chatID}); err != nil {
-		return fmt.Errorf("Inline sidecar read failed: %w", err)
-	}
+func (ic *InlineClient) HandleMatrixViewingChat(_ context.Context, _ *bridgev2.MatrixViewingChat) error {
+	// Opening a room does not prove that any particular message was displayed.
+	// The source may contain newer messages or undelivered history, so only an
+	// explicit receipt with a verified message mapping may advance source reads.
 	return nil
 }
 
@@ -850,10 +796,19 @@ func (ic *InlineClient) startSidecarLoops(ctx context.Context) {
 func (ic *InlineClient) syncDialogLoop(ctx context.Context) {
 	defer ic.wg.Done()
 	var lastLiveRefresh time.Time
+	var lastWorkspaceRefresh time.Time
 
 	for {
 		recoveringUpgrade := ic.needsBridgeStateRecovery()
 		refreshLive := recoveringUpgrade || lastLiveRefresh.IsZero() || time.Since(lastLiveRefresh) >= dialogLiveRefreshInterval
+		if lastWorkspaceRefresh.IsZero() || time.Since(lastWorkspaceRefresh) >= dialogLiveRefreshInterval {
+			if navErr := ic.refreshWorkspaceNavigation(ctx); navErr != nil {
+				ic.UserLogin.Bridge.Log.Warn().Err(navErr).Msg("Inline workspace refresh failed; keeping known navigation")
+			} else {
+				lastWorkspaceRefresh = time.Now()
+			}
+		}
+		ic.retryIdentityProjection(ctx)
 		var err error
 		if recoveringUpgrade {
 			err = ic.recoverBridgeState(ctx)
@@ -1132,6 +1087,11 @@ func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error
 	pages := 0
 	dialogsSeen := 0
 	resyncsQueued := 0
+	readRetries := 4
+	ic.readProjectionMu.Lock()
+	readAfter := ic.readProjectionCursor
+	ic.readProjectionMu.Unlock()
+	readVisited := false
 
 	for {
 		if remainingRPCs <= 0 {
@@ -1159,6 +1119,14 @@ func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error
 				return err
 			}
 			changed := ic.rememberDialog(dialog)
+			if ic.shouldProjectDialog(dialog) && readRetries > 0 && dialog.ChatID > readAfter {
+				ic.retryReadProjection(ctx, dialog.ChatID)
+				ic.readProjectionMu.Lock()
+				ic.readProjectionCursor = dialog.ChatID
+				ic.readProjectionMu.Unlock()
+				readVisited = true
+				readRetries--
+			}
 			if !ic.shouldProjectDialog(dialog) {
 				continue
 			}
@@ -1191,6 +1159,11 @@ func (ic *InlineClient) syncDialogs(ctx context.Context, refreshLive bool) error
 		if err := ic.persistDialogSyncCursor(ctx, cursor); err != nil {
 			return err
 		}
+	}
+	if !readVisited {
+		ic.readProjectionMu.Lock()
+		ic.readProjectionCursor = 0
+		ic.readProjectionMu.Unlock()
 	}
 	err := ic.syncDeferredDialogWork(ctx, deferredWork, remainingRPCs)
 	if ic.UserLogin != nil && ic.UserLogin.Bridge != nil {
@@ -1289,28 +1262,39 @@ func (ic *InlineClient) syncDialogDetails(ctx context.Context, dialog sidecar.Di
 	if err != nil {
 		return err
 	}
-	ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
+	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
 			PortalKey:    ic.portalKeyForChat(dialog.ChatID),
 			Timestamp:    time.Now(),
 			CreatePortal: true,
 		},
-		ChatInfo: info,
+		ChatInfo:        info,
+		GetChatInfoFunc: guardedChatInfo(info),
 	})
-	return nil
+	return eventHandlingResultError("dialog details", result)
 }
 
 func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.DialogRecord) error {
 	if !ic.shouldProjectDialog(dialog) || !ic.needsHistoryDelivery(dialog) {
 		return nil
 	}
-	request := historyRequestForDelivery(dialog, ic.historyCheckpoint(dialog.ChatID), startupHistoryLimit)
+	frontier := ic.historyCheckpoint(dialog.ChatID)
+	request := historyRequestForDelivery(dialog, frontier, startupHistoryLimit)
 	page, err := ic.Sidecar.History(ctx, request)
 	if err != nil {
 		return err
 	}
 	ic.cacheUsers(page.Users)
+	pageMax, err := cachedHistoryPageMax(page.Messages, frontier)
+	if err != nil {
+		return err
+	}
+	for _, msg := range page.Messages {
+		if msg.ChatID != dialog.ChatID {
+			return errors.New("history returned a foreign chat")
+		}
+	}
 
 	sort.SliceStable(page.Messages, func(i, j int) bool {
 		left, right := page.Messages[i], page.Messages[j]
@@ -1328,6 +1312,19 @@ func (ic *InlineClient) syncRecentHistory(ctx context.Context, dialog sidecar.Di
 			return err
 		}
 	}
+	if len(page.Messages) == 0 {
+		if page.HasMore {
+			return errors.New("history returned an empty nonterminal page")
+		}
+		// A terminal empty source page can follow a deleted latest message.
+		pageMax = max(frontier, lastMessageIDValue(dialog))
+	}
+	if pageMax > frontier {
+		if err := ic.persistHistoryCheckpoint(ctx, dialog.ChatID, pageMax); err != nil {
+			return err
+		}
+		ic.rememberHistoryDelivered(dialog.ChatID, pageMax)
+	}
 	return nil
 }
 
@@ -1336,9 +1333,8 @@ func historyRequestForDelivery(dialog sidecar.DialogRecord, checkpoint int64, li
 		ChatID: dialog.ChatID,
 		Limit:  &limit,
 	}
-	if checkpoint > 0 {
-		request.AfterMessageID = &checkpoint
-	}
+	// An explicit zero requests the oldest source page, not the latest window.
+	request.AfterMessageID = &checkpoint
 	return request
 }
 
@@ -1395,22 +1391,15 @@ func (ic *InlineClient) loadHistoryCheckpoint(ctx context.Context, chatID int64)
 	if err != nil {
 		return 0, fmt.Errorf("load Inline portal history checkpoint: %w", err)
 	}
-	if metadata, ok := portal.Metadata.(*PortalMetadata); ok && metadata != nil && metadata.HistoryCheckpoint > 0 {
+	if metadata, ok := portal.Metadata.(*PortalMetadata); ok && metadata != nil && metadata.HistoryCoverageVersion == 1 && metadata.HistoryCheckpoint > 0 {
 		checkpoint = metadata.HistoryCheckpoint
 		ic.rememberHistoryDelivered(chatID, checkpoint)
 		return checkpoint, nil
 	}
 
-	messages, err := ic.UserLogin.Bridge.DB.Message.GetLastNInPortal(ctx, ic.portalKeyForChat(chatID), 16)
-	if err != nil {
-		return 0, err
-	}
-	checkpoint = maxInlineMessageIDForChat(messages, chatID)
-	if checkpoint > 0 {
-		if err := ic.persistHistoryCheckpoint(ctx, chatID, checkpoint); err != nil {
-			return 0, err
-		}
-	}
+	// Legacy checkpoints tracked the greatest observed ID, not contiguous history.
+	// Rewalk from zero once; existing Matrix mappings make this idempotent.
+	checkpoint = 0
 
 	ic.mu.Lock()
 	if ic.history == nil {
@@ -1509,7 +1498,7 @@ func rateLimitRetryDelay(err error, fallback time.Duration) time.Duration {
 
 func (ic *InlineClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	if params.ThreadRoot != "" {
-		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
+		return nil, errors.New("Inline child chats are separate rooms; Matrix thread history is unsupported")
 	}
 
 	request, err := historyRequestForBackfill(params)
@@ -1522,14 +1511,20 @@ func (ic *InlineClient) FetchMessages(ctx context.Context, params bridgev2.Fetch
 	}
 	ic.cacheUsers(page.Users)
 
-	messages, cursor := ic.backfillMessagesFromHistory(ctx, params.Portal, page.Messages)
+	messages, cursor, err := ic.backfillMessagesFromHistory(ctx, params.Portal, page.Messages)
+	if err != nil {
+		return nil, err
+	}
+	if page.HasMore && cursor == "" {
+		return nil, errors.New("Inline backfill returned an empty nonterminal page")
+	}
 	hasMore := page.HasMore && cursor != ""
 	return &bridgev2.FetchMessagesResponse{
 		Messages: messages,
 		Cursor:   cursor,
 		HasMore:  hasMore,
 		Forward:  params.Forward,
-		MarkRead: true,
+		MarkRead: false,
 	}, nil
 }
 
@@ -1591,13 +1586,22 @@ func backfillLimit(count int) *uint32 {
 	return &limit
 }
 
-func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal *bridgev2.Portal, records []sidecar.MessageRecord) ([]*bridgev2.BackfillMessage, networkid.PaginationCursor) {
+func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal *bridgev2.Portal, records []sidecar.MessageRecord) ([]*bridgev2.BackfillMessage, networkid.PaginationCursor, error) {
 	var cursor networkid.PaginationCursor
 	var cursorChatID, minimumMessageID int64
+	seen := make(map[networkid.MessageID]struct{}, len(records))
 	for _, record := range records {
 		if record.ChatID <= 0 || record.MessageID <= 0 {
-			continue
+			return nil, "", errors.New("invalid Inline message identity in backfill")
 		}
+		if (portal != nil && portal.ID != networkid.PortalID(strconv.FormatInt(record.ChatID, 10))) || (cursorChatID != 0 && record.ChatID != cursorChatID) {
+			return nil, "", errors.New("backfill returned a foreign chat")
+		}
+		messageID := makeMessageID(record.ChatID, record.MessageID)
+		if _, duplicate := seen[messageID]; duplicate {
+			return nil, "", errors.New("backfill returned a duplicate message identity")
+		}
+		seen[messageID] = struct{}{}
 		if minimumMessageID == 0 || record.MessageID < minimumMessageID {
 			cursorChatID = record.ChatID
 			minimumMessageID = record.MessageID
@@ -1618,8 +1622,10 @@ func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal 
 	backfillMessages := make([]*bridgev2.BackfillMessage, 0, len(records))
 	for _, record := range records {
 		if record.ChatID <= 0 || record.MessageID <= 0 {
-			ic.logBackfillConversionError(errors.New("invalid Inline message identity"), record)
-			continue
+			return nil, "", errors.New("invalid Inline message identity in backfill")
+		}
+		if portal != nil && portal.ID != networkid.PortalID(strconv.FormatInt(record.ChatID, 10)) {
+			return nil, "", errors.New("backfill returned a foreign chat")
 		}
 		messageID := makeMessageID(record.ChatID, record.MessageID)
 
@@ -1632,16 +1638,15 @@ func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal 
 			var ok bool
 			intent, ok = portal.GetIntentFor(ctx, sender, ic.UserLogin, bridgev2.RemoteEventMessage)
 			if !ok {
-				continue
+				return nil, "", errors.New("backfill sender intent is unavailable")
 			}
 		}
 		converted, err := convertInlineMessage(ctx, portal, intent, record)
 		if err != nil {
-			ic.logBackfillConversionError(err, record)
-			continue
+			return nil, "", fmt.Errorf("convert backfill message %d: %w", record.MessageID, err)
 		}
 		if converted == nil {
-			continue
+			return nil, "", errors.New("backfill conversion returned no message")
 		}
 		backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
 			ConvertedMessage: converted,
@@ -1651,7 +1656,7 @@ func (ic *InlineClient) backfillMessagesFromHistory(ctx context.Context, portal 
 			Timestamp:        inlineTimestamp(record.Timestamp),
 		})
 	}
-	return backfillMessages, cursor
+	return backfillMessages, cursor, nil
 }
 
 func (ic *InlineClient) logBackfillConversionError(err error, record sidecar.MessageRecord) {
@@ -1885,7 +1890,7 @@ func (ic *InlineClient) reconcileBridgeStateSlice(ctx context.Context, afterChat
 }
 
 func (ic *InlineClient) reconcileAccountDeletes(ctx context.Context) error {
-	accountState, err := ic.Sidecar.AccountState(ctx)
+	accountState, err := ic.fetchWorkspaceNavigation(ctx, false)
 	if err != nil {
 		return fmt.Errorf("fetch Inline account reconciliation state: %w", err)
 	}
@@ -1938,7 +1943,8 @@ func (ic *InlineClient) reconcileDialogState(ctx context.Context, dialog sidecar
 			Timestamp:    time.Now(),
 			CreatePortal: true,
 		},
-		ChatInfo: info,
+		ChatInfo:        info,
+		GetChatInfoFunc: guardedChatInfo(info),
 	})
 	if err := eventHandlingResultError("reconciled chat resync", result); err != nil {
 		return err
@@ -2024,6 +2030,11 @@ func (ic *InlineClient) reconcileCachedHistory(ctx context.Context, chatID int64
 		pageMax, err := cachedHistoryPageMax(page.Messages, after)
 		if err != nil {
 			return fmt.Errorf("validate cached Inline history for chat %d: %w", chatID, err)
+		}
+		for _, message := range page.Messages {
+			if message.ChatID != chatID {
+				return errors.New("cached history returned a foreign chat")
+			}
 		}
 		for _, message := range page.Messages {
 			if err := eventHandlingResultError("reconciled message upsert", ic.queueInlineMessage(ctx, message)); err != nil {
@@ -2119,40 +2130,6 @@ func (ic *InlineClient) syncReadState(ctx context.Context, chatID int64) error {
 		return fmt.Errorf("fetch Inline read state for chat %d: %w", chatID, err)
 	}
 	return ic.queueReadState(state.ReadState)
-}
-
-func (ic *InlineClient) queueReadState(state *sidecar.ReadStateRecord) error {
-	if state == nil {
-		return nil
-	}
-	sender := bridgev2.EventSender{
-		Sender:   makeUserID(ic.AccountID),
-		IsFromMe: true,
-	}
-	if state.ReadMaxID != nil && *state.ReadMaxID > 0 {
-		result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.Receipt{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventReadReceipt,
-				PortalKey: ic.portalKeyForChat(state.ChatID),
-				Sender:    sender,
-				Timestamp: time.Now(),
-			},
-			LastTarget: makeMessageID(state.ChatID, *state.ReadMaxID),
-		})
-		if err := eventHandlingResultError("read receipt", result); err != nil {
-			return err
-		}
-	}
-	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.MarkUnread{
-		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventMarkUnread,
-			PortalKey: ic.portalKeyForChat(state.ChatID),
-			Sender:    sender,
-			Timestamp: time.Now(),
-		},
-		Unread: state.MarkedUnread,
-	})
-	return eventHandlingResultError("mark unread", result)
 }
 
 func (ic *InlineClient) handleSequencedSidecarEvent(ctx context.Context, envelope *sidecar.EventEnvelope) error {
@@ -2455,7 +2432,7 @@ func (ic *InlineClient) syncMessageUpsert(ctx context.Context, chatID, messageID
 	}
 	ic.cacheUsers(page.Users)
 	for _, msg := range page.Messages {
-		if msg.MessageID == messageID {
+		if msg.ChatID == chatID && msg.MessageID == messageID {
 			return eventHandlingResultError("message upsert", ic.queueInlineMessage(ctx, msg))
 		}
 	}
@@ -2497,6 +2474,9 @@ func (ic *InlineClient) handleStatusChanged(evt *sidecar.StatusChangedEvent) {
 }
 
 func (ic *InlineClient) queueDialogResync(ctx context.Context, dialog sidecar.DialogRecord) bridgev2.EventHandlingResult {
+	if cached, ok := ic.cachedDialog(dialog.ChatID); ok {
+		dialog = cached
+	}
 	if !ic.shouldProjectDialog(dialog) {
 		return bridgev2.EventHandlingResultIgnored
 	}
@@ -2508,7 +2488,8 @@ func (ic *InlineClient) queueDialogResync(ctx context.Context, dialog sidecar.Di
 			Timestamp:    time.Now(),
 			CreatePortal: true,
 		},
-		ChatInfo: chatInfo,
+		ChatInfo:        chatInfo,
+		GetChatInfoFunc: guardedChatInfo(chatInfo),
 	})
 }
 
@@ -2543,6 +2524,9 @@ func (ic *InlineClient) queueChatResyncByID(ctx context.Context, chatID int64) b
 }
 
 func (ic *InlineClient) queueSpaceDialogResync(ctx context.Context, spaceID int64) error {
+	if err := ic.refreshWorkspaceNavigation(ctx); err != nil {
+		return err
+	}
 	ic.mu.RLock()
 	dialogs := make([]sidecar.DialogRecord, 0)
 	for _, dialog := range ic.dialogs {
@@ -2564,6 +2548,13 @@ func (ic *InlineClient) queueSpaceDialogResync(ctx context.Context, spaceID int6
 }
 
 func (ic *InlineClient) queueChatDelete(chatID int64) bridgev2.EventHandlingResult {
+	ic.mu.Lock()
+	delete(ic.dialogs, chatID)
+	delete(ic.details, chatID)
+	ic.mu.Unlock()
+	if err := ic.removeChatWorkspaceLinks(ic.UserLogin.Bridge.BackgroundCtx, chatID); err != nil {
+		return bridgev2.EventHandlingResultFailed.WithError(fmt.Errorf("remove deleted Inline chat navigation: %w", err))
+	}
 	return ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, &simplevent.ChatDelete{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatDelete,
@@ -2601,6 +2592,9 @@ func (ic *InlineClient) rememberDialog(dialog sidecar.DialogRecord) bool {
 		ic.dialogs = make(map[int64]sidecar.DialogRecord)
 	}
 	previous, ok := ic.dialogs[dialog.ChatID]
+	if ok {
+		dialog = mergeDialogStructure(previous, dialog)
+	}
 	ic.dialogs[dialog.ChatID] = dialog
 	changed := !ok || !sameDialogRecord(previous, dialog)
 	if !ok || !int64PtrEqual(previous.PeerUserID, dialog.PeerUserID) {
@@ -2617,7 +2611,7 @@ func (ic *InlineClient) cachedDialog(chatID int64) (sidecar.DialogRecord, bool) 
 }
 
 func sameDialogRecord(left, right sidecar.DialogRecord) bool {
-	return left.ChatID == right.ChatID &&
+	return sameDialogStructure(left, right) && left.ChatID == right.ChatID &&
 		int64PtrEqual(left.PeerUserID, right.PeerUserID) &&
 		stringPtrEqual(left.Title, right.Title) &&
 		int64PtrEqual(left.LastMessageID, right.LastMessageID) &&
@@ -2631,7 +2625,7 @@ func boolPtrEqual(left, right *bool) bool {
 }
 
 func isDMDialog(dialog sidecar.DialogRecord) bool {
-	return dialog.PeerUserID != nil && *dialog.PeerUserID > 0
+	return dialog.Kind != "chat" && dialog.PeerUserID != nil && *dialog.PeerUserID > 0
 }
 
 func (ic *InlineClient) needsDialogDetailsSync(chatID int64) bool {
@@ -2673,37 +2667,58 @@ func (ic *InlineClient) cachedUser(userID int64) (sidecar.UserRecord, bool) {
 }
 
 func (ic *InlineClient) chatInfoForChat(ctx context.Context, chatID int64, name *string) (*bridgev2.ChatInfo, error) {
-	if dialog, ok := ic.cachedDialog(chatID); ok && isDMDialog(dialog) {
+	dialog, known := ic.cachedDialog(chatID)
+	if known && isDMDialog(dialog) {
 		return ic.chatInfoForDialog(ctx, dialog, name), nil
+	}
+	if !known || dialog.Kind == "" || dialog.Kind == "unknown" {
+		state, err := ic.Sidecar.ChatState(ctx, sidecar.ChatStateRequest{ChatID: chatID})
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch Inline conversation identity: %w", err)
+		}
+		if state.Deleted {
+			return nil, fmt.Errorf("Inline chat %d is no longer accessible", chatID)
+		}
+		if state.Dialog != nil && state.Dialog.ChatID == chatID {
+			ic.rememberDialog(*state.Dialog)
+			dialog, known = ic.cachedDialog(chatID)
+			if isDMDialog(dialog) {
+				return ic.chatInfoForDialog(ctx, dialog, name), nil
+			}
+		}
 	}
 	page, err := ic.Sidecar.ChatParticipants(ctx, sidecar.ChatParticipantsRequest{ChatID: chatID})
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch Inline chat participants: %w", err)
 	}
 	ic.cacheUsers(page.Users)
-	roomType := database.RoomTypeGroupDM
-	return &bridgev2.ChatInfo{
-		Type:        &roomType,
-		Name:        name,
-		Members:     ic.chatMemberListFromParticipants(ctx, page),
-		CanBackfill: true,
-	}, nil
+	if !known {
+		dialog = sidecar.DialogRecord{ChatID: chatID}
+	}
+	info := ic.chatInfoForDialog(ctx, dialog, name)
+	info.Members = ic.chatMemberListFromParticipants(ctx, page)
+	return info, nil
 }
 
 func (ic *InlineClient) chatInfoForDialog(ctx context.Context, dialog sidecar.DialogRecord, name *string) *bridgev2.ChatInfo {
-	info := &bridgev2.ChatInfo{
-		Name:        name,
-		CanBackfill: true,
-	}
-	if dialog.PeerUserID != nil && *dialog.PeerUserID > 0 {
+	info := &bridgev2.ChatInfo{Name: name, CanBackfill: true}
+	if isDMDialog(dialog) {
 		roomType := database.RoomTypeDM
-		info.Type = &roomType
-		info.Name = nil
+		info.Type, info.Name = &roomType, nil
 		info.Members = ic.chatMemberListForDM(ctx, *dialog.PeerUserID)
 	} else {
-		roomType := database.RoomTypeGroupDM
-		info.Type = &roomType
+		if dialog.Kind == "chat" {
+			roomType := database.RoomTypeDefault
+			info.Type = &roomType
+		}
 		info.Members = ic.chatMemberListForKnownSelf(ctx)
+	}
+	info.ExtraUpdates = func(updateCtx context.Context, portal *bridgev2.Portal) bool {
+		changed := ic.updateChildContext(updateCtx, portal, dialog)
+		if err := ic.syncDialogWorkspaceLink(updateCtx, portal, dialog); err != nil && ic.UserLogin != nil && ic.UserLogin.Bridge != nil {
+			ic.UserLogin.Bridge.Log.Warn().Err(err).Int64("chat_id", dialog.ChatID).Msg("Failed to update Inline workspace navigation")
+		}
+		return changed
 	}
 	return info
 }
@@ -2792,6 +2807,7 @@ func (ic *InlineClient) createDMWithUserID(ctx context.Context, userID int64) (*
 	if chat != nil {
 		ic.rememberDialog(sidecar.DialogRecord{
 			ChatID:     chat.ChatID,
+			Kind:       "direct_message",
 			PeerUserID: &userID,
 			Title:      chat.Title,
 		})
@@ -2834,21 +2850,21 @@ func (ic *InlineClient) chatInfoForCreatedChat(ctx context.Context, chat *sideca
 		}
 	}
 	memberList := &bridgev2.ChatMemberList{
-		IsFull:                     true,
+		IsFull:                     false,
 		CheckAllLogins:             true,
 		ExcludeChangesFromTimeline: true,
 		TotalMemberCount:           len(members),
 		MemberMap:                  members,
 	}
-	if len(members) == 2 {
-		for userID := range members {
-			if !ic.IsThisUser(ctx, userID) {
-				memberList.OtherUserID = userID
-				break
-			}
+	roomType := database.RoomTypeDefault
+	if chat != nil {
+		if dialog, ok := ic.cachedDialog(chat.ChatID); ok && isDMDialog(dialog) {
+			return ic.chatInfoForDialog(ctx, dialog, nil)
 		}
 	}
+
 	return &bridgev2.ChatInfo{
+		Type:        &roomType,
 		Name:        name,
 		Members:     memberList,
 		CanBackfill: true,
@@ -2878,7 +2894,7 @@ func (ic *InlineClient) userInfoForID(userID int64) *bridgev2.UserInfo {
 }
 
 func eventHandlingResultError(kind string, result bridgev2.EventHandlingResult) error {
-	if result.Success {
+	if result.Success && !result.Queued && result.Error == nil {
 		return nil
 	}
 	if result.Error != nil {
@@ -2888,15 +2904,19 @@ func eventHandlingResultError(kind string, result bridgev2.EventHandlingResult) 
 }
 
 func (ic *InlineClient) queueInlineMessage(ctx context.Context, msg sidecar.MessageRecord) bridgev2.EventHandlingResult {
-	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, ic.remoteMessageEvent(msg))
-	if historyDeliveryAccepted(result) {
-		if err := ic.persistHistoryCheckpoint(ctx, msg.ChatID, msg.MessageID); err != nil {
-			result.Success = false
-			result.Error = err
-			return result
-		}
-		ic.rememberHistoryDelivered(msg.ChatID, msg.MessageID)
+	if msg.ChatID <= 0 || msg.MessageID <= 0 {
+		return bridgev2.EventHandlingResultFailed.WithError(errors.New("invalid Inline message identity"))
 	}
+	result := ic.UserLogin.Bridge.QueueRemoteEvent(ic.UserLogin, ic.remoteMessageEvent(msg))
+	if !historyDeliveryAccepted(result) {
+		return result
+	}
+	// Completion must have produced a durable, same-portal mapping. In particular,
+	// an ignored event can mean either an existing message or a missing room.
+	if err := ic.verifyMessageDelivery(ctx, msg.ChatID, msg.MessageID); err != nil {
+		return bridgev2.EventHandlingResultFailed.WithError(err)
+	}
+	// Live delivery never advances the historical coverage frontier.
 	return result
 }
 
@@ -2912,20 +2932,22 @@ func (ic *InlineClient) persistHistoryCheckpoint(ctx context.Context, chatID, me
 	if !ok || metadata == nil {
 		return errors.New("Inline portal metadata is unavailable")
 	}
-	if messageID <= metadata.HistoryCheckpoint {
+	if metadata.HistoryCoverageVersion == 1 && messageID <= metadata.HistoryCheckpoint {
 		return nil
 	}
-	previous := metadata.HistoryCheckpoint
+	previous, previousVersion := metadata.HistoryCheckpoint, metadata.HistoryCoverageVersion
 	metadata.HistoryCheckpoint = messageID
+	metadata.HistoryCoverageVersion = 1
 	if err := portal.Save(ctx); err != nil {
 		metadata.HistoryCheckpoint = previous
+		metadata.HistoryCoverageVersion = previousVersion
 		return fmt.Errorf("save Inline history checkpoint: %w", err)
 	}
 	return nil
 }
 
 func historyDeliveryAccepted(result bridgev2.EventHandlingResult) bool {
-	return result.Success
+	return result.Success && !result.Queued && result.Error == nil
 }
 
 func (ic *InlineClient) queueInlineMessageDelete(chatID, messageID int64) bridgev2.EventHandlingResult {
@@ -3049,28 +3071,22 @@ func upsertExistingInlineMessage(ctx context.Context, portal *bridgev2.Portal, i
 	if len(existing) == 0 {
 		return bridgev2.UpsertResult{ContinueMessageHandling: true}, nil
 	}
-	fingerprint := inlineMessageFingerprint(data)
-	if metadata, ok := existing[0].Metadata.(*MessageMetadata); ok &&
-		metadata.InlineFingerprint == fingerprint &&
-		(data.Content.Type != "media" || metadata.MediaHandled) {
-		return bridgev2.UpsertResult{}, nil
+	if metadata, ok := existing[0].Metadata.(*MessageMetadata); ok && metadata != nil {
+		if inlineRevisionIsStale(metadata, data) {
+			return bridgev2.UpsertResult{}, nil
+		}
+		fingerprintMatches := metadata.InlineFingerprint == inlineMessageFingerprint(data)
+		if len(data.Metadata.Entities) == 0 && data.Metadata.Revision == nil && data.Metadata.EditTimestamp == nil {
+			fingerprintMatches = fingerprintMatches || metadata.InlineFingerprint == legacyInlineMessageFingerprint(data)
+		}
+		if fingerprintMatches && (data.Content.Type != "media" || metadata.MediaHandled) {
+			return bridgev2.UpsertResult{}, nil
+		}
 	}
-	return bridgev2.UpsertResult{
-		SubEvents: []bridgev2.RemoteEvent{&simplevent.Message[sidecar.MessageRecord]{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventEdit,
-				PortalKey: portal.PortalKey,
-				Sender: bridgev2.EventSender{
-					Sender:   makeUserID(strconv.FormatInt(data.SenderID, 10)),
-					IsFromMe: data.IsOutgoing,
-				},
-				Timestamp: inlineTimestamp(data.Timestamp),
-			},
-			Data:            data,
-			TargetMessage:   makeMessageID(data.ChatID, data.MessageID),
-			ConvertEditFunc: convertInlineMessageEdit,
-		}},
-	}, nil
+	return bridgev2.UpsertResult{SubEvents: []bridgev2.RemoteEvent{&simplevent.Message[sidecar.MessageRecord]{
+		EventMeta: simplevent.EventMeta{Type: bridgev2.RemoteEventEdit, PortalKey: portal.PortalKey, Sender: bridgev2.EventSender{Sender: makeUserID(strconv.FormatInt(data.SenderID, 10)), IsFromMe: data.IsOutgoing}, Timestamp: inlineTimestamp(inlineEditTimestamp(data))},
+		Data:      data, TargetMessage: makeMessageID(data.ChatID, data.MessageID), ConvertEditFunc: convertInlineMessageEdit,
+	}}}, nil
 }
 
 func convertInlineMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data sidecar.MessageRecord) (*bridgev2.ConvertedMessage, error) {
@@ -3079,10 +3095,9 @@ func convertInlineMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 		return nil, err
 	}
 	if data.ReplyToMessageID != nil {
-		converted.ReplyTo = &networkid.MessageOptionalPartID{
-			MessageID: makeMessageID(data.ChatID, *data.ReplyToMessageID),
-		}
+		converted.ReplyTo = &networkid.MessageOptionalPartID{MessageID: makeMessageID(data.ChatID, *data.ReplyToMessageID)}
 	}
+	applyInlineRecordEntities(ctx, portal, converted, data)
 	setInlineMessageFingerprint(converted, data)
 	return converted, nil
 }
@@ -3091,48 +3106,62 @@ func convertInlineMessageEdit(ctx context.Context, portal *bridgev2.Portal, inte
 	if len(existing) == 0 {
 		return nil, bridgev2.ErrTargetMessageNotFound
 	}
-	converted, err := convertedContentFromInline(ctx, portal, intent, data.Content)
-	if err != nil {
-		return nil, err
+	if portal == nil || string(portal.ID) != strconv.FormatInt(data.ChatID, 10) || existing[0].Room != portal.PortalKey || existing[0].ID != makeMessageID(data.ChatID, data.MessageID) {
+		return nil, fmt.Errorf("Inline edit target belongs to another chat or login")
+	}
+	if metadata, ok := existing[0].Metadata.(*MessageMetadata); ok && inlineRevisionIsStale(metadata, data) {
+		return &bridgev2.ConvertedEdit{}, nil
+	}
+	converted := reuseInlineMedia(existing[0], data)
+	if converted == nil {
+		var err error
+		converted, err = convertedContentFromInline(ctx, portal, intent, data.Content)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(converted.Parts) == 0 {
 		return &bridgev2.ConvertedEdit{}, nil
 	}
+	applyInlineRecordEntities(ctx, portal, converted, data)
 	setInlineMessageFingerprint(converted, data)
-	return &bridgev2.ConvertedEdit{
-		ModifiedParts: []*bridgev2.ConvertedEditPart{
-			converted.Parts[0].ToEditPart(existing[0]),
-		},
-	}, nil
+	return &bridgev2.ConvertedEdit{ModifiedParts: []*bridgev2.ConvertedEditPart{converted.Parts[0].ToEditPart(existing[0])}}, nil
 }
 
 func setInlineMessageFingerprint(converted *bridgev2.ConvertedMessage, data sidecar.MessageRecord) {
 	if converted == nil {
 		return
 	}
-	metadata := &MessageMetadata{
-		InlineFingerprint: inlineMessageFingerprint(data),
-		MediaHandled:      data.Content.Type == "media",
-	}
 	for _, part := range converted.Parts {
-		if part != nil {
-			part.DBMetadata = metadata
+		if part == nil {
+			continue
 		}
+		part.DBMetadata = &MessageMetadata{InlineFingerprint: inlineMessageFingerprint(data), MediaHandled: data.Content.Type == "media", SourceRevision: data.Metadata.Revision, SourceEditTimestamp: data.Metadata.EditTimestamp, MatrixContent: cloneMatrixContent(part.Content), MediaIdentity: inlineMediaIdentity(data.Content)}
 	}
 }
 
 func inlineMessageFingerprint(data sidecar.MessageRecord) string {
 	payload, err := json.Marshal(struct {
+		Legacy        string                        `json:"legacy"`
+		Timestamp     int64                         `json:"timestamp"`
+		Entities      []sidecar.MessageEntityRecord `json:"entities,omitempty"`
+		Revision      *int64                        `json:"revision,omitempty"`
+		EditTimestamp *int64                        `json:"edit_timestamp,omitempty"`
+	}{legacyInlineMessageFingerprint(data), data.Timestamp, data.Metadata.Entities, data.Metadata.Revision, data.Metadata.EditTimestamp})
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("v2:%x", digest[:])
+}
+
+func legacyInlineMessageFingerprint(data sidecar.MessageRecord) string {
+	payload, err := json.Marshal(struct {
 		SenderID         int64                  `json:"sender_id"`
 		IsOutgoing       bool                   `json:"is_outgoing"`
 		Content          sidecar.MessageContent `json:"content"`
 		ReplyToMessageID *int64                 `json:"reply_to_message_id,omitempty"`
-	}{
-		SenderID:         data.SenderID,
-		IsOutgoing:       data.IsOutgoing,
-		Content:          data.Content,
-		ReplyToMessageID: data.ReplyToMessageID,
-	})
+	}{data.SenderID, data.IsOutgoing, data.Content, data.ReplyToMessageID})
 	if err != nil {
 		return ""
 	}
@@ -3168,6 +3197,9 @@ func convertedContentFromInline(ctx context.Context, portal *bridgev2.Portal, in
 }
 
 func convertedInlineMedia(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, content sidecar.MessageContent) (*bridgev2.ConvertedMessage, error) {
+	if content.SizeBytes != nil && *content.SizeBytes > maxInlineMediaDownload {
+		return convertedInlineMediaUnavailable(content), nil
+	}
 	if strings.TrimSpace(content.URL) == "" || portal == nil || intent == nil {
 		return convertedInlineMediaUnavailable(content), nil
 	}
@@ -3205,12 +3237,13 @@ func convertedInlineMedia(ctx context.Context, portal *bridgev2.Portal, intent b
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type: event.EventMessage,
 			Content: &event.MessageEventContent{
-				MsgType:  inlineMediaMessageType(content),
-				Body:     inlineMediaBody(content, fileName),
-				URL:      mxc,
-				File:     file,
-				FileName: fileName,
-				Info:     info,
+				MsgType:      inlineMediaMessageType(content),
+				MSC3245Voice: inlineVoiceMetadata(content),
+				Body:         inlineMediaBody(content, fileName),
+				URL:          mxc,
+				File:         file,
+				FileName:     fileName,
+				Info:         info,
 			},
 		}},
 	}, nil
@@ -3254,6 +3287,9 @@ func downloadInlineURL(ctx context.Context, rawURL string, maxBytes int64, label
 		return nil, err
 	}
 
+	if resp.ContentLength > maxBytes {
+		return nil, permanentMediaFailure(fmt.Errorf("%s Content-Length exceeds %d byte bridge download limit", label, maxBytes))
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read %s response: %w", label, err)
@@ -3284,6 +3320,11 @@ func inlineMediaMessageType(content sidecar.MessageContent) event.MessageType {
 		return event.MsgVideo
 	case "voice":
 		return event.MsgAudio
+	case "document":
+		if content.MimeType != nil && strings.HasPrefix(strings.ToLower(*content.MimeType), "audio/") {
+			return event.MsgAudio
+		}
+		return event.MsgFile
 	default:
 		return event.MsgFile
 	}
@@ -3329,8 +3370,8 @@ func inlineMediaFileName(content sidecar.MessageContent) string {
 }
 
 func inlineMediaBody(content sidecar.MessageContent, fileName string) string {
-	if content.Caption != nil && strings.TrimSpace(*content.Caption) != "" {
-		return strings.TrimSpace(*content.Caption)
+	if content.Caption != nil && *content.Caption != "" {
+		return *content.Caption
 	}
 	return fileName
 }
@@ -3435,7 +3476,10 @@ func sidecarUploadKindForMatrix(content *event.MessageEventContent) string {
 	case event.MsgVideo:
 		return "video"
 	case event.MsgAudio:
-		return "voice"
+		if content.MSC3245Voice != nil {
+			return "voice"
+		}
+		return "document"
 	default:
 		return "document"
 	}
