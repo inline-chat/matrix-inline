@@ -93,17 +93,23 @@ Adapter event cursors are `(generation, sequence)` pairs. If the adapter SQLite
 database is restored behind the Matrix database, the adapter rotates to a new
 generation and returns a structured reset. The Go bridge then performs
 authoritative reconciliation and atomically replaces its saved cursor before
-resuming replay. Protocol v4 requires the Go bridge and Rust sidecar to be
+resuming replay. Protocol v5 requires the Go bridge and Rust sidecar to be
 upgraded together.
 
 Dialog reconciliation uses stable chat-ID keyset pagination and persists its
 next cursor in login metadata. Activity reordering cannot skip rows, and large
 accounts resume from the last completed page after restart or RPC-budget yield.
-Delivered message IDs are also persisted monotonically in portal metadata.
+History coverage advances only after every message in a source-ID page has a
+durable Matrix mapping. Live arrivals do not advance this frontier. On the first
+upgrade, legacy greatest-ID checkpoints are rechecked from the oldest source
+page; existing mappings retain their room/event IDs.
 
 Permanent media projection failures (invalid schemes, reviewed terminal 4xx,
 or the configured size ceiling) produce a stable Matrix unavailable notice and
 allow the lossless cursor to continue. Timeouts, 429, and 5xx remain retryable.
+
+See [bridge semantics](bridge-semantics.md) for workspace navigation, room repair,
+rich messages, read projection and protocol-v5 upgrade details.
 
 ### Hidden Inline dialogs
 
@@ -256,5 +262,5 @@ ireconnect
 - Run:
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:29342/rpc/resume | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST http://127.0.0.1:29342/rpc/resume | jq .
 ```

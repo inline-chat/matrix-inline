@@ -26,10 +26,14 @@ go mod tidy -diff
 echo "==> Shell syntax"
 bash -n scripts/check.sh scripts/smoke-local.sh scripts/e2e-local.sh docker-run.sh
 
-echo "==> Compose config"
-docker compose config >/dev/null
-docker compose config | grep -q 'INLINE_API_BASE_URL:'
-docker compose config | grep -q 'INLINE_REALTIME_URL:'
+if [[ "${SKIP_DOCKER_CHECKS:-0}" == "1" ]]; then
+	echo "==> Compose config skipped (SKIP_DOCKER_CHECKS=1)"
+else
+	echo "==> Compose config"
+	docker compose config >/dev/null
+	docker compose config | grep -q 'INLINE_API_BASE_URL:'
+	docker compose config | grep -q 'INLINE_REALTIME_URL:'
+fi
 
 echo "==> Go tests"
 go test -tags goolm ./...

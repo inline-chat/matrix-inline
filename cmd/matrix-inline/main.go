@@ -22,6 +22,9 @@ func main() {
 	// mautrix environment variable, but the connector will reject non-zero
 	// values at startup to preserve this delivery invariant.
 	bridgev2.PortalEventBuffer = 0
+	// A slow synchronous handler must never be acknowledged while it is still
+	// running. Transport cancellation/timeouts remain responsible for failures.
+	bridgev2.EventHandlingTimeoutTicks = int(^uint(0) >> 1)
 
 	m := mxmain.BridgeMain{
 		Name:        "matrix-inline",

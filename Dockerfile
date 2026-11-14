@@ -40,6 +40,7 @@ ENV CARGO_HOME=/cargo \
 COPY inline-public/Cargo.toml inline-public/Cargo.lock inline-public/rust-toolchain.toml ./inline-public/
 COPY inline-public/cli ./inline-public/cli
 COPY inline-public/crates ./inline-public/crates
+COPY inline-public/vendor ./inline-public/vendor
 COPY matrix-inline/Cargo.toml matrix-inline/Cargo.lock matrix-inline/rust-toolchain.toml ./matrix-inline/
 COPY matrix-inline/crates ./matrix-inline/crates
 WORKDIR /build/matrix-inline

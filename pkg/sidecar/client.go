@@ -146,6 +146,40 @@ func (c *Client) AccountState(ctx context.Context) (*AccountStateSnapshot, error
 	return &snapshot, nil
 }
 
+// RefreshAccountState refreshes accessible workspace navigation from the source.
+// A failed refresh returns an error and does not turn missing rows into removals.
+func (c *Client) RefreshAccountState(ctx context.Context) (*AccountStateSnapshot, error) {
+	var result AccountStateSnapshot
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/state/account/refresh", nil, "account_state", &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) Users(ctx context.Context, request UsersRequest) (*UsersPage, error) {
+	var result UsersPage
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/users", request, "users", &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) SearchUsers(ctx context.Context, request SearchUsersRequest) (*UsersPage, error) {
+	var result UsersPage
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/users/search", request, "users", &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *Client) SpaceMembers(ctx context.Context, request SpaceMembersRequest) (*SpaceMembersPage, error) {
+	var result SpaceMembersPage
+	if err := c.doRPC(ctx, http.MethodPost, "/rpc/spaces/members", request, "space_members", &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 func (c *Client) ChatState(ctx context.Context, request ChatStateRequest) (*ChatStateSnapshot, error) {
 	var snapshot ChatStateSnapshot
 	if err := c.doRPC(ctx, http.MethodPost, "/rpc/state/chat", request, "chat_state", &snapshot); err != nil {
@@ -456,6 +490,7 @@ func (c *Client) doRaw(ctx context.Context, method, path, contentType string, bo
 }
 
 func (c *Client) doRequest(req *http.Request, out any) error {
+	req.Header.Set("X-Inline-Protocol-Version", strconv.Itoa(ProtocolVersion))
 	if strings.TrimSpace(c.SessionNamespace) != "" {
 		req.Header.Set("X-Inline-Session-Namespace", c.SessionNamespace)
 	}

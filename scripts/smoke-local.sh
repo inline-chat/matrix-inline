@@ -45,6 +45,6 @@ echo "==> Adapter status"
 curl -fsS "${URL}/status" | jq .
 
 echo "==> Adapter resume"
-curl -fsS -X POST "${URL}/rpc/resume" | jq .
+curl -fsS -H "X-Inline-Protocol-Version: 5" -X POST "${URL}/rpc/resume" | jq .
 
 echo "Smoke check passed."
